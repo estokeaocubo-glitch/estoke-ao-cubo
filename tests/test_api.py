@@ -40,10 +40,10 @@ def api_client():
 def _get_token(client, db):
     """Helper: faz login e retorna token."""
     # Criar usuário de teste
-    db.adicionar_usuario("Tester", "tester", "test_pass", "admin")
+    db.adicionar_usuario("Tester", "tester", "SenhaSegura123!", "admin")
     
     response = client.post('/api/login', 
-                          data=json.dumps({"login": "tester", "senha": "test_pass"}),
+                          data=json.dumps({"login": "tester", "senha": "SenhaSegura123!"}),
                           content_type='application/json')
     data = response.get_json()
     return data.get("token", "")
@@ -65,10 +65,10 @@ class TestAPILogin:
 
     def test_login_valido(self, api_client):
         client, db = api_client
-        db.adicionar_usuario("Admin", "admin_test", "senha123", "admin")
+        db.adicionar_usuario("Admin", "admin_test", "SenhaSegura123!", "admin")
         
         response = client.post('/api/login',
-                              data=json.dumps({"login": "admin_test", "senha": "senha123"}),
+                              data=json.dumps({"login": "admin_test", "senha": "SenhaSegura123!"}),
                               content_type='application/json')
         assert response.status_code == 200
         data = response.get_json()

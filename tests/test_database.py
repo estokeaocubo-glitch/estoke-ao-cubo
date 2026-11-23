@@ -13,21 +13,30 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 @pytest.fixture
 def db():
     """Cria uma instância de Database com banco temporário para cada teste."""
-    # Usar diretório temporário para evitar conflitos
-    with tempfile.TemporaryDirectory() as tmpdir:
-        # Patch para usar temp dir em vez de AppData
-        import database
-        original_func = database.get_app_data_path
-        database.get_app_data_path = lambda: tmpdir
-        
-        db_instance = database.Database(db_name="test_estoque.db")
-        yield db_instance
-        
+    import gc
+    import time
+    tmpdir = tempfile.TemporaryDirectory()
+    import database
+    original_func = database.get_app_data_path
+    database.get_app_data_path = lambda: tmpdir.name
+    
+    db_instance = database.Database(db_name="test_estoque.db")
+    yield db_instance
+    
+    try:
+        db_instance.close()
+    except Exception:
+        pass
+    database.get_app_data_path = original_func
+    # Forçar coleta de lixo para liberar referências ao banco
+    gc.collect()
+    # Tentativas de limpeza do diretório temporário
+    for _ in range(10):
         try:
-            db_instance.close()
-        except Exception:
-            pass
-        database.get_app_data_path = original_func
+            tmpdir.cleanup()
+            break
+        except PermissionError:
+            time.sleep(0.15)
 
 
 class TestProdutosCRUD:
@@ -152,35 +161,42 @@ class TestUsuarios:
     """Testes para multi-usuário."""
 
     def test_criar_usuario(self, db):
-        ok, msg = db.adicionar_usuario("Maria", "maria123", "senha_segura", "vendedor")
+        ok, msg = db.adicionar_usuario("Maria", "maria123", "SenhaSegura123!", "vendedor")
         assert ok is True
 
     def test_login_duplicado(self, db):
-        db.adicionar_usuario("Ana", "ana_login", "123456", "vendedor")
-        ok, msg = db.adicionar_usuario("Ana 2", "ana_login", "654321", "caixa")
+        # A senha do primeiro usuário deve ser forte para prosseguir para o teste de login duplicado
+        db.adicionar_usuario("Ana", "ana_login", "SenhaSegura123!", "vendedor")
+        # O segundo usuário tenta com senha fraca primeiro (deve falhar por força da senha)
+        ok, msg = db.adicionar_usuario("Ana 2", "ana_login2", "123456", "caixa")
+        assert ok is False
+        assert "caracteres" in msg.lower()
+        
+        # Tentativa com senha forte, deve falhar por duplicidade de login
+        ok, msg = db.adicionar_usuario("Ana 2", "ana_login", "SenhaSegura456!", "caixa")
         assert ok is False
         assert "existe" in msg.lower()
 
     def test_autenticar_usuario(self, db):
-        db.adicionar_usuario("Pedro", "pedro_login", "minha_senha", "gerente")
-        user = db.autenticar_usuario("pedro_login", "minha_senha")
+        db.adicionar_usuario("Pedro", "pedro_login", "MinhaSenha123!", "gerente")
+        user = db.autenticar_usuario("pedro_login", "MinhaSenha123!")
         assert user is not None
         assert user['nome'] == "Pedro"
         assert user['perfil'] == "gerente"
 
     def test_autenticar_senha_errada(self, db):
-        db.adicionar_usuario("Carlos", "carlos_login", "correta", "vendedor")
-        user = db.autenticar_usuario("carlos_login", "errada")
+        db.adicionar_usuario("Carlos", "carlos_login", "SenhaCorreta123!", "vendedor")
+        user = db.autenticar_usuario("carlos_login", "SenhaErrada123!")
         assert user is None
 
     def test_alterar_senha(self, db):
-        db.adicionar_usuario("Lucas", "lucas_login", "senha_antiga", "caixa")
+        db.adicionar_usuario("Lucas", "lucas_login", "SenhaAntiga123!", "caixa")
         df = db.listar_usuarios()
         user_id = int(df[df['login'] == 'lucas_login'].iloc[0]['id'])
-        db.alterar_senha_usuario(user_id, "senha_nova")
+        db.alterar_senha_usuario(user_id, "SenhaNova123!")
         # Testar com senha nova
-        user = db.autenticar_usuario("lucas_login", "senha_nova")
+        user = db.autenticar_usuario("lucas_login", "SenhaNova123!")
         assert user is not None
         # Testar que senha antiga não funciona mais
-        user2 = db.autenticar_usuario("lucas_login", "senha_antiga")
+        user2 = db.autenticar_usuario("lucas_login", "SenhaAntiga123!")
         assert user2 is None
