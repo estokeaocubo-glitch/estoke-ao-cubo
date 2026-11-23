@@ -1,7 +1,7 @@
 # EstokeAoCubo — Open-Source Smart ERP & POS for Small Businesses
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-[![CI](https://github.com/brianxavier18/estoke-ao-cubo/actions/workflows/ci.yml/badge.svg)](https://github.com/brianxavier18/estoke-ao-cubo/actions/workflows/ci.yml)
+[![CI](https://github.com/estokeaocubo-glitch/estoke-ao-cubo/actions/workflows/ci.yml/badge.svg)](https://github.com/estokeaocubo-glitch/estoke-ao-cubo/actions/workflows/ci.yml)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
 [![Version](https://img.shields.io/badge/Version-4.3.0-0ea5e9.svg)](#)
 [![Website](https://img.shields.io/badge/Website-estoke--ao--cubo.pages.dev-10367D?logo=google-chrome&logoColor=white)](https://estoke-ao-cubo.pages.dev)
@@ -30,7 +30,7 @@ It runs locally with **zero mandatory cloud fees**, encrypts local SQLite data a
 
 ### Installation & Run
 ```bash
-git clone https://github.com/brianxavier18/estoke-ao-cubo.git
+git clone https://github.com/estokeaocubo-glitch/estoke-ao-cubo.git
 cd estoke-ao-cubo
 
 python -m venv .venv
