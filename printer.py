@@ -33,6 +33,30 @@ except ImportError:
     qrcode = None
 
 
+def _preparar_imagem_monocromatica(img, max_width=384):
+    """Substitui fundo transparente por branco e converte para 1-bit (monocromático) nítido."""
+    from PIL import Image
+    # 1. Tratar transparência (alfa) preenchendo com fundo branco
+    if img.mode in ('RGBA', 'LA') or (img.mode == 'P' and 'transparency' in img.info):
+        fundo_branco = Image.new("RGBA", img.size, (255, 255, 255, 255))
+        img = Image.alpha_composite(fundo_branco, img.convert("RGBA")).convert("RGB")
+    else:
+        img = img.convert("RGB")
+    
+    # 2. Redimensionar mantendo proporção
+    if img.width > max_width:
+        ratio = max_width / float(img.width)
+        dest_height = int(float(img.height) * ratio)
+        img = img.resize((max_width, min(dest_height, 100)), Image.Resampling.LANCZOS)
+    else:
+        img.thumbnail((max_width, 100), Image.Resampling.LANCZOS)
+        
+    # 3. Converter para 1-bit usando limiar (threshold) para traço nítido
+    # (Evita o efeito granulado do dithering Floyd-Steinberg em logos simples)
+    img_mono = img.convert("L").point(lambda x: 0 if x < 128 else 255, '1')
+    return img_mono
+
+
 # ============================================================
 # GERADOR DE PAYLOAD PIX ESTÁTICO (PADRÃO BR CODE / BACEN EMV)
 # ============================================================
@@ -147,11 +171,12 @@ class ReceiptAuditor:
 
 class PrintJob:
     """Estrutura interna para encapsular um trabalho de impressão."""
-    def __init__(self, text: str, logo_path: str = None, job_id: str = None, pix_payload: str = None):
+    def __init__(self, text: str, logo_path: str = None, job_id: str = None, pix_payload: str = None, venda_id: int = None):
         self.text = text
         self.logo_path = logo_path
         self.job_id = job_id or datetime.datetime.now().strftime("%Y%m%d%H%M%S%f")
         self.pix_payload = pix_payload
+        self.venda_id = venda_id
         self.created_at = time.time()
 
 
@@ -213,17 +238,46 @@ class PrintQueueManager(threading.Thread):
     def _execute_job(self, job: PrintJob):
         """Imprime fisicamente o documento usando o driver correto configurado."""
         self.auditor.registrar_impressao(job.job_id, job.text)
+        status = 'Impresso'
+        error_msg = None
+        printer_name = None
+        
         try:
+            cfg = get_printer_config()
+            printer_name = cfg.get('settings', {}).get('printer_name', cfg.get('interface', 'padrao'))
             printer = _create_raw_printer()
-            printer.print_text(job.text, logo_path=job.logo_path, pix_payload=job.pix_payload)
+            printer.print_text(job.text, logo_path=job.logo_path, pix_payload=job.pix_payload, venda_id=job.venda_id)
         except Exception as e:
             logger.error("Erro ao imprimir assincronamente o job %s: %s", job.job_id, e)
-            # Aciona Fallback Automático salvando em arquivo e abrindo na tela
+            status = 'Fallback'
+            error_msg = str(e)
             try:
                 fallback = TextFilePrinter()
-                fallback.print_text(job.text, logo_path=job.logo_path, pix_payload=job.pix_payload)
+                fallback.print_text(job.text, logo_path=job.logo_path, pix_payload=job.pix_payload, venda_id=job.venda_id)
             except Exception as fe:
                 logger.critical("Falha no fallback de impressão: %s", fe)
+                status = 'Falhou'
+                error_msg += f" | Fallback error: {fe}"
+                
+        # Gravar na tabela impressoes_log sem recriar/descriptografar Database() em thread secundária
+        try:
+            import sqlite3
+            from database import get_app_data_path
+            db_file = os.path.join(get_app_data_path(), "estoque.db")
+            if os.path.exists(db_file):
+                conn_log = sqlite3.connect(db_file, timeout=30.0)
+                try:
+                    conn_log.execute("PRAGMA busy_timeout=30000")
+                    conn_log.execute(
+                        """INSERT INTO impressoes_log (venda_id, status, impressora_nome, erro_mensagem)
+                           VALUES (?, ?, ?, ?)""",
+                        (job.venda_id, status, printer_name, error_msg)
+                    )
+                    conn_log.commit()
+                finally:
+                    conn_log.close()
+        except Exception as db_err:
+            logger.error("Erro ao gravar impressoes_log: %s", db_err)
 
 
 # ============================================================
@@ -231,8 +285,110 @@ class PrintQueueManager(threading.Thread):
 # ============================================================
 
 class BasePrinter:
-    def print_text(self, text: str, logo_path=None, pix_payload=None):
+    def print_text(self, text: str, logo_path=None, pix_payload=None, venda_id=None):
         raise NotImplementedError("Subclasses devem implementar este método")
+
+    def abrir_gaveta(self):
+        """Envia pulso ESC/POS de abertura de gaveta quando suportado pelo driver."""
+        return True
+
+    @staticmethod
+    def formatar_danfe_nfce(dados_nfce: dict, itens: list, config_nota: dict, valor_total: float = 0.0, valor_desconto: float = 0.0, valor_troco: float = 0.0) -> str:
+        """
+        Formata texto térmico do DANFE NFC-e Modelo 65.
+        Exige status == 'autorizado' com chave_acesso e protocolo reais (nunca simula tpEmis=9 offline).
+        """
+        if str(dados_nfce.get("status") or "").lower() != "autorizado":
+            raise ValueError("DANFE NFC-e só pode ser gerado após autorização pela SEFAZ.")
+        chave = "".join(ch for ch in str(dados_nfce.get("chave_acesso") or "") if ch.isdigit())
+        protocolo = str(dados_nfce.get("protocolo") or "").strip()
+        if not chave or not protocolo:
+            raise ValueError("Chave de acesso e protocolo da SEFAZ são obrigatórios para o DANFE NFC-e.")
+
+        empresa = (config_nota or {}).get("empresa_nome") or "ESTOKE AO CUBO"
+        cnpj = (config_nota or {}).get("empresa_cnpj") or ""
+        end = (config_nota or {}).get("empresa_endereco") or ""
+        chave_fmt = " ".join(chave[i:i + 4] for i in range(0, len(chave), 4))
+
+        linhas = [
+            "========================================",
+            f" {empresa[:38]}",
+            f" CNPJ: {cnpj}" if cnpj else " CNPJ: Nao informado",
+        ]
+        if end:
+            linhas.append(f" {end[:38]}")
+        linhas.extend([
+            "----------------------------------------",
+            " DANFE NFC-e - Documento Auxiliar da",
+            " Nota Fiscal de Consumidor Eletronica",
+            " Nao permite aproveitamento de credito ICMS",
+            "----------------------------------------",
+            "QTD  DESCRICAO                TOTAL (R$)",
+        ])
+        for it in itens or []:
+            qtd = it.get("qtd", 1)
+            nome = str(it.get("nome") or "Item")[:20].ljust(20)
+            sub = float(it.get("qtd", 1)) * float(it.get("preco", 0.0))
+            linhas.append(f"{str(qtd):<4} {nome} {sub:>11.2f}")
+
+        linhas.append("----------------------------------------")
+        if valor_desconto > 0:
+            linhas.append(f"Desconto:                    R$ {valor_desconto:>8.2f}")
+        linhas.append(f"VALOR TOTAL R$               R$ {valor_total:>8.2f}")
+        if valor_troco > 0:
+            linhas.append(f"Troco:                       R$ {valor_troco:>8.2f}")
+        linhas.extend([
+            "----------------------------------------",
+            f"NFC-e n. {dados_nfce.get('numero') or '-'}  Serie {dados_nfce.get('serie') or '1'}",
+            f"Ambiente: {str(dados_nfce.get('ambiente') or 'homologacao').upper()}",
+            "Chave de Acesso:",
+            chave_fmt,
+            f"Protocolo: {protocolo}",
+        ])
+        qr_url = str(dados_nfce.get("qrcode_url") or dados_nfce.get("url_danfe") or "").strip()
+        if qr_url:
+            linhas.append(f"Consulte em: {qr_url}")
+        linhas.append("========================================")
+        return "\n".join(linhas)
+
+    @staticmethod
+    def formatar_comprovante_pendente_nfce(transacao_id: str, itens: list, config_nota: dict, valor_total: float = 0.0, valor_desconto: float = 0.0) -> str:
+        """Formata comprovante provisório quando API fiscal está indisponível (sem fingir tpEmis=9)."""
+        empresa = (config_nota or {}).get("empresa_nome") or "ESTOKE AO CUBO"
+        linhas = [
+            "========================================",
+            f" {empresa[:38]}",
+            " COMPROVANTE DE VENDA (NAO FISCAL)",
+            " ** NFC-e PENDENTE DE TRANSMISSAO **",
+            "----------------------------------------",
+            f"Ref. Transacao: {transacao_id}",
+        ]
+        for it in itens or []:
+            qtd = it.get("qtd", 1)
+            nome = str(it.get("nome") or "Item")[:20].ljust(20)
+            sub = float(it.get("qtd", 1)) * float(it.get("preco", 0.0))
+            linhas.append(f"{str(qtd):<4} {nome} {sub:>11.2f}")
+        linhas.append("----------------------------------------")
+        if valor_desconto > 0:
+            linhas.append(f"Desconto:                    R$ {valor_desconto:>8.2f}")
+        linhas.append(f"Total Pago:                  R$ {valor_total:>8.2f}")
+        linhas.extend([
+            "----------------------------------------",
+            "Sua NFC-e sera transmitida automaticamente",
+            "assim que a conexao com a internet retornar.",
+            "========================================",
+        ])
+        return "\n".join(linhas)
+
+    def imprimir_danfe_nfce(self, dados_nfce: dict, itens: list, config_nota: dict, valor_total: float = 0.0, valor_desconto: float = 0.0, valor_troco: float = 0.0, logo_path=None, venda_id=None) -> str:
+        texto = self.formatar_danfe_nfce(dados_nfce, itens, config_nota, valor_total=valor_total, valor_desconto=valor_desconto, valor_troco=valor_troco)
+        self.print_text(texto, logo_path=logo_path, pix_payload=dados_nfce.get("qrcode_url") or None, venda_id=venda_id)
+        return texto
+
+    def imprimir_comprovante_pendente_nfce(self, transacao_id: str, itens: list, config_nota: dict, valor_total: float = 0.0, valor_desconto: float = 0.0, logo_path=None, venda_id=None) -> str:
+        texto = self.formatar_comprovante_pendente_nfce(transacao_id, itens, config_nota, valor_total=valor_total, valor_desconto=valor_desconto)
+        self.print_text(texto, logo_path=logo_path, venda_id=venda_id)
+        return texto
 
 
 class AsyncPrinterWrapper(BasePrinter):
@@ -241,12 +397,15 @@ class AsyncPrinterWrapper(BasePrinter):
     def __init__(self, real_printer):
         self.real_printer = real_printer
 
-    def print_text(self, text: str, logo_path=None, pix_payload=None):
+    def print_text(self, text: str, logo_path=None, pix_payload=None, venda_id=None):
         # Gerar um ID de job unificado baseado no conteúdo
         import hashlib
         job_hash = hashlib.md5(text.encode('utf-8')).hexdigest()
-        job = PrintJob(text, logo_path=logo_path, job_id=job_hash, pix_payload=pix_payload)
+        job = PrintJob(text, logo_path=logo_path, job_id=job_hash, pix_payload=pix_payload, venda_id=venda_id)
         PrintQueueManager.get_instance().enqueue(job)
+
+    def abrir_gaveta(self):
+        return self.real_printer.abrir_gaveta()
 
 
 class TextFilePrinter(BasePrinter):
@@ -257,7 +416,7 @@ class TextFilePrinter(BasePrinter):
         self.folder = folder
         os.makedirs(self.folder, exist_ok=True)
 
-    def print_text(self, text: str, logo_path=None, pix_payload=None):
+    def print_text(self, text: str, logo_path=None, pix_payload=None, venda_id=None):
         import re
         ts = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
         
@@ -291,12 +450,32 @@ class TextFilePrinter(BasePrinter):
             subprocess.call([opener, file_path])
         return file_path
 
-    def _print_as_image(self, text, logo_path, pix_payload, ts):
+    def _print_as_image(self, text, logo_path, pix_payload, ts, venda_id=None):
         """Renderiza o recibo completo como imagem PNG, formatando fontes, logo e QR Code Pix."""
         try:
             from PIL import Image, ImageDraw, ImageFont
             margin = 14
-            receipt_width = 384  # Largura física da bobina de 58mm compacta
+            
+            # Bobina dinâmica de 58mm ou 80mm sem recriar Database()
+            largura_mm = 80
+            try:
+                import sqlite3
+                from database import get_app_data_path
+                db_file = os.path.join(get_app_data_path(), "estoque.db")
+                if os.path.exists(db_file):
+                    conn_cfg = sqlite3.connect(db_file, timeout=10.0)
+                    try:
+                        cur_cfg = conn_cfg.cursor()
+                        cur_cfg.execute("SELECT largura_papel_mm FROM config_nota WHERE id = 1")
+                        row_cfg = cur_cfg.fetchone()
+                        if row_cfg and row_cfg[0]:
+                            largura_mm = int(row_cfg[0])
+                    finally:
+                        conn_cfg.close()
+            except Exception:
+                largura_mm = 80
+            
+            receipt_width = 576 if largura_mm == 80 else 384
             font_size = 13
             line_spacing = 3
 
@@ -323,7 +502,7 @@ class TextFilePrinter(BasePrinter):
             if logo_path and os.path.isfile(logo_path):
                 logo_img = Image.open(logo_path)
                 max_w = receipt_width - 2 * margin
-                logo_img.thumbnail((max_w, 75), Image.Resampling.LANCZOS)
+                logo_img = _preparar_imagem_monocromatica(logo_img, max_width=max_w)
                 logo_h = logo_img.height + 8
 
             # Processar tamanho do QR Code Pix
@@ -414,6 +593,14 @@ class EscPosPrinter(BasePrinter):
         if self.interface == 'network' and Network:
             host = self.settings.get('host')
             port = int(self.settings.get('port', 9100))
+            # Test connection first (timeout 3.0 seconds) to avoid hanging
+            import socket
+            try:
+                with socket.create_connection((host, port), timeout=3.0):
+                    pass
+            except (socket.timeout, ConnectionRefusedError, OSError) as se:
+                logger.error("Falha ao se conectar a impressora de rede %s:%d - %s", host, port, se)
+                raise RuntimeError(f"Impressora de rede inacessível no host {host}:{port}") from se
             self.device = Network(host, port)
         elif self.interface == 'usb' and Usb:
             vendor = int(self.settings.get('idVendor', 0))
@@ -427,7 +614,7 @@ class EscPosPrinter(BasePrinter):
             raise RuntimeError(f"Interface ESC/POS sem suporte ou biblioteca ausente: {self.interface}")
         return self.device
 
-    def print_text(self, text: str, logo_path=None, pix_payload=None):
+    def print_text(self, text: str, logo_path=None, pix_payload=None, venda_id=None):
         dev = self._get_device()
         try:
             # --- INICIALIZAÇÃO DA IMPRESSORA E FONTE A (RESOLVE FONTE MUITO PEQUENA) ---
@@ -440,7 +627,7 @@ class EscPosPrinter(BasePrinter):
                 try:
                     from PIL import Image
                     img = Image.open(logo_path)
-                    img.thumbnail((300, 100), Image.Resampling.LANCZOS)
+                    img = _preparar_imagem_monocromatica(img, max_width=300)
                     dev.image(img)
                 except Exception as le:
                     logger.warning("Falha ao enviar logo para ESC/POS: %s", le)
@@ -461,16 +648,16 @@ class EscPosPrinter(BasePrinter):
                 except Exception as qre:
                     logger.warning("Falha ao imprimir QR Code Pix no ESC/POS: %s", qre)
 
-            # --- AVANÇO E CORTE DE PAPEL (RESOLVE FOLHA SEM CORTE / CORTE PREMATURO) ---
-            # Avança manualmente antes de cortar para garantir que passe do cortador físico
+            # --- AVANÇO E CORTE DE PAPEL ---
+            # Apenas 2 linhas de avanço: suficiente para ultrapassar a guilhotina sem desperdício
             if hasattr(dev, 'text'):
-                dev.text('\n\n\n\n\n\n')
+                dev.text('\n\n')
                 
             if hasattr(dev, 'cut'):
-                # Desativa o feed automático da biblioteca para usar o nosso avanço manual preciso
+                # Um único corte via biblioteca (já envia GS V internamente)
                 dev.cut(feed=False)
             elif hasattr(dev, '_raw'):
-                dev._raw(b'\x1b\x6d')  # ESC m clássico Elgin
+                dev._raw(b'\x1d\x56\x00')  # GS V 0 — corte total padrão ESC/POS
         finally:
             self.close()
 
@@ -481,6 +668,20 @@ class EscPosPrinter(BasePrinter):
             except Exception:
                 pass
             self.device = None
+
+    def abrir_gaveta(self):
+        """Envia pulso ESC/POS padrão (ESC p 0 25 250) para abertura de gaveta."""
+        dev = self._get_device()
+        try:
+            if hasattr(dev, "_raw"):
+                dev._raw(b"\x1b\x70\x00\x19\xfa")
+                return True
+            if hasattr(dev, "cashdraw"):
+                dev.cashdraw(2)
+                return True
+            return False
+        finally:
+            self.close()
 
     def __del__(self):
         self.close()
@@ -530,8 +731,7 @@ class WindowsRawPrinter(BasePrinter):
         try:
             from PIL import Image
             img = Image.open(logo_path)
-            img.thumbnail((384, 100), Image.Resampling.LANCZOS)
-            img = img.convert('1')
+            img = _preparar_imagem_monocromatica(img, max_width=384)
             
             w_bytes = (img.width + 7) // 8
             # Comando ESC/POS GS v 0 (raster graphics)
@@ -555,7 +755,7 @@ class WindowsRawPrinter(BasePrinter):
             logger.warning("Falha na conversão binária do logo: %s", e)
             return b''
 
-    def print_text(self, text: str, logo_path=None, pix_payload=None):
+    def print_text(self, text: str, logo_path=None, pix_payload=None, venda_id=None):
         if not win32print:
             raise RuntimeError("Módulo de impressão pywin32 indisponível.")
         name = self._get_printer_name()
@@ -590,9 +790,9 @@ class WindowsRawPrinter(BasePrinter):
                     qr.make(fit=True)
                     qr_img = qr.make_image(fill_color="black", back_color="white")
                     
-                    # Salvar temporariamente para converter em bytes ESC/POS
-                    temp_qr = os.path.join(os.path.expanduser("~"), "AppData", "Local", "Temp", "temp_qr.png")
-                    os.makedirs(os.path.dirname(temp_qr), exist_ok=True)
+                    # Salvar temporariamente dentro da pasta gravável de AppData/Temp do aplicativo
+                    import paths
+                    temp_qr = paths.get_temp_dir(f"temp_qr_{os.getpid()}.png")
                     qr_img.save(temp_qr)
                     
                     qr_bytes = self._logo_to_escpos_bytes(temp_qr)
@@ -605,15 +805,34 @@ class WindowsRawPrinter(BasePrinter):
                 except Exception as qre:
                     logger.warning("Erro ao anexar QR Code Pix no Windows RAW: %s", qre)
 
-            # --- AVANÇO E CORTE DE PAPEL (RESOLVE FOLHA SEM CORTE / CORTE PREMATURO) ---
-            # Avança 6 linhas para garantir que o texto ultrapasse fisicamente a guilhotina da Elgin i8
-            data += b'\n\n\n\n\n\n'
-            # Envia o comando clássico da Elgin ESC m (\x1b\x6d) e GS V 0 (\x1d\x56\x00) como redundância robusta
-            data += b'\x1b\x6d\x1d\x56\x00'
+            # --- AVANÇO E CORTE DE PAPEL ---
+            # Apenas 2 linhas de avanço: suficiente para ultrapassar a guilhotina sem desperdício
+            data += b'\n\n'
+            # Um único comando de corte: GS V 0 (\x1d\x56\x00) — padrão universal ESC/POS
+            # NÃO enviar ESC m junto, pois causa duplo corte na guilhotina
+            data += b'\x1d\x56\x00'
             
             win32print.WritePrinter(hprinter, data)
             win32print.EndPagePrinter(hprinter)
             win32print.EndDocPrinter(hprinter)
+        finally:
+            win32print.ClosePrinter(hprinter)
+
+    def abrir_gaveta(self):
+        """Envia comando ESC/POS RAW de abertura de gaveta via spooler Windows."""
+        if not win32print:
+            return False
+        name = self._get_printer_name()
+        if not name:
+            return False
+        hprinter = win32print.OpenPrinter(name)
+        try:
+            win32print.StartDocPrinter(hprinter, 1, ("Abertura Gaveta", None, "RAW"))
+            win32print.StartPagePrinter(hprinter)
+            win32print.WritePrinter(hprinter, b"\x1b\x70\x00\x19\xfa")
+            win32print.EndPagePrinter(hprinter)
+            win32print.EndDocPrinter(hprinter)
+            return True
         finally:
             win32print.ClosePrinter(hprinter)
 

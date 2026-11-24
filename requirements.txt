@@ -1,12 +1,15 @@
 customtkinter
 matplotlib
 pandas
-scikit-learn
 numpy
 pillow
-google-generativeai
+google-genai
 python-dotenv
 pdfplumber
+requests
+reportlab
+tkcalendar
+babel
 
 # libs para comunicação com impressoras fiscais
 python-escpos

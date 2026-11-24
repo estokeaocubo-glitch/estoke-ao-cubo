@@ -139,7 +139,7 @@ class SonhosService:
                 "usuario_id": r[1],
                 "titulo": html.unescape(r[2]),
                 "descricao": html.unescape(r[3]),
-                "categoria": html.unescape(r[4]) if r[5] else "Geral",
+                "categoria": html.unescape(r[4]) if r[4] else "Geral",
                 "data_registro": r[5],
                 "version": r[6]
             }

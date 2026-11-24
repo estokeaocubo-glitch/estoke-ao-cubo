@@ -6,12 +6,42 @@ dedução de estoque, registro financeiro e geração de invoice.
 """
 import logging
 import datetime
+import re
 
 logger = logging.getLogger('EstokeAoCubo.services.venda')
 
 
+def parse_scan_input(raw_text: str):
+    """
+    Analisa entrada do leitor de código de barras suportando sintaxe `qtd*codigo`
+    (ex: '3*7891234567895' -> (3, '7891234567895', True), '0,450*2001' -> (0.45, '2001', True)).
+
+    Retorna:
+        (quantidade: int|float, codigo_limpo: str, multiplicador_explicito: bool)
+    Levanta ValueError se o multiplicador ou código forem inválidos.
+    """
+    texto = (raw_text or "").strip()
+    if not texto:
+        raise ValueError("Código de barras vazio.")
+
+    m = re.match(r"^\s*([0-9]+(?:[.,][0-9]+)?)\s*\*\s*(.+?)\s*$", texto)
+    if m:
+        qtd_raw = float(m.group(1).replace(",", "."))
+        codigo = m.group(2).strip()
+        if qtd_raw <= 0:
+            raise ValueError("A quantidade informada antes de '*' deve ser maior que zero.")
+        if not codigo:
+            raise ValueError("Código de barras após '*' não pode ser vazio.")
+        qtd = int(qtd_raw) if qtd_raw.is_integer() else round(qtd_raw, 3)
+        return qtd, codigo, True
+
+    return 1, texto, False
+
+
 class VendaService:
     """Orquestra o fluxo completo de uma venda."""
+
+    parse_scan_input = staticmethod(parse_scan_input)
 
     def __init__(self, db):
         self.db = db
@@ -145,14 +175,14 @@ class VendaService:
             logger.error("Erro ao finalizar venda: %s", e)
             return {'venda_id': None, 'sucesso': False, 'mensagem': str(e)}
 
-    def cancelar_venda(self, venda_id):
+    def cancelar_venda(self, venda_id, motivo="Cancelamento via serviço", usuario_id=None):
         """Cancela uma venda: restaura estoque e faz estorno financeiro.
         
         Returns:
             (sucesso: bool, mensagem: str)
         """
         try:
-            return self.db.cancelar_venda(venda_id)
+            return self.db.cancelar_venda(venda_id, motivo=motivo, usuario_id=usuario_id)
         except Exception as e:
             logger.error("Erro ao cancelar venda %s: %s", venda_id, e)
             return (False, str(e))

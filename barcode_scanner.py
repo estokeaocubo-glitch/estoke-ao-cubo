@@ -7,24 +7,32 @@ import threading
 
 logger = logging.getLogger('EstokeAoCubo.barcode_scanner')
 
-CV2_AVAILABLE = False
-PYZBAR_AVAILABLE = False
+CV2_AVAILABLE = None
+PYZBAR_AVAILABLE = None
 
-try:
-    import cv2
-    CV2_AVAILABLE = True
-except ImportError:
-    logger.info("OpenCV não instalado. Scanner por câmera indisponível.")
-
-try:
-    from pyzbar import pyzbar
-    PYZBAR_AVAILABLE = True
-except ImportError:
-    logger.info("pyzbar não instalado. Scanner por câmera indisponível.")
+def _check_imports():
+    global CV2_AVAILABLE, PYZBAR_AVAILABLE
+    if CV2_AVAILABLE is not None:
+        return
+        
+    try:
+        import cv2
+        CV2_AVAILABLE = True
+    except ImportError:
+        CV2_AVAILABLE = False
+        logger.info("OpenCV não instalado. Scanner por câmera indisponível.")
+        
+    try:
+        from pyzbar import pyzbar
+        PYZBAR_AVAILABLE = True
+    except ImportError:
+        PYZBAR_AVAILABLE = False
+        logger.info("pyzbar não instalado. Scanner por câmera indisponível.")
 
 
 def scanner_disponivel():
     """Retorna True se as dependências do scanner estão instaladas."""
+    _check_imports()
     return CV2_AVAILABLE and PYZBAR_AVAILABLE
 
 
@@ -62,6 +70,9 @@ class CameraScanner:
             self._thread = None
 
     def _capture_loop(self):
+        import cv2
+        from pyzbar import pyzbar
+        
         cap = cv2.VideoCapture(self.camera_index)
         if not cap.isOpened():
             logger.error("Não foi possível abrir a câmera %d", self.camera_index)

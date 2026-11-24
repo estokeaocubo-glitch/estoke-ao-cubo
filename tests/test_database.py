@@ -200,3 +200,41 @@ class TestUsuarios:
         # Testar que senha antiga não funciona mais
         user2 = db.autenticar_usuario("lucas_login", "SenhaAntiga123!")
         assert user2 is None
+
+
+class TestImportacao:
+    """Testes para validação e importação de produtos (CSV/PDF)."""
+
+    def test_preparar_e_validar_importacao_sucesso(self, db):
+        import tempfile
+        import os
+
+        conteudo_csv = (
+            "nome,quantidade,preco,categoria,preco_compra,codigo_barras\n"
+            "Camiseta Legal,10,39.90,Roupas,15.00,123456789\n"
+            "Item Invalido,-5,abc,Roupas,10.00,123456780\n" # Qtd negativa, preço não-numérico
+            "Item Valido,20,19.90,Brindes,5.00,123456781\n"
+        )
+        
+        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.csv', encoding='utf-8') as f:
+            f.write(conteudo_csv)
+            temp_path = f.name
+            
+        try:
+            success, val_data, df = db.preparar_e_validar_importacao(temp_path)
+            assert success is True
+            assert val_data["total_linhas"] == 3
+            assert val_data["total_validos"] == 2
+            assert len(val_data["erros"]) == 2 # Qtd negativa e Preço inválido
+            assert val_data["linhas_com_erro"] == [1]
+            
+            ok, msg = db.importar_dataframe_produtos(df, val_data["linhas_com_erro"], temp_path)
+            assert ok is True
+            
+            df_prods = db.listar_produtos()
+            assert len(df_prods) == 2
+            assert "Camiseta Legal" in df_prods['nome'].values
+            assert "Item Valido" in df_prods['nome'].values
+            assert "Item Invalido" not in df_prods['nome'].values
+        finally:
+            os.remove(temp_path)

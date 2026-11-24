@@ -13,13 +13,14 @@ logger = logging.getLogger('EstokeAoCubo.ai')
 # Carregar variáveis de ambiente
 load_dotenv()
 
-# Importar Gemini
+# Importar Gemini (SDK oficial google-genai)
 GEMINI_LIB_AVAILABLE = False
+genai = None
 try:
-    import google.generativeai as genai
+    from google import genai
     GEMINI_LIB_AVAILABLE = True
 except ImportError:
-    logger.info("Biblioteca Google GenerativeAI não encontrada (modo offline).")
+    logger.info("Biblioteca google-genai não encontrada (modo offline).")
 
 class ResponseGenerator:
     """Gera respostas variadas e dinâmicas para o sistema."""
@@ -72,18 +73,64 @@ class ResponseGenerator:
         except KeyError:
             return template
 
+class SimpleLinearRegression:
+    """Regressão Linear nativa de alta velocidade (substitui scikit-learn economizando ~75MB)."""
+    def __init__(self):
+        self.slope = 0.0
+        self.intercept = 0.0
+
+    def fit(self, X, y):
+        if hasattr(X, 'values'):
+            x_vals = X.values.flatten()
+        else:
+            x_vals = [item[0] if isinstance(item, (list, tuple)) else item for item in X]
+        
+        if hasattr(y, 'values'):
+            y_vals = y.values.flatten()
+        else:
+            y_vals = list(y)
+        
+        n = len(x_vals)
+        if n <= 1:
+            self.slope = 0.0
+            self.intercept = float(y_vals[0]) if n == 1 else 0.0
+            return self
+
+        mean_x = sum(x_vals) / n
+        mean_y = sum(y_vals) / n
+        
+        num = sum((x_vals[i] - mean_x) * (y_vals[i] - mean_y) for i in range(n))
+        den = sum((x_vals[i] - mean_x) ** 2 for i in range(n))
+        
+        if den != 0:
+            self.slope = num / den
+            self.intercept = mean_y - (self.slope * mean_x)
+        else:
+            self.slope = 0.0
+            self.intercept = mean_y
+        return self
+
+    def predict(self, X):
+        if hasattr(X, 'values'):
+            x_vals = X.values.flatten()
+        else:
+            x_vals = [item[0] if isinstance(item, (list, tuple)) else item for item in X]
+        return [float(self.slope * x + self.intercept) for x in x_vals]
+
 class ExpensePredictor:
     def __init__(self, db):
         self.db = db
-        self.model = None # Carregado sob demanda
+        self.model = None
         self.is_trained = False
         self.gemini_available = False
+        self.genai_client = None
         self.configure_ai()
 
     def configure_ai(self):
         """Configura a API do Gemini procurando a chave no env ou em arquivo"""
-        if not GEMINI_LIB_AVAILABLE:
+        if not GEMINI_LIB_AVAILABLE or genai is None:
             self.gemini_available = False
+            self.genai_client = None
             return
 
         api_key = os.getenv("GEMINI_API_KEY")
@@ -102,17 +149,20 @@ class ExpensePredictor:
             if len(api_key) < 10 or ' ' in api_key:
                 logger.warning("Chave de API inválida (formato incorreto). Ignorando.")
                 self.gemini_available = False
+                self.genai_client = None
                 return
             try:
                 self.api_key = api_key
-                genai.configure(api_key=api_key)
+                self.genai_client = genai.Client(api_key=api_key)
                 self.gemini_available = True
-                logger.info("Gemini AI ativado com sucesso.")
+                logger.info("Gemini AI (google-genai) ativado com sucesso.")
             except Exception as e:
                 logger.error("Erro ao configurar Gemini: %s", e)
                 self.gemini_available = False
+                self.genai_client = None
         else:
             self.gemini_available = False
+            self.genai_client = None
 
     def prepare_data(self):
         df = self.db.listar_gastos()
@@ -140,8 +190,7 @@ class ExpensePredictor:
 
     def train(self):
         if self.model is None:
-            from sklearn.linear_model import LinearRegression
-            self.model = LinearRegression()
+            self.model = SimpleLinearRegression()
 
         X, y = self.prepare_data()
         if X is not None and len(X) > 1:
@@ -152,7 +201,7 @@ class ExpensePredictor:
 
     def ask_gemini(self, pergunta):
         """Faz uma pergunta ao Gemini sobre dados do sistema com contexto rico."""
-        if not self.gemini_available:
+        if not self.gemini_available or self.genai_client is None:
             return None
         
         try:
@@ -177,7 +226,8 @@ class ExpensePredictor:
             vendas_mes = 0
             if not df_vendas.empty:
                 try:
-                    df_vendas['data_dt'] = pd.to_datetime(df_vendas['data'], errors='coerce').dt.date
+                    col_data = 'data_venda' if 'data_venda' in df_vendas.columns else 'data'
+                    df_vendas['data_dt'] = pd.to_datetime(df_vendas[col_data], errors='coerce').dt.date
                     vendas_hoje = df_vendas[df_vendas['data_dt'] == hoje]['valor_total'].sum()
                     inicio_mes = hoje.replace(day=1)
                     vendas_mes = df_vendas[df_vendas['data_dt'] >= inicio_mes]['valor_total'].sum()
@@ -185,7 +235,8 @@ class ExpensePredictor:
                     pass
 
             # Lucro
-            lucro_mes = self.db.lucro_por_periodo('mes')
+            res_lucro = self.db.lucro_por_periodo('mes')
+            lucro_mes = res_lucro[0] if isinstance(res_lucro, tuple) else float(res_lucro or 0.0)
 
             # Estoque
             total_itens = df_produtos['quantidade'].sum() if not df_produtos.empty else 0
@@ -216,7 +267,9 @@ class ExpensePredictor:
             comp = self.db.comparativo_mensal()
             comp_txt = ""
             if comp:
-                comp_txt = f"Faturamento mês atual: R${comp.get('faturamento_atual', 0):.2f}, mês anterior: R${comp.get('faturamento_anterior', 0):.2f}"
+                fat_at = comp.get('atual', {}).get('faturamento', comp.get('faturamento_atual', 0))
+                fat_an = comp.get('anterior', {}).get('faturamento', comp.get('faturamento_anterior', 0))
+                comp_txt = f"Faturamento mês atual: R${fat_at:.2f}, mês anterior: R${fat_an:.2f}"
 
             # Vendedores
             vendedores_txt = ""
@@ -277,19 +330,19 @@ Pergunta do usuário: {pergunta}
 """
             
             model_candidates = [
-                "gemini-2.0-flash", 
-                "gemini-flash-latest",
-                "gemini-2.0-flash-lite", 
                 "gemini-2.5-flash",
-                "gemini-pro-latest"
+                "gemini-2.0-flash",
+                "gemini-2.0-flash-lite",
             ]
 
             last_error = None
             for model_name in model_candidates:
                 try:
                     logger.debug("Tentando conectar com modelo: %s", model_name)
-                    model = genai.GenerativeModel(model_name)
-                    response = model.generate_content(contexto)
+                    response = self.genai_client.models.generate_content(
+                        model=model_name,
+                        contents=contexto,
+                    )
                     return response.text
                 except Exception as e:
                     logger.debug("Falha ao tentar %s: %s", model_name, e)
@@ -689,7 +742,23 @@ Pergunta do usuário: {pergunta}
 
                 try:
                     valor_total = qtd * produto['preco']
-                    self.db.registrar_venda(produto['id'], qtd, valor_total)
+                    res_ai = self.db.registrar_venda_detalhada(
+                        [{
+                            'id': int(produto['id']),
+                            'nome': produto['nome'],
+                            'qtd': int(qtd),
+                            'preco': float(produto['preco']),
+                            'preco_compra': float(produto.get('preco_compra') or 0.0),
+                            'type': 'produto'
+                        }],
+                        valor_total,
+                        0.0,
+                        "Consumidor Final",
+                        "Dinheiro",
+                        vendedor="Assistente IA"
+                    )
+                    if isinstance(res_ai, tuple) and not res_ai[0]:
+                        return False, f"❌ Erro ao vender: {res_ai[1]}"
                     
                     # Proactive Trigger: Estoque Baixo Pós-Venda
                     nova_qtd = produto['quantidade'] - qtd
@@ -788,7 +857,8 @@ Pergunta do usuário: {pergunta}
             
             if not df_vendas.empty:
                 try:
-                    df_vendas['data_dt'] = pd.to_datetime(df_vendas['data'], errors='coerce').dt.date
+                    col_data = 'data_venda' if 'data_venda' in df_vendas.columns else 'data'
+                    df_vendas['data_dt'] = pd.to_datetime(df_vendas[col_data], errors='coerce').dt.date
                     v_hoje = df_vendas[df_vendas['data_dt'] == hoje]
                     vendas_hoje = v_hoje['valor_total'].sum()
                     num_vendas_hoje = len(v_hoje)
@@ -799,7 +869,8 @@ Pergunta do usuário: {pergunta}
                 except Exception:
                     pass
             
-            lucro_mes = self.db.lucro_por_periodo('mes')
+            res_lucro = self.db.lucro_por_periodo('mes')
+            lucro_mes = res_lucro[0] if isinstance(res_lucro, tuple) else float(res_lucro or 0.0)
             total_fiado = self.db.total_fiado_pendente()
             total_contas = self.db.total_contas_pagar_pendente()
             produtos_baixo = self.db.produtos_abaixo_estoque_minimo()
@@ -833,9 +904,10 @@ Pergunta do usuário: {pergunta}
         # === LUCRO ===
         if "lucro" in command or "lucrando" in command or "lucrei" in command:
             periodo = filtro_periodo or "mes"
-            periodo_map = {"hoje": "dia", "ontem": "dia", "semana": "semana", "mes": "mes", "ano": "ano", "trimestre": "mes"}
+            periodo_map = {"hoje": "hoje", "ontem": "hoje", "semana": "semana", "mes": "mes", "ano": "ano", "trimestre": "mes"}
             p = periodo_map.get(periodo, "mes")
-            lucro = self.db.lucro_por_periodo(p)
+            res_lucro = self.db.lucro_por_periodo(p)
+            lucro = res_lucro[0] if isinstance(res_lucro, tuple) else float(res_lucro or 0.0)
             periodo_txt = {"hoje": "hoje", "ontem": "ontem", "semana": "esta semana",
                           "mes": "este mês", "ano": "este ano", "trimestre": "este trimestre"}.get(periodo, "este mês")
             return True, f"📈 Lucro líquido {periodo_txt}: R$ {lucro:.2f}"
@@ -848,7 +920,8 @@ Pergunta do usuário: {pergunta}
                 return True, "📊 Nenhuma venda registrada ainda."
             
             try:
-                df_vendas['data_dt'] = pd.to_datetime(df_vendas['data'], errors='coerce').dt.date
+                col_data = 'data_venda' if 'data_venda' in df_vendas.columns else 'data'
+                df_vendas['data_dt'] = pd.to_datetime(df_vendas[col_data], errors='coerce').dt.date
             except Exception:
                 pass
 
@@ -884,7 +957,7 @@ Pergunta do usuário: {pergunta}
             
             detalhes = []
             for _, f in pendentes.head(10).iterrows():
-                nome_cli = f.get('cliente', 'Desconhecido')
+                nome_cli = f.get('cliente_nome') or f.get('cliente') or 'Desconhecido'
                 valor = f.get('valor', 0)
                 detalhes.append(f"  • {nome_cli}: R$ {valor:.2f}")
             
@@ -930,14 +1003,16 @@ Pergunta do usuário: {pergunta}
             return True, txt
 
         # === FORMA DE PAGAMENTO ===
-        if "forma de pagamento" in command or "pagamento mais" in command or "como pagam" in command or "pix" in command and "quanto" in command:
+        if "forma de pagamento" in command or "pagamento mais" in command or "como pagam" in command or ("pix" in command and "quanto" in command):
             df_fp = self.db.vendas_por_forma_pagamento()
             if df_fp.empty:
                 return True, "📊 Sem dados de vendas para análise de pagamento."
             
             txt = "💳 **Vendas por Forma de Pagamento:**\n"
             for _, r in df_fp.iterrows():
-                txt += f"  • {r.get('forma_pagamento', '?')}: R$ {r.get('total', 0):.2f} ({r.get('quantidade', 0)} vendas)\n"
+                forma_lbl = r.get('forma') or r.get('forma_pagamento') or '?'
+                qtd_lbl = r.get('qtd') if r.get('qtd') is not None else r.get('quantidade', 0)
+                txt += f"  • {forma_lbl}: R$ {r.get('total', 0):.2f} ({int(qtd_lbl)} vendas)\n"
             return True, txt
 
         # === VENDEDORES / QUEM MAIS VENDEU ===
@@ -952,7 +1027,8 @@ Pergunta do usuário: {pergunta}
                     if not vendas_v.empty:
                         txt = "🏆 **Desempenho dos Vendedores (últimos 30 dias):**\n"
                         for _, r in vendas_v.iterrows():
-                            txt += f"  • {r.get('vendedor', '?')}: {r.get('num_vendas', 0)} vendas | R$ {r.get('faturamento', 0):.2f}\n"
+                            fat_v = r.get('total_vendido') if r.get('total_vendido') is not None else r.get('faturamento', 0)
+                            txt += f"  • {r.get('vendedor', '?')}: {r.get('num_vendas', 0)} vendas | R$ {fat_v:.2f}\n"
                         return True, txt
                 except Exception:
                     pass
@@ -973,8 +1049,9 @@ Pergunta do usuário: {pergunta}
                 txt = f"👥 **{len(df_cli)} clientes cadastrados:**\n"
                 for _, c in df_cli.head(20).iterrows():
                     txt += f"  • {c['nome']}"
-                    if c.get('telefone'):
-                        txt += f" ({c['telefone']})"
+                    tel = c.get('contato') or c.get('telefone')
+                    if tel:
+                        txt += f" ({tel})"
                     txt += "\n"
                 if len(df_cli) > 20:
                     txt += f"  ... e mais {len(df_cli) - 20} clientes."
@@ -1025,8 +1102,8 @@ Pergunta do usuário: {pergunta}
             if not comp:
                 return True, "📊 Sem dados suficientes para comparativo mensal."
             
-            fat_atual = comp.get('faturamento_atual', 0)
-            fat_ant = comp.get('faturamento_anterior', 0)
+            fat_atual = comp.get('atual', {}).get('faturamento', comp.get('faturamento_atual', 0))
+            fat_ant = comp.get('anterior', {}).get('faturamento', comp.get('faturamento_anterior', 0))
             var = ((fat_atual - fat_ant) / fat_ant * 100) if fat_ant > 0 else 0
             seta = "📈" if var >= 0 else "📉"
             
@@ -1132,14 +1209,18 @@ Pergunta do usuário: {pergunta}
         # DRE / Demonstrativo de Resultados
         if "dre" in command or "demonstrativo" in command or "resultado do exercício" in command:
             try:
-                dre = self.db.gerar_dre(hoje.month, hoje.year)
+                dre = self.db.gerar_dre("mes")
                 if dre:
+                    custos = dre.get('custo_total', dre.get('custos', 0))
+                    despesas = dre.get('despesas_total', dre.get('despesas', 0))
                     return True, (
                         f"📊 **DRE — {hoje.strftime('%m/%Y')}:**\n"
                         f"  Receita Bruta: R$ {dre.get('receita_bruta', 0):.2f}\n"
-                        f"  (-) Custos: R$ {dre.get('custos', 0):.2f}\n"
+                        f"  (-) Deduções: R$ {dre.get('deducoes', 0):.2f}\n"
+                        f"  = Receita Líquida: R$ {dre.get('receita_liquida', 0):.2f}\n"
+                        f"  (-) Custos (CMV): R$ {custos:.2f}\n"
                         f"  = Lucro Bruto: R$ {dre.get('lucro_bruto', 0):.2f}\n"
-                        f"  (-) Despesas: R$ {dre.get('despesas', 0):.2f}\n"
+                        f"  (-) Despesas: R$ {despesas:.2f}\n"
                         f"  = Resultado Líquido: R$ {dre.get('resultado_liquido', 0):.2f}"
                     )
             except Exception:
@@ -1189,7 +1270,8 @@ Pergunta do usuário: {pergunta}
             
             # Analisar lucro
             try:
-                lucro = self.db.lucro_por_periodo('mes')
+                res_lucro = self.db.lucro_por_periodo('mes')
+                lucro = res_lucro[0] if isinstance(res_lucro, tuple) else float(res_lucro or 0.0)
                 if lucro < 0:
                     sugestoes.append(f"📉 Seu lucro do mês está NEGATIVO (R$ {lucro:.2f}). Revise seus custos e margem de preço.")
                 elif lucro > 0:

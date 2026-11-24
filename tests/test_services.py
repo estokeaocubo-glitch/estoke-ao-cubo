@@ -12,17 +12,28 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 @pytest.fixture
 def db():
     """Banco temporário para testes."""
-    with tempfile.TemporaryDirectory() as tmpdir:
-        import database
-        original_func = database.get_app_data_path
-        database.get_app_data_path = lambda: tmpdir
-        db_instance = database.Database(db_name="test_services.db")
-        yield db_instance
+    import gc
+    import time
+    tmpdir = tempfile.TemporaryDirectory()
+    import database
+    original_func = database.get_app_data_path
+    database.get_app_data_path = lambda: tmpdir.name
+    db_instance = database.Database(db_name="test_services.db")
+    yield db_instance
+    try:
+        db_instance.close()
+    except Exception:
+        pass
+    database.get_app_data_path = original_func
+    # Forçar coleta de lixo para liberar referências ao arquivo sqlite
+    gc.collect()
+    # Tentativas de limpeza do diretório temporário
+    for _ in range(10):
         try:
-            db_instance.close()
-        except Exception:
-            pass
-        database.get_app_data_path = original_func
+            tmpdir.cleanup()
+            break
+        except PermissionError:
+            time.sleep(0.15)
 
 
 @pytest.fixture

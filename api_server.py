@@ -17,7 +17,7 @@ logger = logging.getLogger('EstokeAoCubo.api')
 
 FLASK_AVAILABLE = False
 try:
-    from flask import Flask, jsonify, request
+    from flask import Flask, jsonify, request, Response, render_template_string
     FLASK_AVAILABLE = True
 except ImportError:
     logger.info("Flask não instalado. API REST indisponível. Instale com: pip install flask")
@@ -90,9 +90,10 @@ class EstokeAPI:
 
         # Prevenção de Sessões Órfãs: Verificar status ativo no banco em tempo real
         user_id = session["user"]["id"]
-        cursor = self.db.conn.cursor()
-        cursor.execute("SELECT ativo, perfil, loja_id FROM usuarios WHERE id=?", (user_id,))
-        row = cursor.fetchone()
+        with self.db._lock:
+            cursor = self.db.conn.cursor()
+            cursor.execute("SELECT ativo, perfil, loja_id FROM usuarios WHERE id=?", (user_id,))
+            row = cursor.fetchone()
         if not row or row[0] != 1:
             if token in self._sessions:
                 del self._sessions[token]
@@ -632,6 +633,251 @@ class EstokeAPI:
                 return err
             df = self.db.listar_metas()
             return jsonify(df.to_dict(orient='records'))
+
+        # ====================================================
+        # MERCADO PAGO PAGAMENTOS & NOTA FISCAL WEB
+        # ====================================================
+        @app.route('/api/pagamento/config', methods=['GET'])
+        def pagamento_config():
+            from services.mercadopago_service import get_mercadopago_service
+            mp = get_mercadopago_service()
+            return jsonify(mp.get_public_config())
+
+        @app.route('/api/pagamento/pix', methods=['POST'])
+        def pagamento_pix():
+            client_ip = request.remote_addr or '0.0.0.0'
+            if not self._rate_limiter.is_allowed(client_ip):
+                return jsonify({"error": "Rate limit excedido. Aguarde."}), 429
+            data = request.get_json(silent=True) or {}
+            try:
+                valor = float(data.get('valor', 0))
+            except (ValueError, TypeError):
+                valor = 0
+            if valor <= 0:
+                return jsonify({"error": "Valor inválido"}), 400
+            
+            descricao = data.get('descricao', 'Venda Estoke ao Cubo')
+            email = data.get('email')
+            nome = data.get('nome')
+            id_venda = data.get('id_venda')
+
+            from services.mercadopago_service import get_mercadopago_service
+            mp = get_mercadopago_service()
+            res = mp.criar_cobranca_pix(
+                valor=valor,
+                descricao=descricao,
+                cliente_email=email,
+                cliente_nome=nome,
+                id_venda=id_venda
+            )
+            if res.get('sucesso'):
+                return jsonify(res), 200
+            return jsonify(res), 400
+
+        @app.route('/api/pagamento/status/<payment_id>', methods=['GET'])
+        def pagamento_status(payment_id):
+            client_ip = request.remote_addr or '0.0.0.0'
+            if not self._rate_limiter.is_allowed(client_ip):
+                return jsonify({"error": "Rate limit excedido. Aguarde."}), 429
+            from services.mercadopago_service import get_mercadopago_service
+            mp = get_mercadopago_service()
+            res = mp.consultar_pagamento(payment_id)
+            if res.get("sucesso") and hasattr(self.db, "registrar_pagamento_mp"):
+                try:
+                    metodo = str(res.get("metodo_pagamento") or "").lower()
+                    tipo_mp = "pix" if metodo == "pix" else "cartao"
+                    self.db.registrar_pagamento_mp(
+                        payment_id=str(res.get("payment_id") or payment_id),
+                        tipo=tipo_mp,
+                        external_reference=str(res.get("external_reference") or ""),
+                        status=str(res.get("status") or "pending"),
+                        status_detail=str(res.get("status_detail") or ""),
+                        valor=float(res.get("valor") or 0.0),
+                        payload=res,
+                        data_aprovacao=str(res.get("data_aprovacao") or ""),
+                    )
+                except Exception as exc:
+                    logger.warning("Erro ao persistir consulta MP %s: %s", payment_id, exc)
+            return jsonify(res)
+
+        @app.route('/api/pagamento/cartao', methods=['POST'])
+        def pagamento_cartao():
+            client_ip = request.remote_addr or '0.0.0.0'
+            if not self._rate_limiter.is_allowed(client_ip):
+                return jsonify({"error": "Rate limit excedido. Aguarde."}), 429
+            data = request.get_json(silent=True) or {}
+            token = data.get('token')
+            try:
+                valor = float(data.get('valor', 0))
+            except (ValueError, TypeError):
+                valor = 0
+            parcelas = int(data.get('parcelas', 1))
+            method_id = data.get('payment_method_id', 'master')
+            email = data.get('email')
+            id_venda = data.get('id_venda')
+
+            if not token or valor <= 0:
+                return jsonify({"error": "Token e valor válidos são obrigatórios"}), 400
+
+            from services.mercadopago_service import get_mercadopago_service
+            mp = get_mercadopago_service()
+            res = mp.processar_pagamento_cartao(
+                token=token,
+                valor=valor,
+                parcelas=parcelas,
+                payment_method_id=method_id,
+                cliente_email=email,
+                id_venda=id_venda
+            )
+            return jsonify(res)
+
+        @app.route('/api/pagamento/webhook', methods=['POST'])
+        def pagamento_webhook():
+            data = request.get_json(silent=True) or {}
+            logger.info("Webhook Mercado Pago recebido: %s", data)
+            from services.mercadopago_service import get_mercadopago_service
+            mp = get_mercadopago_service()
+
+            data_id = str((data.get("data") or {}).get("id") or data.get("id") or request.args.get("data.id") or "")
+            x_sig = request.headers.get("x-signature", "")
+            x_req_id = request.headers.get("x-request-id", "")
+
+            if not mp.validar_assinatura_webhook(x_sig, x_req_id, data_id):
+                logger.warning("Assinatura de webhook Mercado Pago inválida.")
+                return jsonify({"error": "Assinatura inválida"}), 401
+
+            if data_id and mp.esta_configurado():
+                try:
+                    info = mp.consultar_pagamento(data_id)
+                    if info.get("sucesso") and hasattr(self.db, "registrar_pagamento_mp"):
+                        metodo = str(info.get("metodo_pagamento") or "").lower()
+                        tipo_mp = "pix" if metodo == "pix" else ("point" if metodo in ("debit_card", "credit_card") and info.get("point_intent_id") else "cartao")
+                        self.db.registrar_pagamento_mp(
+                            payment_id=str(info.get("payment_id") or data_id),
+                            tipo=tipo_mp,
+                            external_reference=str(info.get("external_reference") or data.get("external_reference") or ""),
+                            status=str(info.get("status") or "pending"),
+                            status_detail=str(info.get("status_detail") or ""),
+                            valor=float(info.get("valor") or 0.0),
+                            payload=info,
+                            data_aprovacao=str(info.get("data_aprovacao") or ""),
+                        )
+                    if info.get("aprovado"):
+                        self.db.registrar_alteracao(
+                            "Webhook Mercado Pago",
+                            f"Pagamento #{data_id} aprovado (R$ {info.get('valor', 0):.2f})",
+                            entidade="pagamentos_mp",
+                            entidade_id=str(data_id),
+                            depois={"status": "approved", "valor": info.get("valor", 0), "external_reference": info.get("external_reference", "")},
+                        )
+                except Exception as we:
+                    logger.warning("Erro ao conciliar webhook MP %s: %s", data_id, we)
+
+            return jsonify({"status": "received"}), 200
+
+        @app.route('/recibo/<venda_id>', methods=['GET'])
+        def visualizar_recibo(venda_id):
+            """Renderiza a Nota Fiscal no Padrão de Design do Drive diretamente pelo navegador."""
+            client_ip = request.remote_addr or '0.0.0.0'
+            if not self._rate_limiter.is_allowed(client_ip):
+                return "Rate limit excedido. Aguarde.", 429
+            try:
+                import invoice_generator
+                with self.db._lock:
+                    config_nota = self.db.get_config_nota()
+                    cursor = self.db.conn.cursor()
+                    cursor.execute(
+                        "SELECT id, produto_id, quantidade, valor_total, data_venda, cliente, desconto, forma_pagamento, transacao_id FROM vendas WHERE id=?",
+                        (venda_id,)
+                    )
+                    rows = cursor.fetchall()
+
+                    if rows and rows[0][8]:
+                        # Se pertencer a uma transação com múltiplos itens, carregar todos os itens da transação
+                        cursor.execute(
+                            "SELECT id, produto_id, quantidade, valor_total, data_venda, cliente, desconto, forma_pagamento FROM vendas WHERE transacao_id=?",
+                            (rows[0][8],)
+                        )
+                        rows = cursor.fetchall()
+
+                    if rows:
+                        itens = []
+                        total_bruto = 0.0
+                        desconto_total = 0.0
+                        for row in rows:
+                            cursor.execute("SELECT nome, preco FROM produtos WHERE id=?", (row[1],))
+                            p_row = cursor.fetchone()
+                            qtd = row[2] or 1
+                            val_item = float(row[3] or 0.0)
+                            desc_item = float(row[6] or 0.0)
+                            prod_nome = p_row[0] if p_row else f"Produto #{row[1] or row[0]}"
+                            prod_preco = float(p_row[1]) if (p_row and p_row[1] is not None) else (val_item / max(qtd, 1))
+                            itens.append({
+                                "nome": prod_nome,
+                                "qtd": qtd,
+                                "preco": prod_preco,
+                                "desconto_item": desc_item
+                            })
+                            total_bruto += val_item
+                            desconto_total += desc_item
+                        cliente = {"nome": rows[0][5] or "Consumidor Final"}
+                        total_venda = round(total_bruto - desconto_total, 2)
+                        desconto = round(desconto_total, 2)
+                        forma_pgto = rows[0][7] or "PIX"
+                    else:
+                        itens = [{"nome": "Venda #" + str(venda_id), "qtd": 1, "preco": 100.0}]
+                        cliente = {"nome": "Cliente"}
+                        total_venda = 100.0
+                        desconto = 0.0
+                        forma_pgto = "PIX"
+
+                html = invoice_generator.gerar_nota_html(
+                    itens=itens,
+                    cliente=cliente,
+                    total_venda=total_venda,
+                    id_venda=str(venda_id),
+                    desconto=desconto,
+                    forma_pagamento=forma_pgto,
+                    config_nota=config_nota
+                )
+                return Response(html, mimetype='text/html')
+            except Exception as e:
+                logger.error("Erro ao gerar recibo web: %s", e)
+                return "Erro interno ao gerar recibo.", 500
+
+        @app.route('/', methods=['GET'])
+        @app.route('/loja', methods=['GET'])
+        def index_page():
+            """Serve o site oficial do Estoke ao Cubo com catálogo e checkout Mercado Pago."""
+            import paths
+            caminhos = [
+                paths.get_resource_path("index.html"),
+                os.path.join(paths.get_install_dir(), "index.html"),
+                os.path.join(os.path.dirname(__file__), "..", "index.html"),
+                os.path.join(os.path.dirname(__file__), "index.html"),
+            ]
+            for c in caminhos:
+                if os.path.exists(c):
+                    with open(c, 'r', encoding='utf-8') as f:
+                        return Response(f.read(), mimetype='text/html')
+            return "Site Estoke ao Cubo ativo.", 200
+
+        @app.route('/scanner', methods=['GET'])
+        @app.route('/pdv-web', methods=['GET'])
+        def scanner_page():
+            """Serve o PDV Web e leitor ao vivo com checkout Mercado Pago."""
+            import paths
+            caminhos = [
+                paths.get_resource_path("live_scanner.html"),
+                os.path.join(paths.get_install_dir(), "live_scanner.html"),
+                os.path.join(os.path.dirname(__file__), "..", "live_scanner.html"),
+                os.path.join(os.path.dirname(__file__), "live_scanner.html"),
+            ]
+            for c in caminhos:
+                if os.path.exists(c):
+                    with open(c, 'r', encoding='utf-8') as f:
+                        return Response(f.read(), mimetype='text/html')
+            return "PDV Web ativo.", 200
 
     def start(self):
         """Inicia o servidor API em background."""

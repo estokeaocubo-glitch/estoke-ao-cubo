@@ -33,31 +33,39 @@ except ImportError:
 import api_server
 
 # --- Ícone na barra de tarefas do Windows ---
-# Define um AppUserModelID para que o Windows exiba o ícone do app
-# em vez do ícone padrão do Python na barra de tarefas.
+# Define um AppUserModelID exclusivo para que o Windows exiba o ícone nítido do app
+# e descarte qualquer cache desatualizado/pixelizado da barra de tarefas.
 try:
-    ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID('EstokeAoCubo.App.2.3')
+    ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID('EstokeAoCubo.App.4.6')
 except Exception:
     pass
 
 # configuração e impressão
 import config
-from config import get_printer_config, set_printer_config, get_business_type, set_business_type, verify_admin, get_admin_credentials, set_admin_credentials
+from config import get_printer_config, set_printer_config, get_business_type, set_business_type, verify_admin, get_admin_credentials, set_admin_credentials, admin_needs_setup
 from printer import get_printer
 import json
+from logging.handlers import RotatingFileHandler
+import crash_handler
+import paths
 
-# --- Configuração de Logging ---
-_log_dir = os.path.join(os.getenv('LOCALAPPDATA', os.path.expanduser('~')), 'EstokeAoCubo')
-os.makedirs(_log_dir, exist_ok=True)
+# --- Configuração de Logging com Rotação Automática (Máx 5MB x 3 arquivos) ---
+_log_dir = paths.get_app_data_path("logs")
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
     handlers=[
-        logging.FileHandler(os.path.join(_log_dir, 'app.log'), encoding='utf-8'),
+        RotatingFileHandler(
+            os.path.join(_log_dir, 'app.log'),
+            maxBytes=5 * 1024 * 1024,
+            backupCount=3,
+            encoding='utf-8'
+        ),
         logging.StreamHandler()
     ]
 )
 logger = logging.getLogger('EstokeAoCubo')
+crash_handler.install_crash_handlers(show_ui=True)
 
 # --- Monkeypatch para corrigir bug do CTkButton.destroy ---
 # O erro ocorre porque _font às vezes não existe quando destroy é chamado.
@@ -76,10 +84,8 @@ CTkButton.destroy = _safe_destroy
 # ----------------------------------------------------------
 
 def get_base_path():
-    """Retorna o caminho base da aplicação (compatível com PyInstaller)."""
-    if getattr(sys, 'frozen', False):
-        return sys._MEIPASS
-    return os.path.dirname(os.path.abspath(__file__))
+    """Retorna o caminho base de recursos somente-leitura (compatível com PyInstaller _MEIPASS)."""
+    return paths.get_resource_path()
 
 ctk.set_appearance_mode("Light")  # Modes: "System" (standard), "Dark", "Light"
 ctk.set_default_color_theme("blue")  # Themes: "blue" (standard), "green", "dark-blue"
@@ -89,32 +95,52 @@ class App(ctk.CTk):
         super().__init__()
 
         self.title("Estoke ao Cubo - Gestão Inteligente")
-        self.geometry("1100x950")
+        try:
+            screen_h = self.winfo_screenheight()
+            win_h = min(900, max(680, screen_h - 80))
+        except Exception:
+            win_h = 800
+        self.geometry(f"1100x{win_h}")
         self.minsize(800, 500)
         self.configure(fg_color=("#F0F0F5", "#191919")) # Fundo levemente lavanda/cinza para contraste com botões glass
+        self._thumbnail_cache = {}
+        self._last_dashboard_render_ts = 0.0
 
-        # Adicionar ícone da aplicação (titlebar + taskbar)
+        # Adicionar ícone da aplicação em alta definição (titlebar + taskbar + Alt+Tab)
         self._icon_path_ico = None
+        self._icon_photos = []
+        self._hicon_big = None
+        self._hicon_small = None
         try:
             base_path = get_base_path()
             icon_path_ico = os.path.join(base_path, "icon", "icon-cubo.ico")
             icon_path_png = os.path.join(base_path, "icon", "icon-cubo.png")
 
-            if os.path.exists(icon_path_ico):
-                self._icon_path_ico = icon_path_ico
-                # Aplica o ícone como padrão para todas as janelas
-                self.iconbitmap(default=icon_path_ico)
-                self.iconbitmap(icon_path_ico)
-                # Reaplica múltiplas vezes — customtkinter pode resetar
-                self.after(100, self._forcar_icone)
-                self.after(500, self._forcar_icone)
-                self.after(1500, self._forcar_icone)
-            elif os.path.exists(icon_path_png):
-                icon_image = Image.open(icon_path_png)
-                icon_image = icon_image.resize((128, 128), Image.Resampling.LANCZOS)
-                photo = ImageTk.PhotoImage(icon_image)
-                self.iconphoto(False, photo)
-                self._icon_photo = photo  # manter referência
+            # No Windows, NÃO chamar iconphoto() pois o Tk converte PhotoImage para 16/32px
+            # e sobrescreve WM_SETICON com bitmap pixelizado na taskbar HiDPI.
+            # Usar .ico multi-resolução + Win32 LoadImageW(256x256) / WM_SETICON diretamente.
+            if os.name == "nt":
+                if os.path.exists(icon_path_ico):
+                    self._icon_path_ico = icon_path_ico
+                    try:
+                        self.iconbitmap(default=icon_path_ico)
+                        self.iconbitmap(icon_path_ico)
+                    except Exception:
+                        pass
+            else:
+                if os.path.exists(icon_path_png):
+                    master_png = Image.open(icon_path_png)
+                    for sz in (256, 128, 64, 48, 32, 24, 16):
+                        resized = master_png.resize((sz, sz), Image.Resampling.LANCZOS)
+                        self._icon_photos.append(ImageTk.PhotoImage(resized))
+                    if self._icon_photos:
+                        self.iconphoto(True, *self._icon_photos)
+
+            # Reaplica após o timer de 200ms do CustomTkinter para garantir ícone HD definitivo
+            self.after(50, self._forcar_icone)
+            self.after(250, self._forcar_icone)
+            self.after(600, self._forcar_icone)
+            self.after(1500, self._forcar_icone)
         except Exception as e:
             logger.warning("Erro ao carregar ícone: %s", e)
 
@@ -138,6 +164,17 @@ class App(ctk.CTk):
 
         # Sessão do usuário logado (None = sem login multi-usuário)
         self.current_user = None
+        self._ultimo_cupom = None
+        self._pending_installer_path = None
+
+        # Fila Outbox offline, agendador de rotinas (Onda 3) e serviço fiscal NFC-e (Onda 4)
+        from services.outbox_service import OutboxService
+        from services.scheduler import RoutineScheduler
+        from services.fiscal_service import FiscalService
+        self.outbox_service = OutboxService(self.db)
+        self.routine_scheduler = RoutineScheduler(self.db, self.outbox_service)
+        self.fiscal_service = FiscalService(self.db, outbox_service=self.outbox_service)
+        self.db._fiscal_service = self.fiscal_service
 
         # Gerenciador de notificações toast
         self.notifier = NotificationManager(self)
@@ -155,6 +192,132 @@ class App(ctk.CTk):
             self._show_first_access_screen()
         else:
             self._show_login_screen()
+
+    def check_trial_limits(self, type_to_add, parent_win=None):
+        """
+        Verifica se os limites da versão trial foram atingidos.
+        Retorna True se o limite foi atingido (bloqueando a ação) e exibe o modal de upgrade.
+        Retorna False se a ação for permitida.
+        """
+        if not self.db.is_trial_mode():
+            return False
+
+        if type_to_add == 'produto':
+            if self.db.contar_produtos() >= 10:
+                self.show_trial_limit_modal(parent_win)
+                return True
+        elif type_to_add == 'transacao':
+            if self.db.contar_transacoes() >= 5:
+                self.show_trial_limit_modal(parent_win)
+                return True
+        return False
+
+    def show_trial_limit_modal(self, parent_win=None):
+        """
+        Exibe um modal de CustomTkinter premium e com design sofisticado (dark/glassmorphism)
+        informando que o limite do trial foi atingido, com um botão que redireciona para o WhatsApp de vendas.
+        """
+        import webbrowser
+        
+        # Determinar a janela pai para centralização
+        parent = parent_win if parent_win else self
+        
+        # Criar janela de nível superior (Toplevel)
+        modal = ctk.CTkToplevel(parent)
+        modal.title("Limite de Teste Atingido")
+        modal.geometry("520x340")
+        modal.resizable(False, False)
+        
+        # Traz o modal para a frente e o torna modal
+        modal.transient(parent)
+        modal.grab_set()
+        modal.focus_set()
+        
+        # Centralizar a janela em relação ao pai
+        x = parent.winfo_x() + (parent.winfo_width() // 2) - 260
+        y = parent.winfo_y() + (parent.winfo_height() // 2) - 170
+        modal.geometry(f"+{x}+{y}")
+        
+        # Forçar o ícone
+        if hasattr(self, '_icon_path_ico') and self._icon_path_ico:
+            try:
+                modal.iconbitmap(self._icon_path_ico)
+            except Exception:
+                pass
+
+        # Container Principal com visual premium (Dark Mode estético)
+        main_frame = ctk.CTkFrame(modal, corner_radius=18, fg_color=("#1A1A1E", "#151518"), border_width=2, border_color="#33333C")
+        main_frame.pack(fill="both", expand=True, padx=12, pady=12)
+        
+        # Título
+        title_label = ctk.CTkLabel(
+            main_frame,
+            text="Limite do Trial Atingido! 🚀",
+            font=("Segoe UI", 20, "bold"),
+            text_color="#FFA500"
+        )
+        title_label.pack(pady=(25, 15))
+        
+        # Mensagem persuasiva
+        msg_text = (
+            "Você atingiu o limite da versão de teste (máximo de 10 produtos e 5 movimentações).\n\n"
+            "Assine a versão completa por apenas R$ 60/mês para liberar cadastros e "
+            "vendas ilimitados e desfrutar de toda a potência do Estoke ao Cubo!"
+        )
+        msg_label = ctk.CTkLabel(
+            main_frame,
+            text=msg_text,
+            font=("Segoe UI", 13),
+            text_color="#E0E0E6",
+            justify="center",
+            wraplength=440
+        )
+        msg_label.pack(pady=(0, 20), padx=25)
+        
+        # Frame de Ações (Botões)
+        actions_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
+        actions_frame.pack(fill="x", side="bottom", pady=(0, 25), padx=25)
+        
+        def open_whatsapp():
+            phone = "5524992992130"
+            message = "Olá! Gostaria de assinar a versão completa do Estoke ao Cubo por R$ 60/mês. Atingi o limite do trial."
+            import urllib.parse
+            url = f"https://wa.me/{phone}?text={urllib.parse.quote(message)}"
+            webbrowser.open(url)
+            modal.grab_release()
+            modal.destroy()
+
+        def close_modal():
+            modal.grab_release()
+            modal.destroy()
+            
+        # Botão Whatsapp (Verde premium)
+        whatsapp_btn = ctk.CTkButton(
+            actions_frame,
+            text="💬 Assinar Versão Completa (R$ 60/mês)",
+            font=("Segoe UI", 13, "bold"),
+            fg_color="#128C7E",
+            hover_color="#075E54",
+            text_color="#FFFFFF",
+            corner_radius=10,
+            height=40,
+            command=open_whatsapp
+        )
+        whatsapp_btn.pack(fill="x", pady=(0, 10))
+        
+        # Botão Fechar / Continuar depois
+        close_btn = ctk.CTkButton(
+            actions_frame,
+            text="Voltar",
+            font=("Segoe UI", 12),
+            fg_color="transparent",
+            hover_color=("#E5E5E5", "#2D2D35"),
+            text_color="#B0B0B8",
+            corner_radius=10,
+            height=30,
+            command=close_modal
+        )
+        close_btn.pack(fill="x")
 
     def _get_os_config(self):
         """Retorna status, cores, ícones e rótulos de OS adaptados ao tipo de negócio."""
@@ -235,21 +398,47 @@ class App(ctk.CTk):
         ctk.CTkLabel(inner, text="Selecione o tipo do seu negócio para personalizar a experiência:",
                      font=("Aileron", 13), text_color=("gray40", "gray70")).pack(pady=(0, 25))
 
-        # Grid de cards
-        cards_frame = ctk.CTkFrame(inner, fg_color="transparent")
-        cards_frame.pack()
+        # Grid de cards com scroll
+        cards_frame = ctk.CTkScrollableFrame(inner, width=880, height=360, fg_color="transparent")
+        cards_frame.pack(pady=(0, 10))
 
         business_options = [
-            {"key": "artesanato", "title": "Artesanato", "icon": "🎨",
-             "desc": "Produtos feitos à mão,\ncálculo de horas e materiais", "color": "#E8A87C"},
-            {"key": "padaria_acougue", "title": "Padaria / Açougue", "icon": "🥖",
-             "desc": "Venda por peso (kg/g),\nprodutos perecíveis", "color": "#D4A373"},
-            {"key": "loja_roupa", "title": "Loja de Roupas", "icon": "👗",
-             "desc": "Tamanhos P/M/G/GG,\nsapatos e calças", "color": "#7BBDE8"},
-            {"key": "restaurante", "title": "Restaurante", "icon": "🍽️",
-             "desc": "Mesas, comandas,\ncozinha e delivery", "color": "#E07B56"},
-            {"key": "variados", "title": "Variados", "icon": "🏪",
-             "desc": "Loja geral, conveniência,\nprodutos diversos", "color": "#85C1E9"},
+            {"key": "pet_shop_agro", "title": "Pet Shop & Agro", "icon": "🐾",
+             "desc": "Produtos, ração a granel,\nbanho, tosa e agendamento", "color": "#27AE60"},
+            {"key": "oficina_mecanica", "title": "Oficina & Motopeças", "icon": "🔧",
+             "desc": "OS completa, mecânicos,\npeças e dados do veículo", "color": "#D35400"},
+            {"key": "farmacia_suplementos", "title": "Farmácia & Nutrição", "icon": "💊",
+             "desc": "Controle por lote e validade,\nalertas de vencimento", "color": "#16A085"},
+            {"key": "papelaria_livraria", "title": "Papelaria & Livraria", "icon": "📚",
+             "desc": "Alto volume de SKUs, ISBN,\nleitor rápido e código barras", "color": "#8E44AD"},
+            {"key": "otica_joalheria", "title": "Ótica & Joalheria", "icon": "👓",
+             "desc": "Alto valor, nº de série único,\ngarantias e receitas", "color": "#E67E22"},
+            {"key": "treinamento_recorrencia", "title": "Estúdios & Treino", "icon": "🥋",
+             "desc": "Mensalidades, turmas/alunos\ne vendas no balcão", "color": "#2980B9"},
+            {"key": "tecnologia_informatica", "title": "Tecnologia & TI", "icon": "💻",
+             "desc": "Manutenção, upgrades, hardware,\nservidores e assistência", "color": "#0088FF"},
+            {"key": "estetica_automotiva", "title": "Estética Automotiva", "icon": "🚗",
+             "desc": "Car detailing, polimento,\nhigienização e lavagem", "color": "#E74C3C"},
+            {"key": "moda_customizacao", "title": "Moda & Customização", "icon": "👗",
+             "desc": "Boutiques, ateliês, ajustes\nrápidos e peças sob medida", "color": "#9B59B6"},
+            {"key": "festas_eventos", "title": "Festas & Eventos", "icon": "🎉",
+             "desc": "Suprimentos, locação de itens,\ndecoração e pegue-monte", "color": "#F39C12"},
+            {"key": "estetica_arte_corporal", "title": "Arte Corporal & Estética", "icon": "✂️",
+             "desc": "Tatuagem, barbearias, salões\ne agendamentos digitais", "color": "#1ABC9C"},
+            {"key": "delivery_alimentacao", "title": "Delivery & Alimentação", "icon": "🍔",
+             "desc": "Lanches, doces, combos ágeis\ne automação via WhatsApp", "color": "#E67E22"},
+            {"key": "casa_construcao", "title": "Casa & Construção", "icon": "🔨",
+             "desc": "Ferragens, suprimentos do dia a dia\ne gestão para condomínios", "color": "#34495E"},
+            {"key": "loja_roupa", "title": "Loja de Roupas Geral", "icon": "👔",
+             "desc": "Tamanhos P/M/G/GG, calçados\ne controle de trocas", "color": "#7BBDE8"},
+            {"key": "padaria_acougue", "title": "Padaria & Açougue", "icon": "🥖",
+             "desc": "Venda por peso (kg/g),\nbalança e perecíveis", "color": "#D4A373"},
+            {"key": "restaurante", "title": "Restaurante & Bar", "icon": "🍽️",
+             "desc": "Mesas, comandas digitais,\ncozinha e garçons", "color": "#E07B56"},
+            {"key": "artesanato", "title": "Artesanato & Handmade", "icon": "🎨",
+             "desc": "Produtos manuais, insumos\ne cálculo de materiais", "color": "#E8A87C"},
+            {"key": "variados", "title": "Comércio Geral", "icon": "🏪",
+             "desc": "Mercados, conveniências,\nprodutos diversos", "color": "#85C1E9"},
         ]
 
         select_buttons = []
@@ -261,22 +450,24 @@ class App(ctk.CTk):
             self._show_login_screen()
 
         for i, opt in enumerate(business_options):
-            card = ctk.CTkFrame(cards_frame, width=200, height=200, fg_color=("white", "#2B2B2B"),
-                               corner_radius=15, border_width=2, border_color=(opt["color"], opt["color"]))
-            card.grid(row=0, column=i, padx=12, pady=10)
+            row_idx = i // 4
+            col_idx = i % 4
+            card = ctk.CTkFrame(cards_frame, width=205, height=165, fg_color=("white", "#2B2B2B"),
+                               corner_radius=14, border_width=2, border_color=(opt["color"], opt["color"]))
+            card.grid(row=row_idx, column=col_idx, padx=6, pady=6)
             card.grid_propagate(False)
 
             content = ctk.CTkFrame(card, fg_color="transparent")
             content.place(relx=0.5, rely=0.5, anchor="center")
 
-            ctk.CTkLabel(content, text=opt["icon"], font=("Segoe UI Emoji", 36)).pack(pady=(0, 5))
-            ctk.CTkLabel(content, text=opt["title"], font=("Aileron", 14, "bold"),
-                        text_color=("#001D39", "white")).pack(pady=(0, 5))
-            ctk.CTkLabel(content, text=opt["desc"], font=("Aileron", 10),
-                        text_color=("gray40", "gray70"), justify="center").pack(pady=(0, 10))
-            btn = ctk.CTkButton(content, text="Selecionar", height=32, corner_radius=20,
+            ctk.CTkLabel(content, text=opt["icon"], font=("Segoe UI Emoji", 28)).pack(pady=(0, 2))
+            ctk.CTkLabel(content, text=opt["title"], font=("Aileron", 12, "bold"),
+                        text_color=("#001D39", "white")).pack(pady=(0, 2))
+            ctk.CTkLabel(content, text=opt["desc"], font=("Aileron", 9),
+                        text_color=("gray40", "gray70"), justify="center").pack(pady=(0, 6))
+            btn = ctk.CTkButton(content, text="Selecionar", height=28, width=120, corner_radius=16,
                          fg_color=opt["color"], hover_color="#49769F",
-                         text_color="white", font=("Aileron", 11, "bold"),
+                         text_color="white", font=("Aileron", 10, "bold"),
                          command=lambda k=opt["key"]: _select_business(k),
                          state="disabled")
             btn.pack()
@@ -310,10 +501,9 @@ class App(ctk.CTk):
 
         def _open_terms():
             try:
-                base_path = get_base_path()
-                terms_path = os.path.join(base_path, "TERMOS_DE_USO.txt")
+                terms_path = paths.get_resource_path("TERMOS_DE_USO.txt")
                 if not os.path.exists(terms_path):
-                    terms_path = os.path.join(os.path.dirname(sys.executable), "TERMOS_DE_USO.txt")
+                    terms_path = os.path.join(paths.get_install_dir(), "TERMOS_DE_USO.txt")
                 if os.path.exists(terms_path):
                     os.startfile(terms_path)
                 else:
@@ -346,21 +536,79 @@ class App(ctk.CTk):
         "ANOTA TUDO": "vender",
         "VENDEDORES": "vendedores", "CONFIG": "ver_config", "CHAT IA": "chat_ia",
         "INSUMOS": "insumos", "PRODUÇÃO": "producao", "TROCAS": "vender",
-        "REPOSIÇÃO": "adicionar", "MESAS": "mesas", "COMANDAS": "mesas",
+        "REPOSIÇÃO": "adicionar", "INVENTÁRIO": "editar", "COMPRAS": "adicionar",
+        "MESAS": "mesas", "COMANDAS": "mesas",
         "COZINHA": "mesas", "CONTAS PAGAR": "contas_pagar", "ETIQUETAS": "etiquetas",
         "ADICIONAR": "adicionar", "VENDER": "vender", "SERVIÇO": "vender",
         "LISTA": "editar", "RELATORIO": "ver_relatorio", "DRE": "ver_relatorio",
     }
 
     def _tem_permissao(self, acao_btn):
-        """Verifica se o usuário logado tem permissão para a ação."""
-        if self.current_user is None:
-            return True
-        perfil = self.current_user.get("perfil", "vendedor")
+        """Verifica se o usuário logado tem permissão para a ação (fail-closed)."""
+        if not self.current_user or not isinstance(self.current_user, dict):
+            return False
+        perfil = self.current_user.get("perfil")
+        if not perfil:
+            return False
         chave = self._PERMISSAO_MAP.get(acao_btn, "")
         if not chave:
             return perfil == "admin"
-        return self.db.usuario_tem_permissao(perfil, chave)
+        return bool(self.db.usuario_tem_permissao(perfil, chave))
+
+    def report_callback_exception(self, exc, val, tb):
+        """Captura exceções em callbacks do Tkinter/CustomTkinter com log e diálogo de diagnóstico."""
+        info = crash_handler.record_crash(exc, val, tb, context="tk.report_callback_exception")
+        crash_handler.show_crash_dialog(info, parent=self)
+
+    def _exigir_supervisor(self, acao: str, parent=None, exigir_motivo: bool = False, exigir_senha_sempre: bool = False):
+        """Solicita autorização de perfil Admin/Gerente para ações sensíveis (auditoria + anti-fraude)."""
+        from views.supervisor_dialog import solicitar_autorizacao_supervisor
+        ok, info = solicitar_autorizacao_supervisor(
+            self,
+            acao=acao,
+            exigir_motivo=exigir_motivo,
+            parent=parent or self,
+            exigir_senha_sempre=exigir_senha_sempre,
+        )
+        return (ok, info) if exigir_motivo else ok
+
+    def reimprimir_ultimo_cupom(self, parent=None):
+        """Reimprime o último cupom emitido na sessão atual ou recuperado do cache de recibos (F11)."""
+        target_parent = parent or self
+        ultimo = getattr(self, "_ultimo_cupom", None)
+        if ultimo and ultimo.get("text"):
+            try:
+                printer = get_printer()
+                printer.print_text(ultimo["text"], logo_path=ultimo.get("logo_path"), venda_id=ultimo.get("venda_id"))
+                self.db.registrar_alteracao(
+                    "Reimprimir Cupom",
+                    f"Reimpressão do último cupom (Venda #{ultimo.get('venda_id') or 'N/A'})",
+                    entidade="impressoes",
+                    entidade_id=str(ultimo.get("venda_id") or ""),
+                )
+                try:
+                    self.notifier.notify("Reimpressão", "Último cupom reenviado para impressão!", "info")
+                except Exception:
+                    messagebox.showinfo("Reimpressão", "Último cupom reenviado para impressão!", parent=target_parent)
+                return True
+            except Exception as exc:
+                logger.warning("Erro ao reimprimir último cupom: %s", exc)
+                messagebox.showerror("Erro de Impressão", f"Não foi possível reimprimir: {exc}", parent=target_parent)
+                return False
+
+        try:
+            from printer import ReceiptAuditor
+            cached = ReceiptAuditor().recuperar_ultimo_recibo()
+            if cached and "=== INICIO RECIBO" in cached:
+                get_printer().print_text(cached)
+                self.db.registrar_alteracao("Reimprimir Cupom", "Reimpressão do último recibo em cache.")
+                messagebox.showinfo("Reimpressão", "Último recibo do histórico enviado para impressão!", parent=target_parent)
+                return True
+        except Exception as exc:
+            logger.warning("Erro ao recuperar recibo para reimpressão: %s", exc)
+
+        messagebox.showinfo("Reimpressão", "Nenhum cupom recente disponível para reimprimir.", parent=target_parent)
+        return False
 
     def _show_login_screen(self):
         """Tela de login — autenticação do usuário."""
@@ -413,12 +661,19 @@ class App(ctk.CTk):
             user = self.db.autenticar_usuario(login_val, senha_val)
             if user:
                 self.current_user = user
+                self.db.set_current_user(user)
                 self._login_frame.destroy()
                 self.grid_columnconfigure(0, weight=0)
                 self.grid_columnconfigure(1, weight=1)
                 self.grid_rowconfigure(0, weight=0)
                 self.grid_rowconfigure(1, weight=1)
                 self._build_main_ui()
+                if user.get("trocar_senha"):
+                    self.after(300, lambda: messagebox.showwarning(
+                        "Segurança — Senha Padrão",
+                        "Você está utilizando a senha padrão inicial.\nPor segurança, altere sua senha em Configurações > Usuários.",
+                        parent=self
+                    ))
             else:
                 lbl_erro.configure(text="Usuário ou senha incorretos!")
 
@@ -426,8 +681,16 @@ class App(ctk.CTk):
                       fg_color="#0A4174", hover_color="#062F56", text_color="white",
                       font=("Aileron", 13, "bold"), height=40, width=290).pack(padx=30, pady=(10, 5))
 
-        ctk.CTkLabel(login_card, text="Primeiro acesso? Use: admincentral / admin9438",
-                     font=("Aileron", 10), text_color=("gray50", "gray60")).pack(pady=(0, 15))
+        try:
+            _cur = self.db.conn.cursor()
+            _cur.execute("SELECT trocar_senha FROM usuarios WHERE login = 'admincentral'")
+            _row_adm = _cur.fetchone()
+            _mostrar_dica = bool(_row_adm and _row_adm[0])
+        except Exception:
+            _mostrar_dica = False
+        if _mostrar_dica:
+            ctk.CTkLabel(login_card, text="Primeiro acesso? Use: admincentral / admin9438",
+                         font=("Aileron", 10), text_color=("gray50", "gray60")).pack(pady=(0, 15))
 
         entry_user.focus_set()
         entry_pass.bind("<Return>", lambda e: _fazer_login())
@@ -450,7 +713,7 @@ class App(ctk.CTk):
                 pil_image = Image.open(icon_path)
                 self.logo_image = ctk.CTkImage(light_image=pil_image, 
                                         dark_image=pil_image, 
-                                        size=(120, 120))
+                                        size=(85, 85))
                 
                 logo_img_label = ctk.CTkLabel(self.sidebar_frame, image=self.logo_image, text="")
                 logo_img_label.grid(row=0, column=0, padx=15, pady=(15, 10))
@@ -469,24 +732,63 @@ class App(ctk.CTk):
         self._sidebar_scroll.grid_columnconfigure(0, weight=1)
 
         self.sidebar_buttons = [
-            "SALDO", "GASTOS", "CAIXA", "KITS", "CATEGORIAS", "FORNECEDORES",
+            "SALDO", "GASTOS", "CAIXA", "KITS", "INVENTÁRIO", "COMPRAS", "CATEGORIAS", "FORNECEDORES",
             "CLIENTES", "ANOTA TUDO", "VENDEDORES", "CONTAS PAGAR", "ETIQUETAS", "CONFIG", "CHAT IA"
         ]
         
         # Botões condicionais por tipo de negócio
-        if self.business_type in ("padaria_acougue", "artesanato"):
+        if self.business_type == "pet_shop_agro":
+            self.sidebar_buttons.insert(2, "BANHO & TOSA")
+            self.sidebar_buttons.insert(3, "PETS & VACINAS")
+            self.sidebar_buttons.insert(4, "RAÇÃO A GRANEL")
+        if self.business_type == "oficina_mecanica":
+            self.sidebar_buttons.insert(2, "ORDEM SERVIÇO")
+            self.sidebar_buttons.insert(3, "MECÂNICOS")
+            self.sidebar_buttons.insert(4, "VEÍCULOS")
+            self.sidebar_buttons.insert(5, "ORÇAMENTOS")
+        if self.business_type == "farmacia_suplementos":
+            self.sidebar_buttons.insert(2, "LOTES & VALIDADE")
+            self.sidebar_buttons.insert(3, "VENCIMENTOS")
+        if self.business_type == "papelaria_livraria":
+            self.sidebar_buttons.insert(2, "LEITOR RÁPIDO")
+            self.sidebar_buttons.insert(3, "REPOSIÇÃO")
+        if self.business_type == "otica_joalheria":
+            self.sidebar_buttons.insert(2, "RECEITAS & GRAUS")
+            self.sidebar_buttons.insert(3, "Nº SÉRIE")
+            self.sidebar_buttons.insert(4, "GARANTIAS")
+        if self.business_type == "treinamento_recorrencia":
+            self.sidebar_buttons.insert(2, "MENSALIDADES")
+            self.sidebar_buttons.insert(3, "ALUNOS & TURMAS")
+        if self.business_type in ("padaria_acougue", "artesanato", "moda_customizacao", "delivery_alimentacao", "estetica_automotiva"):
             self.sidebar_buttons.insert(2, "INSUMOS")
             self.sidebar_buttons.insert(3, "PRODUÇÃO")
-        if self.business_type == "loja_roupa":
+        if self.business_type in ("loja_roupa", "moda_customizacao"):
             self.sidebar_buttons.insert(2, "TROCAS")
+            if self.business_type == "moda_customizacao":
+                self.sidebar_buttons.insert(3, "AJUSTES / ATELIÊ")
         if self.business_type == "variados":
             self.sidebar_buttons.insert(2, "REPOSIÇÃO")
-        if self.business_type == "restaurante":
-            self.sidebar_buttons.insert(2, "MESAS")
-            self.sidebar_buttons.insert(3, "COMANDAS")
-            self.sidebar_buttons.insert(4, "COZINHA")
-            self.sidebar_buttons.insert(5, "INSUMOS")
-            self.sidebar_buttons.insert(6, "PRODUÇÃO")
+        if self.business_type in ("restaurante", "delivery_alimentacao"):
+            self.sidebar_buttons.insert(2, "PEDIDOS / MESAS")
+            self.sidebar_buttons.insert(3, "COZINHA")
+            if self.business_type == "delivery_alimentacao":
+                self.sidebar_buttons.insert(4, "COMBOS")
+        if self.business_type == "tecnologia_informatica":
+            self.sidebar_buttons.insert(2, "ORDEM SERVIÇO")
+            self.sidebar_buttons.insert(3, "HARDWARE")
+            self.sidebar_buttons.insert(4, "GARANTIAS")
+        if self.business_type == "estetica_automotiva":
+            self.sidebar_buttons.insert(2, "AGENDAMENTOS")
+            self.sidebar_buttons.insert(3, "VEÍCULOS")
+        if self.business_type == "festas_eventos":
+            self.sidebar_buttons.insert(2, "LOCAÇÃO")
+            self.sidebar_buttons.insert(3, "RESERVAS")
+        if self.business_type == "estetica_arte_corporal":
+            self.sidebar_buttons.insert(2, "AGENDAMENTOS")
+            self.sidebar_buttons.insert(3, "PROFISSIONAIS")
+        if self.business_type == "casa_construcao":
+            self.sidebar_buttons.insert(2, "ORÇAMENTOS")
+            self.sidebar_buttons.insert(3, "CONDOMÍNIOS")
         
         for i, btn_text in enumerate(self.sidebar_buttons):
             btn = ctk.CTkButton(self._sidebar_scroll, text=btn_text, height=44, corner_radius=30,
@@ -622,15 +924,211 @@ class App(ctk.CTk):
         # --- Iniciar API REST em background (se disponível) ---
         self._iniciar_api_server()
 
-    def _forcar_icone(self):
-        """Força a reaplicação do ícone na titlebar e taskbar."""
+        # --- Onda 3: Outbox Offline, Agendador de Rotinas e Auto-Update Assinado ---
         try:
-            if self._icon_path_ico and os.path.exists(self._icon_path_ico):
-                self.iconbitmap(self._icon_path_ico)
+            self.outbox_service.start_worker()
+        except Exception as e:
+            logger.warning("Erro ao iniciar OutboxWorker: %s", e)
+        self._start_routine_scheduler()
+        self.after(5000, self._check_updates_async)
+
+    def _start_routine_scheduler(self):
+        """Agenda verificação leve das rotinas operacionais a cada 60 segundos sem travar a UI."""
+        def _tick_loop():
+            def _run_bg():
+                try:
+                    self.routine_scheduler.tick()
+                except Exception as exc:
+                    logger.debug("Erro no tick do agendador de rotinas: %s", exc)
+
+            threading.Thread(target=_run_bg, name="EstokeSchedulerTick", daemon=True).start()
+            if self.winfo_exists():
+                self.after(60000, _tick_loop)
+
+        self.after(60000, _tick_loop)
+
+    def _check_updates_async(self):
+        """Consulta version.json HTTPS com assinatura Ed25519 em thread na inicialização."""
+        def _worker():
+            try:
+                from services.updater import check_for_updates, download_verified_installer
+                info = check_for_updates()
+                if not info.get("available"):
+                    return
+
+                def _prompt_user():
+                    if not self.winfo_exists():
+                        return
+                    ver = info.get("version", "")
+                    notes = info.get("notes") or "Melhorias de segurança, desempenho e estabilidade."
+                    aceitou = messagebox.askyesno(
+                        "Atualização Disponível",
+                        f"Uma nova versão do Estoke Ao Cubo (v{ver}) foi verificada com assinatura digital.\n\n"
+                        f"Novidades:\n{notes}\n\n"
+                        f"Deseja baixar em segundo plano e instalar automaticamente ao fechar o sistema?",
+                        parent=self,
+                    )
+                    if not aceitou:
+                        return
+
+                    def _dl_worker():
+                        ok_dl, path_or_err = download_verified_installer(
+                            info["url"], info["sha256"], version=ver
+                        )
+                        def _dl_done():
+                            if ok_dl:
+                                self._pending_installer_path = path_or_err
+                                try:
+                                    self.notifier.notify(
+                                        "Atualização Pronta",
+                                        f"Versão {ver} baixada e verificada! Será instalada ao fechar o app.",
+                                        tipo="success",
+                                        duracao=7000,
+                                    )
+                                except Exception:
+                                    pass
+                            else:
+                                logger.warning("Download da atualização falhou: %s", path_or_err)
+                        self.after(0, _dl_done)
+
+                    threading.Thread(target=_dl_worker, daemon=True).start()
+
+                self.after(0, _prompt_user)
+            except Exception as exc:
+                logger.debug("Auto-update check ignorado/offline: %s", exc)
+
+        threading.Thread(target=_worker, name="EstokeUpdaterCheck", daemon=True).start()
+
+    def _enviar_whatsapp_resiliente(self, telefone: str, mensagem: str, metadata: dict | None = None) -> tuple[bool, str]:
+        """Enfileira envio de WhatsApp na Outbox offline para nunca travar o caixa."""
+        digs = "".join(ch for ch in str(telefone or "") if ch.isdigit())
+        if len(digs) < 8:
+            return False, "Número de telefone inválido ou incompleto."
+        try:
+            _, item_id = self.outbox_service.enfileirar(
+                "whatsapp",
+                {"telefone": telefone, "mensagem": mensagem, "metadata": metadata or {}},
+            )
+            return True, f"Mensagem enfileirada na Outbox (#{item_id}) para envio assíncrono."
+        except Exception as exc:
+            logger.warning("Falha ao enfileirar WhatsApp na Outbox: %s", exc)
+            return False, str(exc)
+
+    def _aplicar_icone_win32_hd(self, widget=None):
+        """Aplica HICON nativo 256x256 (ICON_BIG) e DPI-aware (ICON_SMALL) via Win32 WM_SETICON."""
+        if os.name != "nt" or not self._icon_path_ico or not os.path.exists(self._icon_path_ico):
+            return
+        try:
+            target = widget or self
+            if not target.winfo_exists():
+                return
+            user32 = ctypes.windll.user32
+            user32.LoadImageW.argtypes = [
+                ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_uint,
+                ctypes.c_int, ctypes.c_int, ctypes.c_uint,
+            ]
+            user32.LoadImageW.restype = ctypes.c_void_p
+            user32.GetAncestor.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+            user32.GetAncestor.restype = ctypes.c_void_p
+            user32.GetParent.argtypes = [ctypes.c_void_p]
+            user32.GetParent.restype = ctypes.c_void_p
+            user32.SendMessageW.argtypes = [
+                ctypes.c_void_p, ctypes.c_uint, ctypes.c_size_t, ctypes.c_void_p,
+            ]
+            user32.SendMessageW.restype = ctypes.c_ssize_t
+
+            raw_hwnd = ctypes.c_void_p(target.winfo_id())
+            hwnd = user32.GetAncestor(raw_hwnd, 2) or user32.GetParent(raw_hwnd) or raw_hwnd
+
+            IMAGE_ICON = 1
+            LR_LOADFROMFILE = 0x0010
+            if not self._hicon_big:
+                self._hicon_big = user32.LoadImageW(
+                    None, self._icon_path_ico, IMAGE_ICON, 256, 256, LR_LOADFROMFILE
+                )
+            if not self._hicon_small:
+                small_sz = 32
+                try:
+                    user32.GetDpiForWindow.argtypes = [ctypes.c_void_p]
+                    user32.GetDpiForWindow.restype = ctypes.c_uint
+                    dpi = user32.GetDpiForWindow(hwnd) or 96
+                    px = int(round(16 * dpi / 96.0))
+                    small_sz = min((16, 24, 32, 48), key=lambda s: abs(s - px))
+                except Exception:
+                    pass
+                self._hicon_small = user32.LoadImageW(
+                    None, self._icon_path_ico, IMAGE_ICON, small_sz, small_sz, LR_LOADFROMFILE
+                )
+
+            WM_SETICON = 0x0080
+            ICON_SMALL = 0
+            ICON_BIG = 1
+            ICON_SMALL2 = 2
+            if self._hicon_big:
+                user32.SendMessageW(hwnd, WM_SETICON, ICON_BIG, self._hicon_big)
+            if self._hicon_small:
+                user32.SendMessageW(hwnd, WM_SETICON, ICON_SMALL, self._hicon_small)
+                user32.SendMessageW(hwnd, WM_SETICON, ICON_SMALL2, self._hicon_small)
+
+            set_cls = getattr(user32, "SetClassLongPtrW", None) or getattr(user32, "SetClassLongW", None)
+            if set_cls is not None:
+                set_cls.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p]
+                set_cls.restype = ctypes.c_void_p
+                if self._hicon_big:
+                    set_cls(hwnd, -14, self._hicon_big)   # GCLP_HICON
+                if self._hicon_small:
+                    set_cls(hwnd, -34, self._hicon_small)  # GCLP_HICONSM
+        except Exception as exc:
+            logger.debug("Falha ao aplicar ícone Win32 HD: %s", exc)
+
+    def _forcar_icone(self):
+        """Força a reaplicação do ícone na titlebar e taskbar em alta definição."""
+        try:
+            if os.name == "nt":
+                if self._icon_path_ico and os.path.exists(self._icon_path_ico):
+                    self.iconbitmap(self._icon_path_ico)
+                self._aplicar_icone_win32_hd(self)
+            elif hasattr(self, '_icon_photos') and self._icon_photos:
+                self.iconphoto(True, *self._icon_photos)
         except Exception:
             pass
 
+    def _get_cached_thumbnail(self, img_name, size=(40, 40)):
+        """Retorna uma CTkImage de miniatura carregada em cache (LRU)."""
+        if not img_name:
+            return None
+        cache_key = (img_name, size)
+        if not hasattr(self, '_thumbnail_cache'):
+            self._thumbnail_cache = {}
+        if cache_key in self._thumbnail_cache:
+            val = self._thumbnail_cache.pop(cache_key)
+            self._thumbnail_cache[cache_key] = val
+            return val
+        try:
+            img_path = os.path.join(self.db.data_dir, "product_images", img_name)
+            if os.path.exists(img_path):
+                pil_img = Image.open(img_path)
+                pil_img.thumbnail(size)
+                if pil_img.mode in ('RGBA', 'LA') or (pil_img.mode == 'P' and 'transparency' in pil_img.info):
+                    fundo = Image.new("RGBA", pil_img.size, (255, 255, 255, 255))
+                    pil_img = Image.alpha_composite(fundo, pil_img.convert("RGBA")).convert("RGB")
+                ctk_img = ctk.CTkImage(light_image=pil_img, dark_image=pil_img, size=size)
+                if len(self._thumbnail_cache) >= 256:
+                    first_key = next(iter(self._thumbnail_cache))
+                    self._thumbnail_cache.pop(first_key)
+                self._thumbnail_cache[cache_key] = ctk_img
+                return ctk_img
+        except Exception as e:
+            pass
+        return None
+
     def _toggle_fullscreen(self, event=None):
+        if getattr(self, "_pdv_dialog", None) is not None:
+            try:
+                if self._pdv_dialog.winfo_exists():
+                    return
+            except Exception:
+                pass
         self._fullscreen = not self._fullscreen
         self.attributes("-fullscreen", self._fullscreen)
 
@@ -640,18 +1138,62 @@ class App(ctk.CTk):
             self.attributes("-fullscreen", False)
     
     def _on_closing(self):
-        """Confirmação antes de fechar a aplicação."""
+        """Confirmação antes de fechar a aplicação (encerra workers e dispara instalador pendente)."""
         if messagebox.askyesno("Sair", "Deseja realmente fechar o Estoke ao Cubo?"):
+            try:
+                if getattr(self, "outbox_service", None):
+                    self.outbox_service.stop_worker(timeout=1.5)
+            except Exception:
+                pass
             try:
                 self.db.close()
             except Exception:
                 pass
+            pending_installer = getattr(self, "_pending_installer_path", None)
+            if pending_installer:
+                try:
+                    from services.updater import launch_installer_on_exit
+                    launch_installer_on_exit(pending_installer)
+                except Exception as exc:
+                    logger.warning("Não foi possível disparar instalador na saída: %s", exc)
             self.destroy()
+
+    @staticmethod
+    def _safe_float(val, default=0.0):
+        """Converte qualquer valor para float de forma segura (None, str, NaN -> default)."""
+        if val is None:
+            return default
+        try:
+            result = float(val)
+            # Proteger contra NaN e Inf
+            import math
+            if math.isnan(result) or math.isinf(result):
+                return default
+            return result
+        except (ValueError, TypeError):
+            # Tenta limpar string com vírgula (ex: "25,00" -> 25.0)
+            if isinstance(val, str):
+                try:
+                    return float(val.replace(',', '.').strip())
+                except (ValueError, TypeError):
+                    pass
+            return default
+
+    @staticmethod
+    def _safe_int(val, default=0):
+        """Converte qualquer valor para int de forma segura (None, str -> default)."""
+        if val is None:
+            return default
+        try:
+            return int(float(val))
+        except (ValueError, TypeError):
+            return default
 
     def _logout(self):
         """Faz logout e retorna à tela de login."""
         if messagebox.askyesno("Sair da Conta", "Deseja trocar de usuário?"):
             self.current_user = None
+            self.db.set_current_user(None)
             self._pdv_dialog = None
             # Destruir todos os widgets da UI principal
             for widget in self.winfo_children():
@@ -672,6 +1214,7 @@ class App(ctk.CTk):
     def refresh_dashboard(self):
         """Limpa e recarrega os gráficos e metas em tempo real"""
         import matplotlib.pyplot as plt
+        self._last_dashboard_render_ts = getattr(self.db, 'last_modified', 0.0)
         # Atualizar metas
         self.refresh_metas_list()
         
@@ -1219,21 +1762,37 @@ class App(ctk.CTk):
         lbl_erro.pack()
 
         def _tentar_login():
-            if verify_admin(entry_user.get().strip(), entry_pass.get()):
+            u = entry_user.get().strip()
+            p = entry_pass.get()
+            if verify_admin(u, p):
                 login_win.destroy()
                 on_success()
-            else:
-                lbl_erro.configure(text="Usuário ou senha incorretos!")
+                return
+            try:
+                user_db = self.db.autenticar_usuario(u, p)
+                if user_db and user_db.get("perfil") in ("admin", "gerente"):
+                    login_win.destroy()
+                    on_success()
+                    return
+            except Exception:
+                pass
+            lbl_erro.configure(text="Usuário ou senha incorretos!")
 
         ctk.CTkButton(login_win, text="Entrar", command=_tentar_login,
                       fg_color="#0A4174", hover_color="#062F56", text_color="white",
-                      font=("Aileron", 13, "bold"), height=40).pack(fill="x", padx=30, pady=(5, 10))
+                      font=("Aileron", 13, "bold"), height=40).pack(fill="x", padx=30, pady=(5, 5))
+
+        if admin_needs_setup():
+            ctk.CTkLabel(login_win, text="Primeiro acesso padrão: admin / admin",
+                         font=("Aileron", 9), text_color=("gray50", "gray60")).pack(pady=(0, 10))
 
         entry_user.focus_set()
         entry_pass.bind("<Return>", lambda e: _tentar_login())
         login_win.grab_set()
 
     def sidebar_event(self, btn_text):
+        if not self.current_user:
+            return
         if not self._tem_permissao(btn_text):
             messagebox.showwarning("Acesso Negado", f"Seu perfil não tem permissão para '{btn_text}'.")
             return
@@ -1241,6 +1800,10 @@ class App(ctk.CTk):
             self.open_gastos_dialog()
         elif btn_text == "KITS":
             self.open_kit_manager()
+        elif btn_text == "INVENTÁRIO":
+            self.open_inventario_dialog()
+        elif btn_text == "COMPRAS":
+            self.open_sugestao_compras_dialog()
         elif btn_text == "CHAT IA":
             self.open_chat_ai()
         elif btn_text == "SALDO":
@@ -1277,8 +1840,24 @@ class App(ctk.CTk):
             self.open_contas_pagar_dialog()
         elif btn_text == "ETIQUETAS":
             self.open_etiquetas_dialog()
+        elif btn_text in ("ORDEM SERVIÇO", "AJUSTES / ATELIÊ", "BANHO & TOSA"):
+            self.open_servico_dialog()
+        elif btn_text in ("HARDWARE", "RAÇÃO A GRANEL", "MEDICAMENTOS"):
+            self.open_insumos_manager()
+        elif btn_text in ("GARANTIAS", "TROCAS", "Nº SÉRIE"):
+            self.open_trocas_dialog()
+        elif btn_text in ("AGENDAMENTOS", "RESERVAS", "LOCAÇÃO", "ORÇAMENTOS", "LOTES & VALIDADE", "VENCIMENTOS"):
+            self.open_anota_tudo_dialog()
+        elif btn_text in ("VEÍCULOS", "CONDOMÍNIOS", "PROFISSIONAIS", "PETS & VACINAS", "MECÂNICOS", "RECEITAS & GRAUS", "ALUNOS & TURMAS", "MENSALIDADES"):
+            self.open_clientes_manager()
+        elif btn_text in ("COMBOS", "PEDIDOS / MESAS"):
+            self.open_mesas_manager()
+        elif btn_text == "LEITOR RÁPIDO":
+            self.open_sell_product_dialog()
 
     def topbar_event(self, btn_text):
+        if not self.current_user:
+            return
         if not self._tem_permissao(btn_text):
             messagebox.showwarning("Acesso Negado", f"Seu perfil não tem permissão para '{btn_text}'.")
             return
@@ -1650,7 +2229,22 @@ class App(ctk.CTk):
 
         ctk.CTkButton(backup_frame, text="📦 Criar Backup Agora", command=criar_backup_manual,
                         fg_color="#28a745", hover_color="#218838", text_color="white",
-                        font=("Aileron", 13, "bold"), height=40).pack(fill="x", pady=(0, 15))
+                        font=("Aileron", 13, "bold"), height=40).pack(fill="x", pady=(0, 8))
+
+        def exportar_kit_recuperacao():
+            dest = filedialog.askdirectory(title="Selecione a Pasta de Destino (Google Drive / OneDrive / Pendrive)", parent=dialog)
+            if not dest:
+                return
+            ok, msg = self.db.exportar_backup_externo(dest)
+            if ok:
+                messagebox.showinfo("Backup Externo Exportado", msg, parent=dialog)
+                atualizar_lista_backups()
+            else:
+                messagebox.showerror("Erro ao Exportar", msg, parent=dialog)
+
+        ctk.CTkButton(backup_frame, text="☁️ Exportar Kit de Recuperação (Nuvem / Pendrive)", command=exportar_kit_recuperacao,
+                        fg_color="#0A4174", hover_color="#062F56", text_color="white",
+                        font=("Aileron", 12, "bold"), height=36).pack(fill="x", pady=(0, 12))
 
         ctk.CTkLabel(backup_frame, text="Backups Disponíveis:", font=("Aileron", 12, "bold"),
                     text_color=("#001D39", "white")).pack(anchor="w", pady=(0, 5))
@@ -1739,14 +2333,38 @@ class App(ctk.CTk):
             ("Telefone", "empresa_telefone"),
             ("Endereço", "empresa_endereco"),
             ("CNPJ/CPF", "empresa_cnpj"),
+            ("Inscrição Estadual (IE)", "empresa_ie"),
+            ("Device ID Pinpad Point (Mercado Pago)", "mp_point_device_id"),
             ("Mensagem de Rodapé", "mensagem_rodape"),
         ]
         for label, key in nota_fields:
             ctk.CTkLabel(nota_frame, text=f"{label}:", font=("Aileron", 11, "bold")).pack(anchor="w", pady=(8, 2))
             e = ctk.CTkEntry(nota_frame, height=35)
-            e.insert(0, nota_cfg.get(key, ''))
+            e.insert(0, nota_cfg.get(key, '') or '')
             e.pack(fill="x", pady=(0, 5))
             nota_entries[key] = e
+
+        ctk.CTkLabel(nota_frame, text="Configuração NFC-e Modelo 65 (API REST):", font=("Aileron", 12, "bold"),
+                     text_color=("#001D39", "white")).pack(anchor="w", pady=(12, 4))
+        var_ambiente_nfce = ctk.StringVar(value=str(nota_cfg.get("ambiente") or "homologacao"))
+        ctk.CTkComboBox(nota_frame, values=["homologacao", "producao"], variable=var_ambiente_nfce,
+                        state="readonly", height=32).pack(fill="x", pady=(0, 6))
+
+        fiscal_secret_fields = [
+            ("Token API Fiscal (Focus NFe)", "token_api", True),
+            ("ID do CSC (SEFAZ)", "id_csc", False),
+            ("CSC (Código de Segurança do Contribuinte)", "csc", True),
+        ]
+        for label, key, masked in fiscal_secret_fields:
+            ctk.CTkLabel(nota_frame, text=f"{label}:", font=("Aileron", 11, "bold")).pack(anchor="w", pady=(6, 2))
+            e = ctk.CTkEntry(nota_frame, height=35, show="*" if masked else "")
+            e.insert(0, nota_cfg.get(key, '') or '')
+            e.pack(fill="x", pady=(0, 5))
+            nota_entries[key] = e
+
+        var_emitir_nfce_auto = ctk.BooleanVar(value=bool(nota_cfg.get("emitir_nfce_automatico", 0)))
+        ctk.CTkCheckBox(nota_frame, text="Emitir NFC-e automaticamente ao finalizar venda no PDV",
+                        variable=var_emitir_nfce_auto, font=("Aileron", 11)).pack(anchor="w", pady=(4, 8))
 
         # Logo/Foto
         ctk.CTkLabel(nota_frame, text="Logo da Empresa:", font=("Aileron", 11, "bold")).pack(anchor="w", pady=(8, 2))
@@ -1780,6 +2398,8 @@ class App(ctk.CTk):
             new_cfg = {}
             for key, entry in nota_entries.items():
                 new_cfg[key] = entry.get().strip()
+            new_cfg['ambiente'] = var_ambiente_nfce.get().strip() or 'homologacao'
+            new_cfg['emitir_nfce_automatico'] = 1 if var_emitir_nfce_auto.get() else 0
             new_cfg['empresa_logo'] = _temp_logo_path[0]
             self.db.salvar_config_nota(new_cfg)
             messagebox.showinfo("Sucesso", "Configuração da nota salva!", parent=dialog)
@@ -1789,20 +2409,62 @@ class App(ctk.CTk):
                       font=("Aileron", 13, "bold"), height=40).pack(fill="x", pady=(10, 5))
 
         def previsualizar_nota():
-            """Gera uma nota de exemplo com as configurações atuais e exibe como imagem."""
+            """Gera uma nota com os dados reais da última venda e exibe como imagem."""
             preview_cfg = {}
             for key, entry in nota_entries.items():
                 preview_cfg[key] = entry.get().strip()
             preview_cfg['empresa_logo'] = _temp_logo_path[0]
 
-            itens_exemplo = [
-                {'nome': 'Produto Exemplo A', 'qtd': 2, 'preco': 49.90},
-                {'nome': 'Produto Exemplo B', 'qtd': 1, 'preco': 29.90},
-            ]
-            cliente_exemplo = {'nome': 'Cliente Teste', 'contato': '(11) 99999-0000'}
+            # Obter dados da última venda real ou mock fallback
+            try:
+                cursor = self.db.conn.cursor()
+                cursor.execute("SELECT id, data_venda, cliente FROM vendas ORDER BY id DESC LIMIT 1")
+                last_venda = cursor.fetchone()
+                if last_venda:
+                    v_id, data_venda, cliente_nome = last_venda
+                    cursor.execute("""
+                        SELECT p.nome, v.quantidade, (v.valor_total / v.quantidade) as preco, v.desconto
+                        FROM vendas v
+                        LEFT JOIN produtos p ON v.produto_id = p.id
+                        WHERE v.data_venda = ? AND v.cliente = ?
+                    """, (data_venda, cliente_nome))
+                    rows = cursor.fetchall()
+                    
+                    itens = []
+                    total_bruto = 0.0
+                    total_desconto = 0.0
+                    for r in rows:
+                        nome_p = r[0] or "Produto"
+                        qtd = r[1] or 1
+                        preco = r[2] or 0.0
+                        desc_item = r[3] or 0.0
+                        total_desconto += desc_item
+                        total_bruto += (preco * qtd)
+                        itens.append({'nome': nome_p, 'qtd': qtd, 'preco': preco})
+                    
+                    cliente = {'nome': cliente_nome}
+                    if cliente_nome != "Consumidor Final":
+                        cursor.execute("SELECT contato FROM clientes WHERE nome=?", (cliente_nome,))
+                        c_row = cursor.fetchone()
+                        if c_row:
+                            cliente['contato'] = c_row[0]
+                    total_liquido = total_bruto - total_desconto
+                else:
+                    raise Exception("Sem vendas")
+            except Exception:
+                # Fallback se banco vazio ou erro
+                itens = [
+                    {'nome': 'Produto Exemplo A', 'qtd': 2, 'preco': 49.90},
+                    {'nome': 'Produto Exemplo B', 'qtd': 1, 'preco': 29.90},
+                ]
+                cliente = {'nome': 'Cliente Teste', 'contato': '(11) 99999-0000'}
+                total_liquido = 119.70
+                total_desconto = 10.00
+                v_id = 'PREVIEW'
+
             _, text_content, _ = invoice_generator.gerar_nota_txt(
-                itens_exemplo, cliente_exemplo, 119.70,
-                id_venda='PREVIEW', desconto=10.00,
+                itens, cliente, total_liquido,
+                id_venda=v_id, desconto=total_desconto,
                 abrir_arquivo=False, config_nota=preview_cfg
             )
             if not text_content:
@@ -1923,28 +2585,41 @@ class App(ctk.CTk):
 
         # ====== ABA TIPO DE NEGÓCIO ======
         tab_btype = tabview.add("Tipo Negócio")
-        btype_frame = ctk.CTkFrame(tab_btype, fg_color="transparent")
-        btype_frame.pack(padx=10, pady=10, fill="both", expand=True)
+        btype_scroll = ctk.CTkScrollableFrame(tab_btype, fg_color="transparent")
+        btype_scroll.pack(padx=10, pady=10, fill="both", expand=True)
 
-        ctk.CTkLabel(btype_frame, text="Tipo de Negócio",
+        ctk.CTkLabel(btype_scroll, text="Tipo de Negócio",
                      font=ctk.CTkFont(family="Aileron", size=16, weight="bold"),
                      text_color=("#001D39", "white")).pack(pady=(0, 5))
-        ctk.CTkLabel(btype_frame, text="Altere o tipo de negócio para personalizar campos e funcionalidades.",
-                     font=("Aileron", 11), text_color=("gray40", "gray70")).pack(pady=(0, 15))
+        ctk.CTkLabel(btype_scroll, text="Altere o nicho para personalizar campos, menus e fluxo de trabalho.",
+                     font=("Aileron", 11), text_color=("gray40", "gray70")).pack(pady=(0, 10))
 
         btype_labels = {
-            "artesanato": "🎨 Artesanato",
-            "padaria_acougue": "🥖 Padaria / Açougue",
-            "loja_roupa": "👗 Loja de Roupas",
-            "restaurante": "🍽️ Restaurante",
-            "variados": "🏪 Variados",
+            "pet_shop_agro": "🐾 Pet Shop & Agropecuária (Produtos + Banho e Tosa)",
+            "oficina_mecanica": "🔧 Oficina Mecânica & Motopeças (OS + Peças + Mão de Obra)",
+            "farmacia_suplementos": "💊 Farmácia, Suplementos & Nutrição (Lotes + Validades)",
+            "papelaria_livraria": "📚 Papelaria & Livraria (Alto Volume SKUs + ISBN)",
+            "otica_joalheria": "👓 Ótica & Joalheria (Nº Série + Garantias + Receitas)",
+            "treinamento_recorrencia": "🥋 Estúdios & Treinamento (Mensalidades + Turmas + Balcão)",
+            "tecnologia_informatica": "💻 Tecnologia & Informática (Assistência/Hardware)",
+            "estetica_automotiva": "🚗 Estética Automotiva (Car Detailing/Lavagem)",
+            "moda_customizacao": "👗 Moda & Customização (Boutiques/Ateliês)",
+            "festas_eventos": "🎉 Artigos para Festas & Eventos (Locação)",
+            "estetica_arte_corporal": "✂️ Arte Corporal & Estética (Tattoo/Barbearias)",
+            "delivery_alimentacao": "🍔 Delivery Rápido & Alimentação (Lanches/Combos)",
+            "casa_construcao": "🔨 Casa, Construção & Condomínios (Ferragens)",
+            "loja_roupa": "👔 Loja de Roupas Geral (Grade P/M/G/GG)",
+            "padaria_acougue": "🥖 Padaria & Açougue (Venda por Peso)",
+            "restaurante": "🍽️ Restaurante & Bar (Mesas/Comandas)",
+            "artesanato": "🎨 Artesanato & Handmade",
+            "variados": "🏪 Variados / Comércio Geral",
         }
         current_btype = self.business_type or "variados"
         btype_var = ctk.StringVar(value=current_btype)
 
         for key, label in btype_labels.items():
-            ctk.CTkRadioButton(btype_frame, text=label, variable=btype_var, value=key,
-                               font=("Aileron", 13), text_color=("#001D39", "white")).pack(anchor="w", pady=5, padx=10)
+            ctk.CTkRadioButton(btype_scroll, text=label, variable=btype_var, value=key,
+                               font=("Aileron", 12), text_color=("#001D39", "white")).pack(anchor="w", pady=4, padx=5)
 
         def _save_btype():
             new_type = btype_var.get()
@@ -1952,12 +2627,12 @@ class App(ctk.CTk):
             self.business_type = new_type
             messagebox.showinfo("Tipo de Negócio",
                                 f"Tipo alterado para: {btype_labels.get(new_type, new_type)}\n\n"
-                                "As mudanças serão aplicadas ao cadastrar produtos e vender.",
+                                "As mudanças foram salvas e aplicadas aos menus e cadastros.",
                                 parent=dialog)
 
-        ctk.CTkButton(btype_frame, text="Salvar Tipo de Negócio", command=_save_btype,
+        ctk.CTkButton(btype_scroll, text="Salvar Tipo de Negócio", command=_save_btype,
                       fg_color="#0A4174", hover_color="#062F56", text_color="white",
-                      font=("Aileron", 13, "bold"), height=40).pack(fill="x", pady=(15, 0))
+                      font=("Aileron", 13, "bold"), height=38).pack(fill="x", pady=(15, 10))
 
         ctk.CTkLabel(calc_frame, text="Calculadora de Margem de Lucro", font=ctk.CTkFont(family="Aileron", size=16, weight="bold"),
                     text_color=("#001D39", "white")).pack(pady=(0, 15))
@@ -2361,6 +3036,8 @@ class App(ctk.CTk):
         button_frame.pack(pady=20, padx=15, fill="x")
         
         def adicionar():
+            if self.check_trial_limits('transacao', dialog):
+                return
             valor = entry_valor.get().strip()
             desc = entry_desc.get().strip()
             if valor:
@@ -2467,20 +3144,43 @@ class App(ctk.CTk):
             if not question: 
                 return
             
-            chat_history.insert("end", f"Você: {question}\n")
+            chat_history.insert("end", f"Você: {question}\n⏳ IA analisando...\n")
+            chat_history.see("end")
             entry.delete(0, "end")
+            btn_send.configure(state="disabled", text="...")
             
             imagem = _chat_img_path[0]
             _chat_img_path[0] = None
             lbl_img_status.configure(text="")
-            
-            answer = self.ai.process_query(question, imagem_path=imagem)
-            chat_history.insert("end", f"IA: {answer}\n\n")
-            chat_history.see("end")
-            
-            # Se foi um comando executado com sucesso, atualizar o dashboard
-            if "✅" in answer:
-                self.refresh_dashboard()
+
+            def _worker():
+                try:
+                    answer = self.ai.process_query(question, imagem_path=imagem)
+                except Exception as exc:
+                    answer = f"❌ Erro ao consultar IA: {exc}"
+
+                def _deliver():
+                    try:
+                        if not chat_window.winfo_exists():
+                            return
+                        # Remove a linha temporária de status
+                        content = chat_history.get("1.0", "end-1c")
+                        if content.endswith("⏳ IA analisando...\n"):
+                            chat_history.delete("end-2l", "end-1l")
+                        chat_history.insert("end", f"IA: {answer}\n\n")
+                        chat_history.see("end")
+                        btn_send.configure(state="normal", text="Enviar")
+                        if "✅" in answer:
+                            self.refresh_dashboard()
+                    except Exception:
+                        pass
+
+                try:
+                    chat_window.after(0, _deliver)
+                except Exception:
+                    pass
+
+            threading.Thread(target=_worker, daemon=True).start()
 
         btn_send = ctk.CTkButton(input_frame, text="Enviar", width=80, fg_color="#7BBDE8", 
                                 text_color="black", hover_color="#49769F", command=send_message,
@@ -2637,6 +3337,14 @@ class App(ctk.CTk):
                 else:
                     window.lift()
 
+            if tab == "produto":
+                def do_qrcode(r=row):
+                    self.show_product_qrcode_dialog(r)
+                ctk.CTkButton(btn_frame, text="QR", width=35, height=30, corner_radius=8,
+                              fg_color="#6EA2B3", text_color="white", hover_color="#49769F",
+                              font=ctk.CTkFont(family="Aileron", size=10, weight="bold"),
+                              command=do_qrcode).pack(side="left", padx=2)
+
             ctk.CTkButton(btn_frame, text="✏️ Editar", width=80, height=30, corner_radius=8,
                           fg_color="#5DADE2", text_color="#001D39", hover_color="#3498DB",
                           font=ctk.CTkFont(family="Aileron", size=10, weight="bold"),
@@ -2650,17 +3358,10 @@ class App(ctk.CTk):
             content.pack(side="left", fill="both", expand=True, padx=12, pady=10)
 
             if tab == "produto":
-                # Thumbnail do produto
                 if row.get("imagem"):
-                    try:
-                        img_path = os.path.join(self.db.data_dir, "product_images", row["imagem"])
-                        if os.path.exists(img_path):
-                            pil_img = Image.open(img_path)
-                            pil_img.thumbnail((40, 40))
-                            ctk_img = ctk.CTkImage(light_image=pil_img, dark_image=pil_img, size=(40, 40))
-                            ctk.CTkLabel(content, image=ctk_img, text="").pack(side="left", padx=(0, 10))
-                    except Exception:
-                        pass
+                    ctk_img = self._get_cached_thumbnail(row["imagem"], size=(40, 40))
+                    if ctk_img:
+                        ctk.CTkLabel(content, image=ctk_img, text="").pack(side="left", padx=(0, 10))
 
                 text_frame = ctk.CTkFrame(content, fg_color="transparent")
                 text_frame.pack(side="left", fill="both", expand=True)
@@ -2891,14 +3592,7 @@ class App(ctk.CTk):
                     
                     # Carregar imagem para produtos
                     if type_ == "produto" and 'imagem' in row and row['imagem']:
-                        try:
-                            img_path = os.path.join(self.db.data_dir, "product_images", row['imagem'])
-                            if os.path.exists(img_path):
-                                pil_img = Image.open(img_path)
-                                 # Usar miniatura
-                                icon_image = ctk.CTkImage(light_image=pil_img, dark_image=pil_img, size=(30, 30))
-                        except Exception as e:
-                            logger.debug("Erro imagem miniatura: %s", e)
+                        icon_image = self._get_cached_thumbnail(row['imagem'], size=(30, 30))
                 
                 logger.debug("Criando botão para: %s", text)
                 
@@ -3180,6 +3874,7 @@ class App(ctk.CTk):
             _atualizar_lucro_edit()
 
             ctk.CTkButton(card_frame, text="Calcular Preço Sugerido", command=calcular_sugestao, fg_color="#5DADE2", text_color="#001D39", height=30).pack(pady=10, padx=15, fill="x")
+            ctk.CTkButton(card_frame, text="🔍 Visualizar QR Code", command=lambda: self.show_product_qrcode_dialog(row), fg_color="#6EA2B3", text_color="white", height=30, font=("Aileron", 11, "bold")).pack(pady=5, padx=15, fill="x")
             
             def salvar_produto():
                 nome = entry_nome.get().strip()
@@ -3316,6 +4011,8 @@ class App(ctk.CTk):
         entry_desc.pack(fill="x", padx=15, pady=5)
 
         def add_gasto():
+            if self.check_trial_limits('transacao', window):
+                return
             try:
                 val = float(entry_val.get().replace(",", "."))
                 date = entry_date.get().strip()
@@ -3380,10 +4077,21 @@ class App(ctk.CTk):
 
         ctk.CTkLabel(main_frame, text="Gestão de Produtos", font=("Aileron", 20, "bold"), text_color=("#001D39", "white")).pack(pady=(0, 10))
 
-        # Botão de importação CSV
-        ctk.CTkButton(main_frame, text="📂 Importar Produtos (CSV/PDF)", command=lambda: (dialog.destroy(), self.open_importar_csv()),
+        # Botões de Importação Lote
+        import_btns_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
+        import_btns_frame.pack(fill="x", pady=(0, 15))
+        
+        ctk.CTkButton(import_btns_frame, text="📂 Importar Produtos (CSV/PDF)", command=lambda: (dialog.destroy(), self.open_importar_csv()),
                         height=35, fg_color=("#EBEBF0", "#3A3A3A"), text_color=("#333", "white"),
-                        hover_color=("#D9D9E0", "#4A4A4A"), font=("Aileron", 11)).pack(fill="x", pady=(0, 15))
+                        hover_color=("#D9D9E0", "#4A4A4A"), font=("Aileron", 11, "bold")).pack(side="left", fill="x", expand=True, padx=(0, 4))
+
+        ctk.CTkButton(import_btns_frame, text="🧾 Importar NF-e (XML)", command=lambda: (dialog.destroy(), self.open_importar_nfe_xml()),
+                        height=35, fg_color="#0A4174", text_color="white",
+                        hover_color="#062F56", font=("Aileron", 11, "bold")).pack(side="left", fill="x", expand=True, padx=4)
+                        
+        ctk.CTkButton(import_btns_frame, text="📸 Importar Imagens Lote", command=lambda: (dialog.destroy(), self.open_importar_imagens_lote()),
+                        height=35, fg_color=("#EBEBF0", "#3A3A3A"), text_color=("#333", "white"),
+                        hover_color=("#D9D9E0", "#4A4A4A"), font=("Aileron", 11, "bold")).pack(side="left", fill="x", expand=True, padx=(4, 0))
 
         # ===== CARD PRINCIPAL: ADICIONAR AO PRODUTO EXISTENTE (PRIMEIRO!) =====
         existing_card = ctk.CTkFrame(main_frame, fg_color=("white", "#2B2B2B"), corner_radius=15, border_width=2, border_color="#0A4174")
@@ -3752,33 +4460,43 @@ class App(ctk.CTk):
 
         ctk.CTkButton(basic_card, text="Selecionar Imagem", command=pick_img, fg_color="#5DADE2", text_color="#001D39", height=30).pack(fill="x", padx=15, pady=(0, 15))
 
-        # --- UNIDADE DE MEDIDA (Padaria/Açougue) ---
+        # --- UNIDADE DE MEDIDA (Padaria/Açougue/Construção/Pet/Farmácia) ---
         e_unidade = None
         e_preco_peso = None
-        if self.business_type == "padaria_acougue":
+        if self.business_type in ("padaria_acougue", "casa_construcao", "pet_shop_agro", "farmacia_suplementos"):
             weight_card = ctk.CTkFrame(main_frame, fg_color=("white", "#2B2B2B"), corner_radius=15)
             weight_card.pack(fill="x", pady=(0, 15))
-            ctk.CTkLabel(weight_card, text="Venda por Peso", font=("Aileron", 14, "bold"), text_color="#D4A373").pack(pady=10, padx=15, anchor="w")
-            ctk.CTkLabel(weight_card, text="Configure a unidade de medida e preço por peso:", font=("Aileron", 10, "italic"), text_color="gray").pack(padx=15, anchor="w")
+            card_title = "Unidade / Peso / Medida" if self.business_type in ("casa_construcao", "pet_shop_agro", "farmacia_suplementos") else "Venda por Peso"
+            ctk.CTkLabel(weight_card, text=card_title, font=("Aileron", 14, "bold"), text_color="#D4A373").pack(pady=10, padx=15, anchor="w")
+            ctk.CTkLabel(weight_card, text="Configure a unidade de medida e preço de referência:", font=("Aileron", 10, "italic"), text_color="gray").pack(padx=15, anchor="w")
             w_grid = ctk.CTkFrame(weight_card, fg_color="transparent")
             w_grid.pack(fill="x", padx=15, pady=10)
             w_grid.columnconfigure(0, weight=1)
             w_grid.columnconfigure(1, weight=1)
             ctk.CTkLabel(w_grid, text="Unidade de Medida:", font=("Aileron", 11, "bold")).grid(row=0, column=0, sticky="w", padx=5)
-            e_unidade = ctk.CTkComboBox(w_grid, values=["un", "kg", "g", "L", "mL"], state="readonly")
+            if self.business_type == "casa_construcao":
+                unidades_list = ["un", "m", "kg", "g", "L", "mL", "barra", "rolo", "pacote", "saco"]
+            elif self.business_type == "pet_shop_agro":
+                unidades_list = ["un", "kg", "g", "saco (15kg)", "saco (20kg)", "frasco", "dose", "pacote"]
+            elif self.business_type == "farmacia_suplementos":
+                unidades_list = ["un", "cx", "frasco", "blister", "pote", "g", "kg", "dose"]
+            else:
+                unidades_list = ["un", "kg", "g", "L", "mL"]
+            e_unidade = ctk.CTkComboBox(w_grid, values=unidades_list, state="readonly")
             e_unidade.set("un")
             e_unidade.grid(row=1, column=0, sticky="ew", padx=5, pady=(0, 10))
-            ctk.CTkLabel(w_grid, text="Preço por Kg (R$):", font=("Aileron", 11, "bold")).grid(row=0, column=1, sticky="w", padx=5)
+            preco_label = "Preço por Unid/Kg (R$):" if self.business_type != "padaria_acougue" else "Preço por Kg (R$):"
+            ctk.CTkLabel(w_grid, text=preco_label, font=("Aileron", 11, "bold")).grid(row=0, column=1, sticky="w", padx=5)
             e_preco_peso = ctk.CTkEntry(w_grid, placeholder_text="0.00")
             e_preco_peso.grid(row=1, column=1, sticky="ew", padx=5, pady=(0, 10))
 
-        # --- ESTOQUE POR TAMANHO (P/M/G/GG) — somente Loja de Roupas ---
+        # --- ESTOQUE POR TAMANHO (P/M/G/GG) — Loja de Roupas e Moda / Customização ---
         size_entries = {}
-        if self.business_type in ("loja_roupa",):
+        if self.business_type in ("loja_roupa", "moda_customizacao"):
             size_card = ctk.CTkFrame(main_frame, fg_color=("white", "#2B2B2B"), corner_radius=15)
             size_card.pack(fill="x", pady=(0, 15))
 
-            ctk.CTkLabel(size_card, text="Controle de Estoque por Tamanho", font=("Aileron", 14, "bold"), text_color="#7BBDE8").pack(pady=10, padx=15, anchor="w")
+            ctk.CTkLabel(size_card, text="Controle de Estoque por Tamanho / Grade", font=("Aileron", 14, "bold"), text_color="#7BBDE8").pack(pady=10, padx=15, anchor="w")
             ctk.CTkLabel(size_card, text="(Opcional - preencha se o produto tem variações de tamanho)", font=("Aileron", 10, "italic"), text_color="gray").pack(padx=15, anchor="w")
 
             size_grid = ctk.CTkFrame(size_card, fg_color="transparent")
@@ -3791,10 +4509,10 @@ class App(ctk.CTk):
                 e_size.grid(row=1, column=col_idx, padx=10, pady=(0, 10))
                 size_entries[size_label] = e_size
 
-        # --- SEÇÃO SAPATOS / CALÇAS — somente Loja de Roupas ---
+        # --- SEÇÃO SAPATOS / CALÇAS / SOB MEDIDA — Loja de Roupas e Moda ---
         shoe_sizes_list = []
         pants_sizes_list = []
-        if self.business_type in ("loja_roupa",):
+        if self.business_type in ("loja_roupa", "moda_customizacao"):
             shoes_pants_card = ctk.CTkFrame(main_frame, fg_color=("white", "#2B2B2B"), corner_radius=15)
             shoes_pants_card.pack(fill="x", pady=(0, 15))
 
@@ -3938,6 +4656,8 @@ class App(ctk.CTk):
 
         # --- Save ---
         def save():
+            if self.check_trial_limits('produto', dialog):
+                return
             try:
                 nome = entries["Nome"].get().strip()
                 if not nome:
@@ -4215,1235 +4935,40 @@ class App(ctk.CTk):
 
         ctk.CTkButton(right_col, text="SALVAR KIT", height=45, fg_color="#28a745", hover_color="#218838", font=("Aileron", 14, "bold"), command=save_kit).pack(pady=20, padx=15, fill="x")
 
-    def _fechar_pdv(self, dialog):
-        """Fecha janela do PDV e limpa referência singleton."""
+    def _fechar_pdv(self, dialog=None):
+        """Fecha janela do PDV e limpa referência singleton com cleanup de timers."""
+        target = dialog or getattr(self, '_pdv_dialog', None)
         self._pdv_dialog = None
-        dialog.destroy()
-
-    def open_sell_product_dialog(self):
-        # Singleton: impedir múltiplas janelas de PDV
-        if self._pdv_dialog is not None and self._pdv_dialog.winfo_exists():
-            self._pdv_dialog.focus()
-            return
-
-        # Verificar se o caixa está aberto antes de vender
-        if not self.db.caixa_aberto():
-            messagebox.showwarning(
-                "Caixa Fechado",
-                "Abra o caixa antes de registrar vendas.\n\nAcesse: Menu lateral → CAIXA"
-            )
-            return
-
-        # Janela de PDV (Ponto de Venda)
-        dialog = ctk.CTkToplevel(self)
-        dialog.title("PDV - Registrar Venda")
-        dialog.geometry("900x600")
-        dialog.minsize(700, 400)
-        dialog.attributes("-topmost", True)
-        self._pdv_dialog = dialog
-        dialog.protocol("WM_DELETE_WINDOW", lambda: self._fechar_pdv(dialog))
-        
-        # Variáveis de Estado
-        self.carrinho = []
-        
-        # -- Layout --
-        main_frame = ctk.CTkFrame(dialog, fg_color="transparent")
-        main_frame.pack(fill="both", expand=True, padx=10, pady=10)
-        
-        left_container = ctk.CTkFrame(main_frame, fg_color="transparent")
-        left_container.pack(side="left", fill="both", expand=True, padx=(0, 5))
-
-        left_frame = ctk.CTkScrollableFrame(left_container, fg_color=("white", "#2B2B2B"), corner_radius=15,
-                                             scrollbar_button_color=("#CCCCCC", "#555555"))
-        left_frame.pack(fill="both", expand=True)
-        
-        right_container = ctk.CTkFrame(main_frame, fg_color="transparent")
-        right_container.pack(side="right", fill="both", expand=True, padx=(5, 0))
-
-        right_frame = ctk.CTkScrollableFrame(right_container, fg_color=("white", "#2B2B2B"), corner_radius=15,
-                                              scrollbar_button_color=("#CCCCCC", "#555555"))
-        right_frame.pack(fill="both", expand=True)
-        
-        # --- ESQUERDA: Seleção de Produto ---
-        ctk.CTkLabel(left_frame, text="Adicionar Produto / Kit", font=("Aileron", 16, "bold"), text_color=("#001D39", "white")).pack(pady=15)
-        
-        # Leitor de Código de Barras
-        lbl_scan = ctk.CTkLabel(left_frame, text="Scan Código de Barras:", font=("Aileron", 11, "italic"))
-        lbl_scan.pack(fill="x", padx=15, pady=(0,0))
-        scan_row = ctk.CTkFrame(left_frame, fg_color="transparent")
-        scan_row.pack(fill="x", padx=15, pady=(0, 5))
-        entry_scan = ctk.CTkEntry(scan_row, placeholder_text="Clique aqui e escaneie...")
-        entry_scan.pack(side="left", fill="x", expand=True, padx=(0, 5))
-
-        # Botão de câmera para scanner por webcam
-        def _abrir_camera_scanner():
-            if not BARCODE_SCANNER_AVAILABLE:
-                messagebox.showinfo("Indisponível", "Instale opencv-python e pyzbar para usar o scanner por câmera.", parent=dialog)
-                return
-            # Aqui barcode_scanner já foi importado com sucesso
-            if not barcode_scanner.scanner_disponivel():
-                messagebox.showinfo("Indisponível", "Câmera não disponível ou drivers não instalados.", parent=dialog)
-                return
-
-            cam_win = ctk.CTkToplevel(dialog)
-            cam_win.title("Scanner por Câmera")
-            cam_win.geometry("640x520")
-            cam_win.attributes("-topmost", True)
-            cam_win.resizable(False, False)
-
-            lbl_video = ctk.CTkLabel(cam_win, text="Iniciando câmera...", width=640, height=480)
-            lbl_video.pack()
-
-            lbl_status = ctk.CTkLabel(cam_win, text="Aponte o código de barras para a câmera",
-                                      font=("Aileron", 12), text_color=("#333", "white"))
-            lbl_status.pack(pady=5)
-
-            import cv2 as _cv2
-            cap = _cv2.VideoCapture(0)
-            _cam_running = [True]
-
-            def _update_frame():
-                if not _cam_running[0]:
-                    return
-                try:
-                    if not cam_win.winfo_exists():
-                        return
-                except Exception:
-                    return
-                ret, frame = cap.read()
-                if ret:
-                    from pyzbar import pyzbar as _pyzbar
-                    barcodes = _pyzbar.decode(frame)
-                    for bc in barcodes:
-                        pts = bc.polygon
-                        if len(pts) == 4:
-                            for i in range(4):
-                                _cv2.line(frame, (pts[i].x, pts[i].y),
-                                         (pts[(i+1) % 4].x, pts[(i+1) % 4].y), (0, 255, 0), 3)
-                        code_data = bc.data.decode('utf-8', errors='ignore')
-                        if code_data:
-                            _cam_running[0] = False
-                            cap.release()
-                            cam_win.destroy()
-                            entry_scan.delete(0, 'end')
-                            entry_scan.insert(0, code_data)
-                            entry_scan.event_generate('<Return>')
-                            return
-
-                    frame_rgb = _cv2.cvtColor(frame, _cv2.COLOR_BGR2RGB)
-                    pil_img = Image.fromarray(frame_rgb)
-                    ctk_img = ctk.CTkImage(light_image=pil_img, dark_image=pil_img, size=(640, 480))
-                    lbl_video.configure(image=ctk_img, text="")
-                    lbl_video._cam_img_ref = ctk_img
-
-                if _cam_running[0]:
-                    cam_win.after(33, _update_frame)
-
-            def _on_cam_close():
-                _cam_running[0] = False
-                cap.release()
-                try:
-                    cam_win.destroy()
-                except Exception:
-                    pass
-
-            cam_win.protocol("WM_DELETE_WINDOW", _on_cam_close)
-            cam_win.after(100, _update_frame)
-
-        btn_cam = ctk.CTkButton(scan_row, text="📷", width=40, height=32,
-                                fg_color="#0A4174", hover_color="#062F56",
-                                command=_abrir_camera_scanner)
-        btn_cam.pack(side="right")
-        
-        # Carregar Produtos e Kits (excluir insumos do PDV)
-        df_prods = self.db.listar_produtos_vendaveis()
-        if not df_prods.empty:
-            df_prods['type'] = 'produto'
-            df_prods['display_name'] = df_prods.apply(lambda r: f"{r['nome']} (Estoque: {r['quantidade']} | R$ {r['preco']:.2f})", axis=1)
-
-        df_kits = self.db.listar_kits()
-        if not df_kits.empty:
-            df_kits['type'] = 'kit'
-            df_kits['display_name'] = df_kits.apply(lambda r: f"[KIT] {r['nome']} (Promo: R$ {r['preco_venda']:.2f})", axis=1)
-        
-        # Mapa unificado (Nome Display -> Linha de dados)
-        item_map = {}
-        all_items_list = []  # lista ordenada de dicts
-        if not df_prods.empty:
-            for _, r in df_prods.iterrows():
-                item_map[r['display_name']] = r
-                all_items_list.append(dict(r))
-        if not df_kits.empty:
-            for _, r in df_kits.iterrows():
-                item_map[r['display_name']] = r
-                all_items_list.append(dict(r))
-
-        # Ordenar: mais vendidos no topo, depois alfabético
-        top_vendidos = self.db.obter_produtos_mais_vendidos(50)
-        top_vendidos_set = set(top_vendidos)
-        top_vendidos_rank = {pid: idx for idx, pid in enumerate(top_vendidos)}
-
-        def _sort_key(item):
-            item_id = item.get('id')
-            if item.get('type') == 'produto' and item_id in top_vendidos_set:
-                return (0, top_vendidos_rank[item_id])
-            return (1, item.get('display_name', ''))
-
-        all_items_list.sort(key=_sort_key)
-
-        if not all_items_list:
-            ctk.CTkLabel(left_frame, text="Sem itens cadastrados.", text_color="red").pack(pady=20)
-            return
-
-        # --- Busca + Filtros por Categoria / Subcategoria / Sub-subcategoria ---
-        search_frame = ctk.CTkFrame(left_frame, fg_color="transparent")
-        search_frame.pack(fill="x", padx=15, pady=(5, 0))
-
-        entry_busca = ctk.CTkEntry(search_frame, placeholder_text="🔍 Buscar produto...", height=32)
-        entry_busca.pack(fill="x")
-
-        filter_frame = ctk.CTkFrame(left_frame, fg_color="transparent")
-        filter_frame.pack(fill="x", padx=15, pady=(3, 0))
-
-        # Coletar categorias únicas dos produtos
-        cats_unicas = ["Todas"]
-        if not df_prods.empty and 'categoria' in df_prods.columns:
-            cats_unicas += sorted(df_prods['categoria'].dropna().unique().tolist())
-        var_filtro_cat = ctk.StringVar(value="Todas")
-        combo_filtro_cat = ctk.CTkComboBox(filter_frame, values=cats_unicas, variable=var_filtro_cat, width=120, state="readonly", height=28, font=("Aileron", 10))
-        combo_filtro_cat.pack(side="left", padx=(0, 3))
-
-        var_filtro_subcat = ctk.StringVar(value="Todas")
-        combo_filtro_subcat = ctk.CTkComboBox(filter_frame, values=["Todas"], variable=var_filtro_subcat, width=120, state="readonly", height=28, font=("Aileron", 10))
-        combo_filtro_subcat.pack(side="left", padx=(0, 3))
-
-        var_filtro_subsub = ctk.StringVar(value="Todas")
-        combo_filtro_subsub = ctk.CTkComboBox(filter_frame, values=["Todas"], variable=var_filtro_subsub, width=120, state="readonly", height=28, font=("Aileron", 10))
-        combo_filtro_subsub.pack(side="left")
-
-        def _on_cat_change(*_):
-            cat_sel = var_filtro_cat.get()
-            if cat_sel == "Todas":
-                combo_filtro_subcat.configure(values=["Todas"])
-                var_filtro_subcat.set("Todas")
-                combo_filtro_subsub.configure(values=["Todas"])
-                var_filtro_subsub.set("Todas")
-            else:
-                subcats = ["Todas"]
-                if not df_prods.empty and 'subcategoria' in df_prods.columns:
-                    mask = df_prods['categoria'] == cat_sel
-                    subcats += sorted(df_prods.loc[mask, 'subcategoria'].dropna().loc[lambda s: s != ''].unique().tolist())
-                combo_filtro_subcat.configure(values=subcats)
-                var_filtro_subcat.set("Todas")
-                combo_filtro_subsub.configure(values=["Todas"])
-                var_filtro_subsub.set("Todas")
-
-        def _on_subcat_change(*_):
-            cat_sel = var_filtro_cat.get()
-            subcat_sel = var_filtro_subcat.get()
-            if subcat_sel == "Todas" or cat_sel == "Todas":
-                combo_filtro_subsub.configure(values=["Todas"])
-                var_filtro_subsub.set("Todas")
-            else:
-                subsubs = ["Todas"]
-                if not df_prods.empty and 'sub_subcategoria' in df_prods.columns:
-                    mask = (df_prods['categoria'] == cat_sel) & (df_prods['subcategoria'] == subcat_sel)
-                    subsubs += sorted(df_prods.loc[mask, 'sub_subcategoria'].dropna().loc[lambda s: s != ''].unique().tolist())
-                combo_filtro_subsub.configure(values=subsubs)
-                var_filtro_subsub.set("Todas")
-
-        var_filtro_cat.trace_add("write", _on_cat_change)
-        var_filtro_subcat.trace_add("write", _on_subcat_change)
-
-        # --- Lista scrollable de produtos (substitui o ComboBox) ---
-        prod_scroll = ctk.CTkScrollableFrame(left_frame, fg_color=("#F5F5F5", "#333333"), corner_radius=10, height=180)
-        prod_scroll.pack(fill="both", expand=True, padx=15, pady=5)
-
-        # Cache de imagens
-        _img_cache_pdv = {}
-
-        def _carregar_imagem_produto(item_row):
-            """Retorna CTkImage (60x60) ou None."""
-            if item_row.get('type') != 'produto':
-                return None
-            img_name = item_row.get('imagem', '')
-            if not img_name:
-                return None
-            if img_name in _img_cache_pdv:
-                return _img_cache_pdv[img_name]
+        if target is not None:
             try:
-                img_path = os.path.join(self.db.data_dir, "product_images", img_name)
-                if os.path.exists(img_path):
-                    pil_img = Image.open(img_path)
-                    pil_img.thumbnail((100, 100), Image.Resampling.LANCZOS)
-                    ctk_img = ctk.CTkImage(light_image=pil_img, dark_image=pil_img, size=(100, 100))
-                    _img_cache_pdv[img_name] = ctk_img
-                    return ctk_img
-            except Exception as e:
-                logger.debug("Erro ao carregar preview: %s", e)
-            return None
-
-        # Tooltip flutuante com foto ao passar o mouse na lista de seleção
-        _hover_tooltip = None
-        _hover_tooltip_img_ref = None
-        _hover_current_item = [None]  # item_data do produto atualmente em hover
-        _hover_after_id = [None]      # ID do after pendente (debounce)
-        _HOVER_DELAY_MS = 200         # atraso antes de mostrar o tooltip
-
-        def _do_show_tooltip(item_data, x_root, y_root):
-            """Cria efetivamente o tooltip após o debounce."""
-            nonlocal _hover_tooltip, _hover_tooltip_img_ref
-            # Se mudou de item enquanto esperava, cancela
-            if _hover_current_item[0] is not item_data:
-                return
-            # Se já existe um tooltip para o mesmo item, ignora
-            if _hover_tooltip:
-                try:
-                    if _hover_tooltip.winfo_exists():
-                        return
-                except Exception:
-                    _hover_tooltip = None
-
-            ctk_img = _carregar_imagem_produto(item_data)
-            if not ctk_img:
-                return  # Sem imagem, sem tooltip
-
-            _hover_tooltip = tw = ctk.CTkToplevel(dialog)
-            tw.wm_overrideredirect(True)
-            tw.attributes("-topmost", True)
-            tw.wm_geometry(f"+{x_root + 15}+{y_root + 10}")
-
-            frame_tt = ctk.CTkFrame(tw, fg_color=("white", "#2B2B2B"), corner_radius=10,
-                                    border_width=1, border_color=("#CCCCCC", "#555555"))
-            frame_tt.pack(fill="both", expand=True, padx=2, pady=2)
-
-            _hover_tooltip_img_ref = ctk_img
-            ctk.CTkLabel(frame_tt, image=ctk_img, text="").pack(padx=8, pady=(8, 4))
-            ctk.CTkLabel(frame_tt, text=item_data.get('nome', ''), font=("Aileron", 11, "bold"),
-                        text_color=("#001D39", "white"), wraplength=160).pack(padx=8, pady=(0, 8))
-
-        def _show_hover_preview(event, item_data):
-            nonlocal _hover_tooltip
-            # Se já está em hover no mesmo item, apenas reposiciona o tooltip existente
-            if _hover_current_item[0] is item_data:
-                if _hover_tooltip:
-                    try:
-                        if _hover_tooltip.winfo_exists():
-                            _hover_tooltip.wm_geometry(f"+{event.x_root + 15}+{event.y_root + 10}")
-                    except Exception:
-                        pass
-                return
-            # Mudou de item — destruir tooltip anterior e cancelar debounce pendente
-            _destroy_tooltip()
-            _hover_current_item[0] = item_data
-            # Agendar criação do tooltip com debounce
-            if _hover_after_id[0]:
-                try:
-                    dialog.after_cancel(_hover_after_id[0])
-                except Exception:
-                    pass
-            _hover_after_id[0] = dialog.after(
-                _HOVER_DELAY_MS,
-                lambda: _do_show_tooltip(item_data, event.x_root, event.y_root)
-            )
-
-        def _destroy_tooltip():
-            """Remove tooltip sem limpar o item atual."""
-            nonlocal _hover_tooltip, _hover_tooltip_img_ref
-            if _hover_after_id[0]:
-                try:
-                    dialog.after_cancel(_hover_after_id[0])
-                except Exception:
-                    pass
-                _hover_after_id[0] = None
-            if _hover_tooltip:
-                try:
-                    _hover_tooltip.destroy()
-                except Exception:
-                    pass
-                _hover_tooltip = None
-                _hover_tooltip_img_ref = None
-
-        def _is_mouse_inside_frame(frame):
-            """Verifica se o ponteiro do mouse ainda está dentro do frame."""
-            try:
-                mx, my = frame.winfo_pointerxy()
-                fx = frame.winfo_rootx()
-                fy = frame.winfo_rooty()
-                fw = frame.winfo_width()
-                fh = frame.winfo_height()
-                return fx <= mx < fx + fw and fy <= my < fy + fh
-            except Exception:
-                return False
-
-        def _on_frame_leave(event, frame):
-            """Só esconde o tooltip se o mouse realmente saiu da área do frame."""
-            # Quando o mouse passa do frame para seu filho (btn), tkinter
-            # dispara <Leave> no frame — mas o mouse ainda está dentro.
-            if _is_mouse_inside_frame(frame):
-                return  # Falso Leave — mouse ainda está no frame
-            _destroy_tooltip()
-            _hover_current_item[0] = None
-
-        def _hide_hover_preview(event=None):
-            _destroy_tooltip()
-            _hover_current_item[0] = None
-
-        # Variável para armazenar item selecionado
-        _selected_item = [None]  # lista mutável para closure
-
-        def _select_item(item_data):
-            _selected_item[0] = item_data
-            # Destacar visualmente (atualizar lista)
-            _populate_product_list()
-
-        def _quick_add_to_cart(item_data):
-            """Duplo-clique adiciona 1 unidade direto ao carrinho."""
-            try:
-                add_to_cart_logic(item_data, 1)
+                if hasattr(target, 'close'):
+                    target.close()
+                else:
+                    target.destroy()
             except Exception:
                 pass
 
-        def _populate_product_list():
-            for w in prod_scroll.winfo_children():
-                w.destroy()
-
-            query = entry_busca.get().strip().lower()
-            cat_filter = var_filtro_cat.get()
-            subcat_filter = var_filtro_subcat.get()
-            subsub_filter = var_filtro_subsub.get()
-
-            for item_data in all_items_list:
-                # Filtro de busca por texto E código de barras
-                if query:
-                    nome_match = query in item_data.get('display_name', '').lower()
-                    codigo_match = query == item_data.get('codigo_barras', '').lower() if item_data.get('codigo_barras') else False
-                    if not nome_match and not codigo_match:
-                        continue
-                # Filtro por categoria
-                if cat_filter != "Todas":
-                    item_cat = item_data.get('categoria', '')
-                    if item_data.get('type') == 'kit':
-                        pass  # kits sempre visíveis
-                    elif str(item_cat) != cat_filter:
-                        continue
-                # Filtro por subcategoria
-                if subcat_filter != "Todas":
-                    item_subcat = item_data.get('subcategoria', '') or ''
-                    if item_data.get('type') != 'kit' and str(item_subcat) != subcat_filter:
-                        continue
-                # Filtro por sub-subcategoria
-                if subsub_filter != "Todas":
-                    item_subsub = item_data.get('sub_subcategoria', '') or ''
-                    if item_data.get('type') != 'kit' and str(item_subsub) != subsub_filter:
-                        continue
-
-                is_selected = (_selected_item[0] is not None and 
-                              item_data.get('display_name') == _selected_item[0].get('display_name'))
-
-                fg = ("#D6EAF8", "#1A3A5C") if is_selected else ("white", "#404040")
-                border_color = ("#0A4174", "#7BBDE8") if is_selected else ("#7BBDE8", "#49769F")
-                border_w = 2
-
-                f = ctk.CTkFrame(prod_scroll, fg_color=fg, corner_radius=8, 
-                                border_width=border_w, border_color=border_color)
-                f.pack(fill="x", pady=2, padx=3)
-
-                nome_display = item_data.get('nome', '')
-                tipo = item_data.get('type', 'produto')
-                if tipo == 'kit':
-                    txt = f"[KIT] {nome_display}  —  R$ {item_data.get('preco_venda', 0):.2f}"
-                else:
-                    cat_txt = item_data.get('categoria', '')
-                    sub_txt = item_data.get('subcategoria', '') or ''
-                    tam_txt = item_data.get('tamanho', '') or ''
-                    sub_sub_txt = item_data.get('sub_subcategoria', '') or ''
-                    extras = []
-                    if cat_txt: extras.append(cat_txt)
-                    if sub_txt: extras.append(sub_txt)
-                    if sub_sub_txt: extras.append(sub_sub_txt)
-                    if tam_txt: extras.append(tam_txt)
-                    info_extra = " | ".join(extras)
-                    # Mostrar estoque por tamanho se disponível
-                    ep = item_data.get('estoque_p', 0) or 0
-                    em = item_data.get('estoque_m', 0) or 0
-                    eg = item_data.get('estoque_g', 0) or 0
-                    egg = item_data.get('estoque_gg', 0) or 0
-                    txt = f"{nome_display}  —  Est: {item_data.get('quantidade', 0)} | R$ {item_data.get('preco', 0):.2f}"
-                    # Mostrar preço por peso para padaria/açougue
-                    unidade_m = item_data.get('unidade_medida', 'un') or 'un'
-                    preco_peso_v = item_data.get('preco_por_peso', 0) or 0
-                    if unidade_m in ('kg', 'g') and preco_peso_v > 0:
-                        txt = f"{nome_display}  —  R$ {preco_peso_v:.2f}/kg"
-                    if ep > 0 or em > 0 or eg > 0 or egg > 0:
-                        txt += f"\nP:{ep} M:{em} G:{eg} GG:{egg}"
-                    if info_extra:
-                        txt += f"\n{info_extra}"
-
-                btn = ctk.CTkButton(f, text=txt, text_color=("#333333", "white"), 
-                                   fg_color="transparent", hover_color=("#E8F4FD", "#2A4A6A"),
-                                   anchor="w", font=("Aileron", 11),
-                                   command=lambda d=item_data: _select_item(d))
-                btn.pack(fill="x", padx=5, pady=4)
-
-                # Duplo-clique adiciona direto ao carrinho
-                btn.bind("<Double-1>", lambda e, d=item_data: _quick_add_to_cart(d))
-                f.bind("<Double-1>", lambda e, d=item_data: _quick_add_to_cart(d))
-
-                # Hover para mostrar foto — bind em frame E botão para continuidade
-                f.bind("<Enter>", lambda e, d=item_data: _show_hover_preview(e, d))
-                btn.bind("<Enter>", lambda e, d=item_data: _show_hover_preview(e, d))
-                f.bind("<Leave>", lambda e, fr=f: _on_frame_leave(e, fr))
-                btn.bind("<Leave>", lambda e, fr=f: _on_frame_leave(e, fr))
-
-        # Garantir que sair da área do scroll limpa o tooltip
-        prod_scroll.bind("<Leave>", _hide_hover_preview)
-        entry_busca.bind("<KeyRelease>", lambda e: _populate_product_list())
-        var_filtro_cat.trace_add("write", lambda *a: _populate_product_list())
-        var_filtro_subcat.trace_add("write", lambda *a: _populate_product_list())
-        var_filtro_subsub.trace_add("write", lambda *a: _populate_product_list())
-        _populate_product_list()
-
-        # Quantidade e Cliente com setas
-        ctk.CTkLabel(left_frame, text="Quantidade:", anchor="w", text_color=("#001D39", "white")).pack(fill="x", padx=15, pady=(5, 0))
-        
-        qtd_frame = ctk.CTkFrame(left_frame, fg_color="transparent")
-        qtd_frame.pack(fill="x", padx=15, pady=3)
-        
-        def _diminuir_qtd():
+    def open_sell_product_dialog(self):
+        """Abre a janela isolada do PDV (Ponto de Venda)."""
+        if self._pdv_dialog is not None:
             try:
-                val = int(entry_qtd.get())
-                if val > 1:
-                    entry_qtd.delete(0, "end")
-                    entry_qtd.insert(0, str(val - 1))
-            except ValueError:
-                entry_qtd.delete(0, "end")
-                entry_qtd.insert(0, "1")
-
-        def _aumentar_qtd():
-            try:
-                val = int(entry_qtd.get())
-                entry_qtd.delete(0, "end")
-                entry_qtd.insert(0, str(val + 1))
-            except ValueError:
-                entry_qtd.delete(0, "end")
-                entry_qtd.insert(0, "1")
-
-        ctk.CTkButton(qtd_frame, text="▼", width=40, height=35, fg_color="#7BBDE8", hover_color="#49769F",
-                      text_color="#001D39", font=("Aileron", 16, "bold"), command=_diminuir_qtd).pack(side="left", padx=(0, 5))
-        entry_qtd = ctk.CTkEntry(qtd_frame, width=80, justify="center")
-        entry_qtd.insert(0, "1")
-        entry_qtd.pack(side="left", fill="x", expand=True)
-        ctk.CTkButton(qtd_frame, text="▲", width=40, height=35, fg_color="#7BBDE8", hover_color="#49769F",
-                      text_color="#001D39", font=("Aileron", 16, "bold"), command=_aumentar_qtd).pack(side="left", padx=(5, 0))
-
-        # Campo de peso (apenas para Padaria/Açougue)
-        entry_peso = None
-        if self.business_type == "padaria_acougue":
-            ctk.CTkLabel(left_frame, text="Peso (kg):", anchor="w", text_color=("#001D39", "white")).pack(fill="x", padx=15, pady=(5, 0))
-            peso_frame = ctk.CTkFrame(left_frame, fg_color="transparent")
-            peso_frame.pack(fill="x", padx=15, pady=3)
-            entry_peso = ctk.CTkEntry(peso_frame, placeholder_text="Ex: 0.500", justify="center")
-            entry_peso.pack(side="left", fill="x", expand=True, padx=(0, 5))
-            ctk.CTkLabel(peso_frame, text="kg", font=("Aileron", 12, "bold"), text_color=("#001D39", "white")).pack(side="left")
-
-        # Desconto por item
-        ctk.CTkLabel(left_frame, text="Desconto por Item:", anchor="w", text_color=("#001D39", "white")).pack(fill="x", padx=15, pady=(5, 0))
-        desc_item_frame = ctk.CTkFrame(left_frame, fg_color="transparent")
-        desc_item_frame.pack(fill="x", padx=15, pady=3)
-        entry_desc_item = ctk.CTkEntry(desc_item_frame, placeholder_text="0", width=80)
-        entry_desc_item.pack(side="left", fill="x", expand=True, padx=(0, 5))
-        tipo_desc_item_var = ctk.StringVar(value="%")
-        ctk.CTkComboBox(desc_item_frame, values=["%", "R$"], variable=tipo_desc_item_var, width=60, state="readonly").pack(side="left")
-
-        # Seleção de Cliente
-        ctk.CTkLabel(left_frame, text="Cliente:", anchor="w", text_color=("#001D39", "white")).pack(fill="x", padx=15, pady=(5, 0))
-        df_clientes = self.db.listar_clientes()
-        clientes_options = ["Consumidor Final"] + (df_clientes['nome'].tolist() if not df_clientes.empty else [])
-        var_cliente = ctk.StringVar(value="Consumidor Final")
-        combo_cliente = ctk.CTkComboBox(left_frame, values=clientes_options, variable=var_cliente)
-        combo_cliente.pack(fill="x", padx=15, pady=3)
-
-        # Contato / WhatsApp do Cliente
-        ctk.CTkLabel(left_frame, text="Contato / WhatsApp:", anchor="w", text_color=("#001D39", "white")).pack(fill="x", padx=15, pady=(5, 0))
-        entry_contato_cliente = ctk.CTkEntry(left_frame, placeholder_text="(11) 99999-9999")
-        entry_contato_cliente.pack(fill="x", padx=15, pady=3)
-
-        def _on_cliente_change(*args):
-            """Preenche o contato automaticamente ao selecionar um cliente cadastrado."""
-            nome_sel = var_cliente.get()
-            entry_contato_cliente.delete(0, "end")
-            if nome_sel != "Consumidor Final" and not df_clientes.empty:
-                c_rows = df_clientes[df_clientes['nome'] == nome_sel]
-                if not c_rows.empty:
-                    contato = c_rows.iloc[0].get('contato', '')
-                    if contato:
-                        entry_contato_cliente.insert(0, contato)
-
-        var_cliente.trace_add("write", _on_cliente_change)
-
-        # Seleção de Vendedor (auto-detecta turno)
-        ctk.CTkLabel(left_frame, text="Vendedor:", anchor="w", text_color=("#001D39", "white")).pack(fill="x", padx=15, pady=(5, 0))
-        df_vendedores = self.db.listar_vendedores()
-        vendedores_options = [""] + (df_vendedores['nome'].tolist() if not df_vendedores.empty else [])
-        vendedor_turno = self.db.vendedor_no_turno()
-        var_vendedor = ctk.StringVar(value=vendedor_turno)
-        combo_vendedor = ctk.CTkComboBox(left_frame, values=vendedores_options, variable=var_vendedor)
-        combo_vendedor.pack(fill="x", padx=15, pady=3)
-
-        def add_to_cart_logic(item_row, qtd, peso_kg=None):
-            if qtd <= 0: raise ValueError
-            
-            # Check Availability Logic
-            if item_row['type'] == 'produto':
-                if qtd > item_row['quantidade']:
-                    messagebox.showerror("Erro", f"Estoque insuficiente! Disponível: {item_row['quantidade']}", parent=dialog)
-                    return
-                price = item_row['preco']
-                name = item_row['nome']
-                item_id = item_row['id']
-
-                # Venda por peso (Padaria/Açougue)
-                unidade = item_row.get('unidade_medida', 'un') or 'un'
-                if peso_kg and peso_kg > 0 and unidade in ('kg', 'g'):
-                    preco_peso = item_row.get('preco_por_peso', 0) or 0
-                    if preco_peso > 0:
-                        price = preco_peso * peso_kg
-                    name = f"{name} ({peso_kg:.3f}kg)"
-                
-            elif item_row['type'] == 'kit':
-                # Check dynamic kit availability
-                max_kits = self.db.verificar_disponibilidade_kit(item_row['id'])
-                if qtd > max_kits:
-                    messagebox.showerror("Erro", f"Estoque insuficiente para montar {qtd} kits!\nMáximo possível hoje: {max_kits}", parent=dialog)
-                    return
-                price = item_row['preco_venda']
-                name = f"[KIT] {item_row['nome']}"
-                item_id = item_row['id']
-            
-            # Calcular desconto por item
-            desc_val_item = 0.0
-            try:
-                desc_input = entry_desc_item.get().strip()
-                if desc_input:
-                    desc_val_item = float(desc_input.replace(",", "."))
-            except ValueError:
-                desc_val_item = 0.0
-
-            if desc_val_item > 0:
-                if tipo_desc_item_var.get() == "%":
-                    price = price * (1 - desc_val_item / 100)
-                else:
-                    price = max(0, price - desc_val_item)
-            
-            # Verificar se já tem no carrinho
-            for c_item in self.carrinho:
-                if c_item['id'] == item_id and c_item['type'] == item_row['type']:
-                    # Re-check total limit
-                    if item_row['type'] == 'produto':
-                        if c_item['qtd'] + qtd > item_row['quantidade']:
-                            messagebox.showerror("Erro", "Limite de estoque atingido.", parent=dialog)
-                            return
-                    elif item_row['type'] == 'kit':
-                        max_kits_check = self.db.verificar_disponibilidade_kit(item_row['id'])
-                        if c_item['qtd'] + qtd > max_kits_check:
-                            messagebox.showerror("Erro", "Limite de kits atingido.", parent=dialog)
-                            return
-                    
-                    c_item['qtd'] += qtd
-                    update_cart_ui()
-                    return
-            
-            # Adicionar novo
-            preco_original = item_row.get('preco', price) if item_row['type'] == 'produto' else item_row.get('preco_venda', price)
-            desconto_aplicado = preco_original - price if price < preco_original else 0.0
-            self.carrinho.append({
-                'id': item_id,
-                'type': item_row['type'],
-                'nome': name,
-                'preco': price,
-                'preco_original': preco_original,
-                'desconto_item': desconto_aplicado,
-                'qtd': qtd,
-                'row_data': item_row # Guarda dados originais para referencia
-            })
-            update_cart_ui()
-
-        def add_to_cart():
-            try:
-                item_row = _selected_item[0]
-                if item_row is None:
-                    messagebox.showerror("Erro", "Selecione um produto na lista.", parent=dialog)
-                    return
-                qtd = int(entry_qtd.get())
-                peso_kg = None
-                if entry_peso is not None:
-                    peso_str = entry_peso.get().strip().replace(",", ".")
-                    if peso_str:
-                        peso_kg = float(peso_str)
-                add_to_cart_logic(item_row, qtd, peso_kg=peso_kg)
-            except ValueError:
-                messagebox.showerror("Erro", "Quantidade inválida.", parent=dialog)
-            except Exception as e:
-                messagebox.showerror("Erro", f"Ocorreu um erro: {e}", parent=dialog)
-
-        ctk.CTkButton(left_frame, text="Adicionar ao Carrinho", command=add_to_cart, height=40, fg_color="#0A4174", hover_color="#062F56").pack(padx=15, pady=20, fill="x")
-        
-        def on_scan(event=None):
-            code = entry_scan.get().strip()
-            if not code: return
-            
-            # Buscar produto pelo codigo
-            res_df = self.db.buscar_produto_por_codigo(code)
-            
-            if not res_df.empty:
-                # Produto encontrado!
-                p_row = res_df.iloc[0]
-                p_row['type'] = 'produto'
-                _mostrar_popup_desconto_scan(p_row)
-                entry_scan.delete(0, 'end')
-            else:
-                messagebox.showwarning("Não encontrado", f"Produto com código '{code}' não encontrado.", parent=dialog)
-                entry_scan.select_range(0, 'end')
-
-        def _mostrar_popup_desconto_scan(p_row):
-            """Popup de desconto antes de adicionar produto escaneado ao carrinho."""
-            preco = p_row['preco']
-            nome = p_row['nome']
-
-            popup = ctk.CTkToplevel(dialog)
-            popup.title("Produto Escaneado")
-            popup.geometry("380x340")
-            popup.attributes("-topmost", True)
-            popup.resizable(False, False)
-            popup.grab_set()
-
-            ctk.CTkLabel(popup, text=f"📦 {nome}", font=("Aileron", 15, "bold"),
-                         wraplength=340).pack(pady=(15, 3))
-            ctk.CTkLabel(popup, text=f"Preço: R$ {preco:.2f}", font=("Aileron", 13)).pack(pady=(0, 10))
-
-            # Quantidade
-            qtd_frame = ctk.CTkFrame(popup, fg_color="transparent")
-            qtd_frame.pack(fill="x", padx=25, pady=(0, 5))
-            ctk.CTkLabel(qtd_frame, text="Quantidade:", anchor="w").pack(side="left")
-            entry_qtd_scan = ctk.CTkEntry(qtd_frame, width=60)
-            entry_qtd_scan.pack(side="right")
-            entry_qtd_scan.insert(0, "1")
-
-            # Checkbox desconto
-            var_desc = ctk.BooleanVar(value=False)
-            desc_check = ctk.CTkCheckBox(popup, text="Aplicar desconto?", variable=var_desc)
-            desc_check.pack(pady=(5, 5))
-
-            # Frame de desconto (inicialmente oculto)
-            desc_frame = ctk.CTkFrame(popup, fg_color="transparent")
-
-            ctk.CTkLabel(desc_frame, text="Tipo:", anchor="w").pack(fill="x", padx=5)
-            var_tipo = ctk.StringVar(value="%")
-            ctk.CTkComboBox(desc_frame, values=["%", "R$"], variable=var_tipo,
-                            width=80, state="readonly").pack(padx=5, pady=(0, 5))
-
-            ctk.CTkLabel(desc_frame, text="Valor do desconto:", anchor="w").pack(fill="x", padx=5)
-            entry_desc_val = ctk.CTkEntry(desc_frame, placeholder_text="0", width=100)
-            entry_desc_val.pack(padx=5, pady=(0, 5))
-
-            def _toggle_desc():
-                if var_desc.get():
-                    desc_frame.pack(fill="x", padx=25, pady=(0, 5))
-                else:
-                    desc_frame.pack_forget()
-            var_desc.trace_add("write", lambda *_a: _toggle_desc())
-
-            def _confirmar():
-                try:
-                    qtd = int(entry_qtd_scan.get())
-                    if qtd <= 0:
-                        raise ValueError
-                except ValueError:
-                    messagebox.showerror("Erro", "Quantidade inválida.", parent=popup)
-                    return
-
-                preco_final = preco
-                if var_desc.get():
-                    try:
-                        desc_v = float(entry_desc_val.get().strip().replace(",", "."))
-                    except (ValueError, AttributeError):
-                        desc_v = 0.0
-                    if desc_v > 0:
-                        if var_tipo.get() == "%":
-                            preco_final = preco * (1 - desc_v / 100)
-                        else:
-                            preco_final = max(0, preco - desc_v)
-
-                # Temporariamente setar os campos de desconto do formulário para a lógica do carrinho
-                # Usar add_to_cart_logic sem desconto (já calculamos aqui)
-                old_desc = entry_desc_item.get()
-                entry_desc_item.delete(0, 'end')
-                entry_desc_item.insert(0, "0")
-
-                # Criar row modificado com preco ajustado
-                import copy
-                p_mod = copy.copy(p_row)
-                p_mod['preco'] = preco_final
-
-                try:
-                    add_to_cart_logic(p_mod, qtd)
-                except Exception as e:
-                    messagebox.showerror("Erro ao adicionar", str(e), parent=popup)
-                finally:
-                    entry_desc_item.delete(0, 'end')
-                    if old_desc:
-                        entry_desc_item.insert(0, old_desc)
-                    popup.destroy()
-
-            ctk.CTkButton(popup, text="✅ Adicionar ao Carrinho", command=_confirmar,
-                          height=38, fg_color="#0A4174", hover_color="#062F56").pack(pady=(10, 10), padx=25, fill="x")
-
-        entry_scan.bind('<Return>', on_scan)
-        entry_scan.focus_set()
-        
-        # --- DIREITA: Carrinho e Finalização ---
-        ctk.CTkLabel(right_frame, text="Carrinho de Compras", font=("Aileron", 16, "bold"), text_color=("#001D39", "white")).pack(pady=(10, 5))
-        
-        # Lista 
-        tree_frame = ctk.CTkFrame(right_frame, fg_color="transparent")
-        tree_frame.pack(fill="both", expand=True, padx=10)
-
-        # Estilo do Treeview para tema claro/escuro
-        style_cart = ttk.Style()
-        is_dark_mode = ctk.get_appearance_mode() == "Dark"
-        if is_dark_mode:
-            style_cart.configure("Cart.Treeview", background="#2B2B2B", foreground="white",
-                                fieldbackground="#2B2B2B", rowheight=28)
-            style_cart.configure("Cart.Treeview.Heading", background="#3A3A3A", foreground="white")
-        else:
-            style_cart.configure("Cart.Treeview", background="white", foreground="#333333",
-                                fieldbackground="white", rowheight=28)
-            style_cart.configure("Cart.Treeview.Heading", background="#E8F4FD", foreground="#001D39")
-
-        columns = ("qtd", "produto", "unit", "total")
-        tree = ttk.Treeview(tree_frame, columns=columns, show="headings", height=10, style="Cart.Treeview")
-        tree.heading("qtd", text="Qtd")
-        tree.heading("produto", text="Produto")
-        tree.heading("unit", text="Unit (R$)")
-        tree.heading("total", text="Total (R$)")
-        
-        tree.column("qtd", width=50, anchor="center")
-        tree.column("produto", width=150)
-        tree.column("unit", width=80, anchor="e")
-        tree.column("total", width=80, anchor="e")
-        
-        tree.pack(side="left", fill="both", expand=True)
-        scrollbar = ttk.Scrollbar(tree_frame, orient="vertical", command=tree.yview)
-        scrollbar.pack(side="right", fill="y")
-        tree.configure(yscrollcommand=scrollbar.set)
-
-        lbl_total = ctk.CTkLabel(right_frame, text="Total: R$ 0,00", font=("Aileron", 18, "bold"), text_color="#28a745")
-        lbl_total.pack(pady=(5, 3))
-
-        # --- Seção de Desconto ---
-        desc_frame = ctk.CTkFrame(right_frame, fg_color=("white", "#3A3A3A"), corner_radius=10)
-        desc_frame.pack(fill="x", padx=10, pady=3)
-
-        ctk.CTkLabel(desc_frame, text="Desconto:", font=("Aileron", 11, "bold"), text_color=("#001D39", "white")).pack(side="left", padx=(10, 5), pady=8)
-        entry_desconto = ctk.CTkEntry(desc_frame, width=80, placeholder_text="0")
-        entry_desconto.pack(side="left", padx=2, pady=8)
-
-        tipo_desconto_var = ctk.StringVar(value="%")
-        combo_tipo_desc = ctk.CTkComboBox(desc_frame, values=["%", "R$"], variable=tipo_desconto_var, width=60, state="readonly")
-        combo_tipo_desc.pack(side="left", padx=5, pady=8)
-
-        lbl_total_final = ctk.CTkLabel(right_frame, text="", font=("Aileron", 13, "bold"), text_color="#0A4174")
-        lbl_total_final.pack(pady=(0, 3))
-
-        # --- Seção de Forma de Pagamento (Múltiplas) ---
-        pgto_container = ctk.CTkFrame(right_frame, fg_color=("white", "#3A3A3A"), corner_radius=10)
-        pgto_container.pack(fill="x", padx=10, pady=3)
-
-        pgto_header = ctk.CTkFrame(pgto_container, fg_color="transparent")
-        pgto_header.pack(fill="x", padx=10, pady=(5, 0))
-        ctk.CTkLabel(pgto_header, text="Pagamento:", font=("Aileron", 11, "bold"), text_color=("#001D39", "white")).pack(side="left")
-
-        pagamentos_list = []  # [{forma, valor_entry, frame}]
-        pgto_rows_frame = ctk.CTkFrame(pgto_container, fg_color="transparent")
-        pgto_rows_frame.pack(fill="x", padx=5, pady=3)
-
-        formas_pgto_options = ["Dinheiro", "PIX", "Cartão Débito", "Cartão Crédito", "Fiado"]
-
-        def _add_pgto_row(forma="Dinheiro", valor=""):
-            row_f = ctk.CTkFrame(pgto_rows_frame, fg_color="transparent")
-            row_f.pack(fill="x", pady=2)
-            var_forma = ctk.StringVar(value=forma)
-            combo = ctk.CTkComboBox(row_f, values=formas_pgto_options, variable=var_forma, width=130, state="readonly")
-            combo.pack(side="left", padx=2)
-            entry_val = ctk.CTkEntry(row_f, width=90, placeholder_text="R$ 0,00")
-            if valor:
-                entry_val.insert(0, valor)
-            entry_val.pack(side="left", padx=2)
-            entry_val.bind("<KeyRelease>", lambda e: _update_troco())
-            item = {"forma_var": var_forma, "valor_entry": entry_val, "frame": row_f}
-            
-            def _remove():
-                if len(pagamentos_list) <= 1:
-                    return
-                pagamentos_list.remove(item)
-                row_f.destroy()
-                _update_troco()
-
-            btn_rem = ctk.CTkButton(row_f, text="✕", width=28, height=28, fg_color="#FF6B6B",
-                                    hover_color="#FF5252", text_color="white", command=_remove)
-            btn_rem.pack(side="left", padx=2)
-            pagamentos_list.append(item)
-            var_forma.trace_add("write", lambda *a: _update_troco())
-
-        _add_pgto_row()
-
-        def _add_pgto_click():
-            _add_pgto_row()
-
-        ctk.CTkButton(pgto_container, text="+ Forma de Pagamento", height=26, fg_color="#7BBDE8",
-                      hover_color="#49769F", text_color="#001D39", font=("Aileron", 10, "bold"),
-                      command=_add_pgto_click).pack(padx=10, pady=(2, 5))
-
-        # --- Seção de Troco (aparece só quando tem Dinheiro) ---
-        troco_frame = ctk.CTkFrame(right_frame, fg_color=("white", "#3A3A3A"), corner_radius=10)
-        troco_frame.pack(fill="x", padx=10, pady=3)
-
-        ctk.CTkLabel(troco_frame, text="Valor recebido:", font=("Aileron", 11), text_color=("#001D39", "white")).pack(side="left", padx=(10, 5), pady=8)
-        entry_troco = ctk.CTkEntry(troco_frame, width=100, placeholder_text="0,00")
-        entry_troco.pack(side="left", padx=2, pady=8)
-        lbl_troco = ctk.CTkLabel(troco_frame, text="", font=("Aileron", 12, "bold"), text_color="#28a745")
-        lbl_troco.pack(side="left", padx=10, pady=8)
-
-        # --- Observação da Venda ---
-        obs_frame = ctk.CTkFrame(right_frame, fg_color=("white", "#3A3A3A"), corner_radius=10)
-        obs_frame.pack(fill="x", padx=10, pady=3)
-        ctk.CTkLabel(obs_frame, text="Observação:", font=("Aileron", 11, "bold"), text_color=("#001D39", "white")).pack(side="left", padx=(10, 5), pady=8)
-        entry_obs_venda = ctk.CTkEntry(obs_frame, placeholder_text="Ex: entregar às 14h, embalar para presente...")
-        entry_obs_venda.pack(side="left", fill="x", expand=True, padx=(2, 10), pady=8)
-
-        def _calcular_troco(*args):
-            try:
-                recebido = float(entry_troco.get().replace(",", "."))
-                _, total_final = calcular_desconto()
-                troco = recebido - total_final
-                if troco >= 0:
-                    lbl_troco.configure(text=f"Troco: R$ {troco:.2f}", text_color="#28a745")
-                else:
-                    lbl_troco.configure(text=f"Falta: R$ {abs(troco):.2f}", text_color="#FF6B6B")
-            except ValueError:
-                lbl_troco.configure(text="")
-
-        entry_troco.bind("<KeyRelease>", _calcular_troco)
-
-        def _has_dinheiro():
-            return any(p["forma_var"].get() == "Dinheiro" for p in pagamentos_list)
-
-        def _update_troco(*args):
-            if _has_dinheiro():
-                troco_frame.pack(fill="x", padx=10, pady=3)
-            else:
-                troco_frame.pack_forget()
-
-        _update_troco()
-
-        def calcular_desconto():
-            """Retorna (valor_desconto, total_com_desconto)"""
-            total_bruto = sum(item['qtd'] * item['preco'] for item in self.carrinho)
-            try:
-                desc_val = float(entry_desconto.get().replace(",", ".")) if entry_desconto.get().strip() else 0.0
-            except ValueError:
-                desc_val = 0.0
-            if tipo_desconto_var.get() == "%":
-                valor_desconto = total_bruto * (desc_val / 100)
-            else:
-                valor_desconto = desc_val
-            valor_desconto = min(valor_desconto, total_bruto)  # Não ultrapassa o total
-            return valor_desconto, total_bruto - valor_desconto
-
-        def atualizar_label_desconto(*args):
-            if not self.carrinho:
-                lbl_total_final.configure(text="")
-                return
-            valor_desc, total_final = calcular_desconto()
-            if valor_desc > 0:
-                lbl_total_final.configure(text=f"Desconto: -R$ {valor_desc:.2f}  |  Total Final: R$ {total_final:.2f}")
-            else:
-                lbl_total_final.configure(text="")
-
-        entry_desconto.bind("<KeyRelease>", atualizar_label_desconto)
-        tipo_desconto_var.trace_add("write", atualizar_label_desconto)
-        
-        def update_cart_ui():
-            # Limpar
-            for item in tree.get_children():
-                tree.delete(item)
-            
-            total = 0.0
-            for item in self.carrinho:
-                subtotal = item['qtd'] * item['preco']
-                total += subtotal
-                tree.insert("", "end", values=(item['qtd'], item['nome'], f"{item['preco']:.2f}", f"{subtotal:.2f}"))
-            
-            lbl_total.configure(text=f"Subtotal: R$ {total:.2f}")
-            atualizar_label_desconto()
-
-        def remover_item():
-            selected = tree.selection()
-            if not selected: return
-            
-            idx = tree.index(selected[0])
-            del self.carrinho[idx]
-            update_cart_ui()
-
-        def alterar_preco_item():
-            selected = tree.selection()
-            if not selected:
-                messagebox.showwarning("Alerta", "Selecione um item no carrinho.", parent=dialog)
-                return
-            idx = tree.index(selected[0])
-            item = self.carrinho[idx]
-
-            preco_dialog = ctk.CTkToplevel(dialog)
-            preco_dialog.title("Alterar Preço")
-            preco_dialog.geometry("350x200")
-            preco_dialog.attributes("-topmost", True)
-            preco_dialog.grab_set()
-            preco_dialog.focus_set()
-
-            ctk.CTkLabel(preco_dialog, text=f"Produto: {item['nome']}", font=("Aileron", 13, "bold")).pack(pady=(15, 5))
-            ctk.CTkLabel(preco_dialog, text=f"Preço atual: R$ {item['preco']:.2f}", font=("Aileron", 11)).pack(pady=(0, 10))
-
-            ctk.CTkLabel(preco_dialog, text="Novo preço (R$):", font=("Aileron", 11)).pack(padx=20, anchor="w")
-            entry_novo_preco = ctk.CTkEntry(preco_dialog, height=35, placeholder_text="0.00")
-            entry_novo_preco.pack(padx=20, fill="x", pady=(2, 10))
-            entry_novo_preco.insert(0, f"{item['preco']:.2f}")
-            entry_novo_preco.select_range(0, "end")
-            entry_novo_preco.focus_set()
-
-            def _aplicar_preco(event=None):
-                try:
-                    novo = float(entry_novo_preco.get().strip().replace(",", "."))
-                    if novo < 0:
-                        messagebox.showerror("Erro", "Preço não pode ser negativo.", parent=preco_dialog)
-                        return
-                except ValueError:
-                    messagebox.showerror("Erro", "Valor inválido.", parent=preco_dialog)
-                    return
-                preco_original = item.get('preco_original', item['preco'])
-                item['preco'] = novo
-                item['desconto_item'] = max(0, preco_original - novo)
-                update_cart_ui()
-                preco_dialog.destroy()
-
-            entry_novo_preco.bind("<Return>", _aplicar_preco)
-            ctk.CTkButton(preco_dialog, text="Aplicar", command=_aplicar_preco, height=36,
-                         fg_color="#0A4174", hover_color="#062F56").pack(pady=10, padx=20, fill="x")
-            
-        ctk.CTkButton(right_frame, text="Remover Item Selecionado", command=remover_item, height=28, fg_color="#FF6B6B", hover_color="#FF5252", text_color="white").pack(pady=3, padx=10, fill="x")
-        ctk.CTkButton(right_frame, text="Alterar Preço do Item", command=alterar_preco_item, height=28, fg_color="#FF9800", hover_color="#E68900", text_color="white").pack(pady=3, padx=10, fill="x")
-        
-        def finalizar_venda():
-            if not self.carrinho:
-                messagebox.showerror("Erro", "Carrinho vazio.", parent=dialog)
-                return
-
-            # Coletar formas de pagamento
-            formas_usadas = []
-            total_pgto_informado = 0.0
-            for p in pagamentos_list:
-                forma = p["forma_var"].get()
-                val_str = p["valor_entry"].get().strip().replace(",", ".")
-                try:
-                    val = float(val_str) if val_str else 0.0
-                except ValueError:
-                    val = 0.0
-                if val > 0 or len(pagamentos_list) == 1:
-                    formas_usadas.append({"forma": forma, "valor": val})
-                    total_pgto_informado += val
-
-            # Se só tem 1 forma e valor vazio, usar total
-            valor_desconto, total_com_desconto = calcular_desconto()
-            if len(formas_usadas) == 1 and formas_usadas[0]["valor"] == 0:
-                formas_usadas[0]["valor"] = total_com_desconto
-
-            # Forma de pagamento principal (para compatibilidade)
-            forma_pgto = " + ".join(f"{f['forma']} R${f['valor']:.2f}" for f in formas_usadas) if len(formas_usadas) > 1 else formas_usadas[0]["forma"]
-
-            # Validar fiado: precisa ter cliente selecionado
-            if any(f["forma"] == "Fiado" for f in formas_usadas) and var_cliente.get() == "Consumidor Final":
-                messagebox.showerror("Erro", "Para venda fiado, selecione um cliente cadastrado.", parent=dialog)
-                return
-
-            obs_venda = entry_obs_venda.get().strip()
-            
-            msg_confirm = f"Finalizar venda?\n\nSubtotal: R$ {sum(i['qtd']*i['preco'] for i in self.carrinho):.2f}"
-            if valor_desconto > 0:
-                msg_confirm += f"\nDesconto: -R$ {valor_desconto:.2f}"
-            msg_confirm += f"\nTotal: R$ {total_com_desconto:.2f}"
-            msg_confirm += f"\nPagamento: {forma_pgto}"
-            if obs_venda:
-                msg_confirm += f"\nObs: {obs_venda}"
-            
-            if _has_dinheiro():
-                try:
-                    recebido = float(entry_troco.get().replace(",", "."))
-                    troco = recebido - total_com_desconto
-                    if troco >= 0:
-                        msg_confirm += f"\nRecebido: R$ {recebido:.2f} | Troco: R$ {troco:.2f}"
-                except ValueError:
-                    pass
-            
-            if not messagebox.askyesno("Confirmar", msg_confirm, parent=dialog):
-                return
-            
-            try:
-                total_geral = 0
-                itens_nota = []
-                
-                # Processar Itens
-                for item in self.carrinho:
-                    if item['type'] == 'produto':
-                        # Baixa normal
-                        prod_row = item['row_data']
-                        nova_qtd = prod_row['quantidade'] - item['qtd']
-                        
-                        self.db.atualizar_produto(
-                            prod_row['id'], prod_row['nome'], nova_qtd, prod_row['preco'], prod_row['categoria'],
-                            prod_row.get('horas_trabalho',0), prod_row.get('valor_hora',0),
-                            margem_lucro=prod_row.get('margem_lucro', 0.20),
-                            fator_risco=prod_row.get('fator_risco', 0.10),
-                            fator_raridade=prod_row.get('fator_raridade', 1.0),
-                            imagem=prod_row.get('imagem'), codigo_barras=prod_row.get('codigo_barras')
-                        )
-                    elif item['type'] == 'kit':
-                        # Baixa via Kit (explode componentes) - registrar_entrada=False para evitar duplicação
-                        success, msg = self.db.vender_kit(item['id'], item['qtd'], registrar_entrada=False)
-                        if not success:
-                            messagebox.showerror("Erro Estoque", msg, parent=dialog)
-                            return
-                            
-                    total_geral += item['qtd'] * item['preco']
-                    itens_nota.append({
-                        'nome': item['nome'], 'qtd': item['qtd'], 'preco': item['preco'],
-                        'preco_original': item.get('preco_original', item['preco']),
-                        'desconto_item': item.get('desconto_item', 0.0)
-                    })
-                
-                # Registrar Financeiro (com desconto)
-                desc_venda = f"Venda PDV - {len(itens_nota)} itens"
-                if valor_desconto > 0:
-                    desc_venda += f" (Desc: R${valor_desconto:.2f})"
-                if obs_venda:
-                    desc_venda += f" | Obs: {obs_venda}"
-                self.db.adicionar_entrada(total_com_desconto, desc_venda)
-                
-                # Registrar Vendas Detalhadas na tabela vendas
-                cliente_nome = var_cliente.get() if 'var_cliente' in dir() else "Consumidor Final"
-                itens_venda = []
-                for item in self.carrinho:
-                    item_venda = {
-                        'id': item.get('id'),
-                        'nome': item['nome'],
-                        'qtd': item['qtd'],
-                        'preco': item['preco'],
-                        'preco_compra': item.get('row_data', {}).get('preco_compra', 0) if item['type'] == 'produto' else 0
-                    }
-                    itens_venda.append(item_venda)
-                self.db.registrar_venda_detalhada(itens_venda, total_com_desconto, valor_desconto, cliente_nome, forma_pgto, vendedor=var_vendedor.get())
-                
-                # Registrar fiado se for o caso
-                if any(f["forma"] == "Fiado" for f in formas_usadas) and cliente_nome != "Consumidor Final":
-                    try:
-                        c_df = df_clientes[df_clientes['nome'] == cliente_nome]
-                        if not c_df.empty:
-                            c_id = int(c_df.iloc[0]['id'])
-                            self.db.registrar_fiado(c_id, total_com_desconto, desc_venda)
-                    except Exception as e:
-                        logger.warning("Erro ao registrar fiado: %s", e)
-                
-                # Gerar Nota
-                try:
-                    cliente_nome = var_cliente.get()
-                    dados_cliente = {"nome": cliente_nome}
-                    contato_cliente = entry_contato_cliente.get().strip()
-                    if cliente_nome != "Consumidor Final":
-                        c_row = df_clientes[df_clientes['nome'] == cliente_nome].iloc[0]
-                        dados_cliente['contato'] = c_row.get('contato', contato_cliente) or contato_cliente
-                    if contato_cliente:
-                        dados_cliente['contato'] = contato_cliente
-
-                    # Carregar configuração personalizada da nota
-                    config_nota = self.db.get_config_nota()
-
-                    file_path, text_content, wpp_content = invoice_generator.gerar_nota_txt(
-                        itens_nota, dados_cliente, total_com_desconto,
-                        desconto=valor_desconto, abrir_arquivo=False, config_nota=config_nota
-                    )
-                    
-                    # Perguntar se deseja imprimir
-                    if file_path and text_content:
-                        resp = messagebox.askyesno("Imprimir Recibo", 
-                            "Venda finalizada com sucesso!\n\nDeseja imprimir o recibo agora?", parent=dialog)
-                        if resp:
-                            try:
-                                printer = get_printer()
-                                # Resolver caminho do logo para impressão
-                                logo_path = None
-                                logo_file = config_nota.get('empresa_logo', '')
-                                if logo_file:
-                                    logo_path = os.path.join(self.db.data_dir, "product_images", logo_file)
-                                    if not os.path.isfile(logo_path):
-                                        logger.warning("Logo não encontrado em: %s", logo_path)
-                                        logo_path = None
-                                printer.print_text(text_content, logo_path=logo_path)
-                                messagebox.showinfo("Sucesso", "Recibo enviado para impressão!", parent=dialog)
-                            except Exception as e:
-                                logger.warning("Erro ao imprimir: %s", e)
-                                messagebox.showwarning("Aviso", 
-                                    f"Não foi possível imprimir diretamente.\nO recibo foi salvo em:\n{file_path}", parent=dialog)
-                                try:
-                                    if os.name == 'nt':
-                                        os.startfile(file_path)
-                                except Exception:
-                                    pass
-                        
-                        # Oferecer envio por WhatsApp se houver contato
-                        if contato_cliente:
-                            enviar_wpp = messagebox.askyesno("Enviar por WhatsApp",
-                                f"Deseja enviar o recibo por WhatsApp para {contato_cliente}?",
-                                parent=dialog)
-                            if enviar_wpp:
-                                try:
-                                    from printer import enviar_whatsapp
-                                    sucesso = enviar_whatsapp(contato_cliente, wpp_content or text_content)
-                                    if sucesso:
-                                        messagebox.showinfo("WhatsApp", 
-                                            "O WhatsApp Web será aberto com o recibo.\n"
-                                            "Clique em 'Enviar' no navegador para finalizar.", parent=dialog)
-                                    else:
-                                        messagebox.showwarning("WhatsApp", 
-                                            "Não foi possível abrir o WhatsApp.\nVerifique o número do contato.", parent=dialog)
-                                except Exception as e:
-                                    logger.warning("Erro WhatsApp: %s", e)
-                                    messagebox.showwarning("WhatsApp", 
-                                        f"Erro ao enviar por WhatsApp: {e}", parent=dialog)
-                        
-                        if not resp and not contato_cliente:
-                            messagebox.showinfo("Sucesso", f"Venda finalizada!\nRecibo salvo em:\n{file_path}", parent=dialog)
-                    else:
-                        messagebox.showinfo("Sucesso", "Venda finalizada!", parent=dialog)
-                except Exception as e:
-                    logger.warning("Erro ao gerar recibo: %s", e)
-                    messagebox.showinfo("Sucesso", "Venda finalizada! (Erro ao gerar recibo)", parent=dialog)
-                
-                self.refresh_dashboard()
-                dialog.destroy()
-                
-            except Exception as e:
-                messagebox.showerror("Erro Fatal", f"Ocorreu um erro ao processar venda: {e}", parent=dialog)
-
-        ctk.CTkButton(right_frame, text="FINALIZAR VENDA", command=finalizar_venda, height=50, fg_color="#28a745", hover_color="#218838", font=("Aileron", 14, "bold")).pack(pady=(8, 10), padx=10, fill="x")
+                if self._pdv_dialog.winfo_exists():
+                    self._pdv_dialog.focus()
+                    return self._pdv_dialog
+            except Exception:
+                self._pdv_dialog = None
+
+        user_id = self.current_user.get("id") if self.current_user else 1
+        if not self.db.caixa_aberto(user_id):
+            messagebox.showwarning(
+                "Caixa Fechado",
+                "Você precisa abrir o caixa antes de registrar vendas."
+            )
+            self.open_caixa_dialog()
+            return None
+
+        from views.pdv_view import PDVDialog
+        return PDVDialog(self, self.db)
 
     # --- Gerenciador de Clientes com Histórico e Fidelidade ---
     def open_clientes_manager(self):
@@ -5571,12 +5096,13 @@ class App(ctk.CTk):
         def carregar_fidelidade():
             for w in fid_frame.winfo_children(): w.destroy()
             try:
-                df_c = self.db.listar_clientes()
+                df_c = self.db.listar_fidelidade_clientes()
                 if df_c.empty:
                     ctk.CTkLabel(fid_frame, text="Nenhum cliente cadastrado.", text_color="gray").pack(pady=20)
                     return
                 for _, r in df_c.iterrows():
-                    pontos, total_ac = self.db.get_pontos_cliente(r['id'])
+                    pontos = int(r.get('pontos', 0) or 0)
+                    total_ac = float(r.get('total_acumulado', 0.0) or 0.0)
                     card = ctk.CTkFrame(fid_frame, fg_color=("white", "#2B2B2B"), corner_radius=10)
                     card.pack(fill="x", pady=3, padx=5)
                     ctk.CTkLabel(card, text=f"{r['nome']}", font=("Aileron", 13, "bold"), text_color=("#001D39", "white")).pack(side="left", padx=15, pady=10)
@@ -5873,76 +5399,475 @@ class App(ctk.CTk):
 
     # --- Importar Produtos via CSV/PDF ---
     def open_importar_csv(self):
-        filepath = filedialog.askopenfilename(
-            title="Selecionar arquivo CSV ou PDF",
-            filetypes=[("CSV Files", "*.csv"), ("PDF Files", "*.pdf"), ("Todos", "*.*")]
-        )
-        if not filepath:
-            return
+        """Abre a interface avançada de importação com validador e modelo de exemplo."""
+        import os
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Importador de Produtos (CSV/PDF)")
+        dialog.geometry("850x650")
+        dialog.attributes("-topmost", True)
+        dialog.lift()
+        dialog.focus_force()
+
+        main_frame = ctk.CTkFrame(dialog, fg_color="transparent")
+        main_frame.pack(padx=20, pady=20, fill="both", expand=True)
+
+        # Divisão em duas colunas (Esquerda: Instruções/Modelo, Direita: Validador/Ações)
+        main_frame.grid_columnconfigure(0, weight=4)  # Coluna esquerda (modelo/dicas)
+        main_frame.grid_columnconfigure(1, weight=5)  # Coluna direita (validação/importação)
+        main_frame.grid_rowconfigure(0, weight=1)
+
+        # --- Coluna Esquerda: Instruções e Modelo ---
+        left_frame = ctk.CTkFrame(main_frame, fg_color=("white", "#2B2B2B"), corner_radius=15)
+        left_frame.grid(row=0, column=0, padx=(0, 10), sticky="nsew")
+        left_frame.grid_columnconfigure(0, weight=1)
+        left_frame.grid_rowconfigure(2, weight=1)
+
+        ctk.CTkLabel(left_frame, text="Instruções & Modelo CSV", font=("Aileron", 16, "bold"), text_color=("#0A4174", "#7BBDE8")).grid(row=0, column=0, padx=15, pady=(15, 5), sticky="w")
         
-        # Preview
-        try:
-            if filepath.lower().endswith('.pdf'):
-                df_preview = self._ler_tabela_pdf(filepath, nrows=5)
-            else:
-                df_preview = pd.read_csv(filepath, nrows=5)
+        instrucoes = (
+            "Para importar produtos em lote:\n"
+            "1. Crie uma tabela com as colunas obrigatórias.\n"
+            "2. Salve no formato CSV ou use a tabela de um PDF.\n"
+            "3. O sistema mapeia colunas sinônimas automaticamente.\n\n"
+            "Campos Obrigatórios:\n"
+            "• nome (ou Item/Produto/Nome)\n"
+            "• quantidade (ou Qtd/Estoque)\n"
+            "• preco (ou Preço/Preço Venda/Valor)\n\n"
+            "Campos Opcionais:\n"
+            "• categoria, subcategoria, tamanho, preco_compra,\n"
+            "  codigo_barras, data_validade, lote_serie, imagem"
+        )
+        ctk.CTkLabel(left_frame, text=instrucoes, font=("Aileron", 11), justify="left", text_color=("#333333", "#CCCCCC")).grid(row=1, column=0, padx=15, pady=5, sticky="w")
+
+        # Modelo CSV Comentado
+        template_text = (
+            "# Exemplo de arquivo de importação do EstokeAoCubo\n"
+            "# As linhas com '#' no início serão ignoradas\n"
+            "nome,quantidade,preco,categoria,preco_compra,codigo_barras\n"
+            "Camiseta Estampada,50,45.00,Vestuário,20.00,7891234567890\n"
+            "Caneca Porcelana,25,29.90,Decoração,12.50,7891234567891\n"
+            "Almofada Conforto,12,39.90,Decoração,15.00,7891234567892\n"
+        )
+        
+        template_box = ctk.CTkTextbox(left_frame, font=("Courier", 10), height=180)
+        template_box.grid(row=2, column=0, padx=15, pady=5, sticky="nsew")
+        template_box.insert("0.0", template_text)
+        template_box.configure(state="disabled")
+
+        def copiar_modelo():
+            self.clipboard_clear()
+            self.clipboard_append(template_text)
+            messagebox.showinfo("Modelo Copiado", "Modelo CSV copiado para a área de transferência!", parent=dialog)
+            dialog.lift()
+
+        ctk.CTkButton(left_frame, text="📋 Copiar Modelo CSV", command=copiar_modelo, height=35, fg_color="#6EA2B3", hover_color="#49769F", text_color="white", font=("Aileron", 12, "bold")).grid(row=3, column=0, padx=15, pady=15, sticky="ew")
+
+        # --- Coluna Direita: Validação e Importação ---
+        right_frame = ctk.CTkFrame(main_frame, fg_color=("white", "#2B2B2B"), corner_radius=15)
+        right_frame.grid(row=0, column=1, padx=(10, 0), sticky="nsew")
+        right_frame.grid_columnconfigure(0, weight=1)
+        right_frame.grid_rowconfigure(2, weight=1)
+
+        ctk.CTkLabel(right_frame, text="Validador de Arquivo", font=("Aileron", 16, "bold"), text_color=("#0A4174", "#7BBDE8")).grid(row=0, column=0, padx=15, pady=(15, 15), sticky="w")
+
+        # Seleção de arquivo
+        file_select_frame = ctk.CTkFrame(right_frame, fg_color="transparent")
+        file_select_frame.grid(row=1, column=0, padx=15, pady=5, sticky="ew")
+        file_select_frame.grid_columnconfigure(0, weight=1)
+
+        selected_file_var = ctk.StringVar(value="Nenhum arquivo selecionado")
+        lbl_selected_file = ctk.CTkLabel(file_select_frame, textvariable=selected_file_var, font=("Aileron", 11, "italic"), text_color="gray", anchor="w")
+        lbl_selected_file.grid(row=0, column=0, padx=(0, 10), sticky="ew")
+
+        # Variáveis de estado da validação
+        state = {
+            "df": None,
+            "validation_data": None,
+            "filepath": None
+        }
+
+        # Status do arquivo (resultado da validação)
+        status_box = ctk.CTkFrame(right_frame, fg_color="transparent")
+        status_box.grid(row=2, column=0, padx=15, pady=10, sticky="nsew")
+        status_box.grid_columnconfigure(0, weight=1)
+        status_box.grid_rowconfigure(1, weight=1)
+
+        lbl_status_title = ctk.CTkLabel(status_box, text="Aguardando arquivo para validação...", font=("Aileron", 12, "bold"), text_color="gray")
+        lbl_status_title.grid(row=0, column=0, pady=(0, 5), sticky="w")
+
+        log_box = ctk.CTkTextbox(status_box, font=("Courier", 10), text_color="#E74C3C")
+        log_box.grid(row=1, column=0, sticky="nsew")
+        log_box.configure(state="disabled")
+
+        action_btn_frame = ctk.CTkFrame(right_frame, fg_color="transparent")
+        action_btn_frame.grid(row=3, column=0, padx=15, pady=15, sticky="ew")
+        action_btn_frame.grid_columnconfigure(0, weight=1)
+
+        btn_importar = ctk.CTkButton(action_btn_frame, text="Confirmar Importação", state="disabled", height=40, fg_color="#28a745", hover_color="#218838", text_color="white", font=("Aileron", 13, "bold"))
+        btn_importar.grid(row=0, column=0, sticky="ew", pady=(0, 5))
+
+        def selecionar_e_validar():
+            dialog.attributes("-topmost", False)
+            filepath = filedialog.askopenfilename(
+                title="Selecionar arquivo CSV ou PDF",
+                filetypes=[("CSV Files", "*.csv"), ("PDF Files", "*.pdf"), ("Todos", "*.*")]
+            )
+            dialog.attributes("-topmost", True)
+            dialog.lift()
             
-            if df_preview is None or df_preview.empty:
-                messagebox.showerror("Erro", "Nenhuma tabela encontrada no arquivo.", parent=self)
+            if not filepath:
+                return
+
+            selected_file_var.set(os.path.basename(filepath))
+            state["filepath"] = filepath
+
+            # Rodar validação
+            success, val_data, df = self.db.preparar_e_validar_importacao(filepath)
+            
+            log_box.configure(state="normal")
+            log_box.delete("0.0", "end")
+            
+            if not success:
+                lbl_status_title.configure(text="❌ Erro ao processar arquivo", text_color="#E74C3C")
+                log_box.insert("end", val_data.get("mensagem", "Erro desconhecido."))
+                log_box.configure(state="disabled")
+                btn_importar.configure(state="disabled", text="Confirmar Importação")
+                state["df"] = None
+                state["validation_data"] = None
                 return
             
-            msg = f"Colunas encontradas:\n{', '.join(df_preview.columns)}\n\nPrimeiras 5 linhas:\n"
-            for _, r in df_preview.iterrows():
-                msg += f"  {r.to_dict()}\n"
-            msg += "\nColunas obrigatórias: nome (ou Item/Produto), quantidade (ou Qtd), preco (ou Preço/Valor)\nOpcionais: categoria, subcategoria, sub_subcategoria, tamanho, preco_compra, codigo_barras, data_validade\n\n✅ O sistema reconhece automaticamente variações de nomes de colunas."
+            state["df"] = df
+            state["validation_data"] = val_data
             
-            if messagebox.askyesno("Confirmar Importação", msg, parent=self):
-                if filepath.lower().endswith('.pdf'):
-                    ok, result = self.db.importar_produtos_pdf(filepath)
-                else:
-                    ok, result = self.db.importar_produtos_csv(filepath)
-                if ok:
-                    messagebox.showinfo("Sucesso", result, parent=self)
-                    self.refresh_dashboard()
-                else:
-                    messagebox.showerror("Erro", result, parent=self)
-        except Exception as e:
-            messagebox.showerror("Erro", f"Erro ao ler arquivo: {e}", parent=self)
+            erros = val_data["erros"]
+            total_linhas = val_data["total_linhas"]
+            total_validos = val_data["total_validos"]
+            mapeamentos = val_data["mapeamentos"]
 
-    def _ler_tabela_pdf(self, filepath, nrows=None):
-        """Extrai a primeira tabela de um PDF usando pdfplumber."""
+            log_msg = ""
+            if mapeamentos:
+                log_msg += "=== MAPEAMENTO DE COLUNAS ===\n"
+                for k, v in mapeamentos.items():
+                    log_msg += f"• Coluna '{k}' mapeada para '{v}'\n"
+                log_msg += "\n"
+
+            if erros:
+                lbl_status_title.configure(text=f"⚠️ Concluído com {len(erros)} inconsistência(s)", text_color="#F39C12")
+                log_msg += f"=== INCONSISTÊNCIAS ENCONTRADAS ({len(erros)}) ===\n"
+                log_msg += "Estes itens serão ignorados ou devem ser corrigidos:\n\n"
+                for err in erros:
+                    log_msg += f"Linha {err['linha']} | Produto: {err['produto']}\n   Erro: {err['erro']}\n\n"
+                
+                log_box.insert("end", log_msg)
+                log_box.configure(state="disabled", text_color=("#E74C3C", "#FF6B6B"))
+                
+                if total_validos > 0:
+                    btn_importar.configure(
+                        state="normal", 
+                        text=f"Importar apenas {total_validos} válidos (desconsiderar erros)",
+                        command=confirmar_importacao
+                    )
+                else:
+                    btn_importar.configure(state="disabled", text="Nenhum item válido para importar")
+            else:
+                lbl_status_title.configure(text="✅ Arquivo 100% válido!", text_color="#28a745")
+                log_msg += f"Tudo certo! Todas as {total_linhas} linhas estão em formato correto.\n"
+                log_msg += "\nPrimeiros 5 registros para importação:\n"
+                for _, r in df.head(5).iterrows():
+                    log_msg += f"• {r.get('nome')} | Preço: R$ {r.get('preco')} | Qtd: {r.get('quantidade')}\n"
+                
+                log_box.insert("end", log_msg)
+                log_box.configure(state="disabled", text_color=("#28a745", "#2ecc71"))
+                btn_importar.configure(
+                    state="normal", 
+                    text=f"Confirmar Importação de {total_linhas} itens", 
+                    command=confirmar_importacao
+                )
+
+        btn_selecionar = ctk.CTkButton(file_select_frame, text="Procurar Arquivo", command=selecionar_e_validar, width=120)
+        btn_selecionar.grid(row=0, column=1, sticky="e")
+
+        def confirmar_importacao():
+            df = state["df"]
+            val_data = state["validation_data"]
+            filepath = state["filepath"]
+            
+            if df is None or val_data is None or not filepath:
+                return
+
+            if self.db.is_trial_mode():
+                linhas_com_erro = val_data["linhas_com_erro"]
+                itens_a_importar = len(df) - len(linhas_com_erro)
+                contagem_atual = self.db.contar_produtos()
+                if contagem_atual + itens_a_importar > 10:
+                    self.show_trial_limit_modal(dialog)
+                    return
+
+            linhas_com_erro = val_data["linhas_com_erro"]
+            ok, msg = self.db.importar_dataframe_produtos(df, linhas_com_erro, filepath)
+            
+            if ok:
+                messagebox.showinfo("Sucesso", msg, parent=dialog)
+                dialog.destroy()
+                self.refresh_dashboard()
+            else:
+                messagebox.showerror("Erro", msg, parent=dialog)
+                dialog.lift()
+
+    def open_importar_imagens_lote(self):
+        """Interface para importar imagens em lote, associando-as aos produtos pelo nome ou código de barras."""
+        import os
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Importador de Imagens em Lote")
+        dialog.geometry("700x600")
+        dialog.attributes("-topmost", True)
+        dialog.lift()
+        dialog.focus_force()
+
+        main_frame = ctk.CTkFrame(dialog, fg_color="transparent")
+        main_frame.pack(padx=20, pady=20, fill="both", expand=True)
+
+        ctk.CTkLabel(main_frame, text="📸 Importar Imagens em Lote", font=("Aileron", 18, "bold"), text_color=("#0A4174", "#7BBDE8")).pack(anchor="w", pady=(0, 10))
+
+        instrucoes = (
+            "Esta ferramenta associa imagens aos produtos automaticamente.\n"
+            "Como nomear os arquivos de imagem na sua pasta:\n"
+            "• Pelo Código de Barras (ex: 7891234567890.jpg)\n"
+            "• Pelo Nome Exato do Produto (ex: Camiseta Azul.png)\n"
+            "• Por Parte do Nome (ex: camiseta.jpg associará à 'Camiseta Estampada')"
+        )
+        ctk.CTkLabel(main_frame, text=instrucoes, font=("Aileron", 11), justify="left", text_color=("#333", "#AAA")).pack(anchor="w", fill="x", pady=5)
+
+        # Seleção de pasta
+        dir_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
+        dir_frame.pack(fill="x", pady=10)
+
+        selected_dir_var = ctk.StringVar(value="Nenhuma pasta selecionada")
+        lbl_dir = ctk.CTkLabel(dir_frame, textvariable=selected_dir_var, font=("Aileron", 11, "italic"), text_color="gray", anchor="w")
+        lbl_dir.pack(side="left", fill="x", expand=True, padx=(0, 10))
+
+        state = {
+            "matches": [],
+            "directory": None
+        }
+
+        # Área de Preview/Log
+        preview_box = ctk.CTkFrame(main_frame, fg_color=("white", "#2B2B2B"), corner_radius=12)
+        preview_box.pack(fill="both", expand=True, pady=10)
+        
+        scroll = ctk.CTkScrollableFrame(preview_box, fg_color="transparent")
+        scroll.pack(fill="both", expand=True, padx=8, pady=8)
+
+        lbl_no_items = ctk.CTkLabel(scroll, text="Selecione uma pasta para escanear imagens", font=("Aileron", 12), text_color="gray")
+        lbl_no_items.pack(pady=40)
+
+        action_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
+        action_frame.pack(fill="x", pady=(10, 0))
+
+        btn_confirmar = ctk.CTkButton(action_frame, text="Confirmar Importação", state="disabled", height=38, fg_color="#28a745", hover_color="#218838", text_color="white", font=("Aileron", 12, "bold"))
+        btn_confirmar.pack(side="right", padx=5)
+
+        def selecionar_pasta():
+            dialog.attributes("-topmost", False)
+            folder = filedialog.askdirectory(title="Selecionar Pasta de Imagens")
+            dialog.attributes("-topmost", True)
+            dialog.lift()
+            
+            if not folder:
+                return
+
+            selected_dir_var.set(folder)
+            state["directory"] = folder
+
+            df_prods = self.db.listar_produtos()
+            if df_prods.empty:
+                messagebox.showerror("Erro", "Não há produtos cadastrados no sistema para associar.", parent=dialog)
+                return
+
+            for w in scroll.winfo_children():
+                w.destroy()
+
+            valid_exts = ('.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp')
+            files = [f for f in os.listdir(folder) if os.path.isfile(os.path.join(folder, f)) and f.lower().endswith(valid_exts)]
+            
+            if not files:
+                ctk.CTkLabel(scroll, text="Nenhuma imagem válida encontrada nesta pasta.", font=("Aileron", 12), text_color="#E74C3C").pack(pady=40)
+                btn_confirmar.configure(state="disabled")
+                return
+
+            state["matches"] = []
+            
+            for filename in files:
+                name_without_ext = os.path.splitext(filename)[0].strip()
+                file_path = os.path.join(folder, filename)
+                
+                matched_row = None
+                
+                match_barcode = df_prods[df_prods['codigo_barras'].astype(str).str.strip() == name_without_ext]
+                if not match_barcode.empty:
+                    matched_row = match_barcode.iloc[0]
+                    match_type = "Código de Barras"
+                else:
+                    match_name = df_prods[df_prods['nome'].astype(str).str.lower().str.strip() == name_without_ext.lower()]
+                    if not match_name.empty:
+                        matched_row = match_name.iloc[0]
+                        match_type = "Nome Exato"
+                    else:
+                        match_sub = df_prods[df_prods['nome'].astype(str).str.lower().str.contains(name_without_ext.lower(), na=False)]
+                        if not match_sub.empty:
+                            matched_row = match_sub.iloc[0]
+                            match_type = "Nome Parcial"
+                
+                if matched_row is not None:
+                    status = "Associar"
+                    prod_name = matched_row["nome"]
+                    prod_id = int(matched_row["id"])
+                    has_current = bool(matched_row.get("imagem"))
+                    if has_current:
+                        status = "Substituir Imagem"
+                else:
+                    status = "Não Correspondido"
+                    prod_name = "Nenhum"
+                    prod_id = None
+                    match_type = ""
+
+                state["matches"].append({
+                    "file_path": file_path,
+                    "file_name": filename,
+                    "product_id": prod_id,
+                    "product_name": prod_name,
+                    "status": status,
+                    "match_type": match_type
+                })
+
+            total_matched = 0
+            for idx, match in enumerate(state["matches"]):
+                item_f = ctk.CTkFrame(scroll, fg_color=("#F5F5F5", "#3A3A3A"), corner_radius=8)
+                item_f.pack(fill="x", pady=2, padx=2)
+                
+                ctk.CTkLabel(item_f, text=match["file_name"], font=("Courier", 10), text_color=("#333", "#CCC")).pack(side="left", padx=10)
+                
+                if match["product_id"]:
+                    total_matched += 1
+                    status_text = f"→ {match['product_name']} ({match['match_type']})"
+                    status_color = "#28a745" if "Substituir" not in match["status"] else "#F39C12"
+                    
+                    if "Substituir" in match["status"]:
+                        status_text += " [Substituir]"
+                else:
+                    status_text = "→ (Sem correspondência)"
+                    status_color = "gray"
+                    
+                ctk.CTkLabel(item_f, text=status_text, font=("Aileron", 11, "bold"), text_color=status_color).pack(side="left", padx=10)
+            
+            if total_matched > 0:
+                btn_confirmar.configure(state="normal", text=f"Associar {total_matched} Imagens", command=confirmar_importacao_imagens)
+            else:
+                btn_confirmar.configure(state="disabled", text="Nenhuma imagem correspondida")
+
+        btn_procurar = ctk.CTkButton(dir_frame, text="Escolher Pasta", command=selecionar_pasta, width=120)
+        btn_procurar.pack(side="right")
+
+        def confirmar_importacao_imagens():
+            matches = state["matches"]
+            if not matches:
+                return
+                
+            cursor = self.db.conn.cursor()
+            cursor.execute("BEGIN TRANSACTION")
+            count = 0
+            try:
+                for match in matches:
+                    if not match["product_id"]:
+                        continue
+                    
+                    img_name = self.db.importar_imagem_avulsa(match["file_path"], match["product_name"])
+                    if img_name:
+                        cursor.execute("UPDATE produtos SET imagem = ? WHERE id = ?", (img_name, match["product_id"]))
+                        count += 1
+                
+                self.db.conn.commit()
+            except Exception as e:
+                self.db.conn.rollback()
+                messagebox.showerror("Erro", f"Erro ao importar imagens: {e}", parent=dialog)
+                return
+                
+            self.db.registrar_alteracao("Importar Imagens Lote", f"{count} imagens associadas aos produtos")
+            messagebox.showinfo("Sucesso", f"{count} imagens associadas aos produtos com sucesso!", parent=dialog)
+            dialog.destroy()
+            self.refresh_dashboard()
+
+    def show_product_qrcode_dialog(self, product_row):
+        """Exibe uma janela com o QR Code do produto contendo seus dados em formato JSON."""
+        import json
+        from PIL import Image
+        
         try:
-            import pdfplumber
-            all_rows = []
-            with pdfplumber.open(filepath) as pdf:
-                for page in pdf.pages:
-                    tables = page.extract_tables()
-                    for table in tables:
-                        if not table:
-                            continue
-                        if not all_rows:
-                            # Primeira tabela: usar primeira linha como cabeçalho
-                            header = [str(c).strip().lower() if c else f'col_{i}' for i, c in enumerate(table[0])]
-                            all_rows = []
-                            data_rows = table[1:]
-                        else:
-                            data_rows = table
-                        for row in data_rows:
-                            all_rows.append(row)
-            if not all_rows:
-                return None
-            df = pd.DataFrame(all_rows, columns=header)
-            # Limpar espaços dos nomes de colunas
-            df.columns = [c.strip() for c in df.columns]
-            if nrows:
-                df = df.head(nrows)
-            return df
+            import qrcode
         except ImportError:
-            messagebox.showerror("Erro", "Biblioteca 'pdfplumber' não instalada.\nInstale com: pip install pdfplumber", parent=self)
-            return None
-        except Exception as e:
-            logger.error("Erro ao ler PDF: %s", e)
-            return None
+            messagebox.showerror("Erro", "A biblioteca 'qrcode' não está instalada.", parent=self)
+            return
+
+        dialog = ctk.CTkToplevel(self)
+        dialog.title(f"QR Code - {product_row['nome']}")
+        dialog.geometry("400x500")
+        dialog.attributes("-topmost", True)
+        dialog.lift()
+        dialog.focus_force()
+
+        main_frame = ctk.CTkFrame(dialog, fg_color="transparent")
+        main_frame.pack(padx=20, pady=20, fill="both", expand=True)
+
+        ctk.CTkLabel(main_frame, text=product_row['nome'], font=("Aileron", 16, "bold"), text_color=("#0A4174", "#7BBDE8")).pack(pady=(0, 5))
+        ctk.CTkLabel(main_frame, text=f"Preço: R$ {product_row['preco']:.2f}", font=("Aileron", 13), text_color="gray").pack(pady=(0, 15))
+
+        # Montar payload JSON
+        payload = {
+            "nome": product_row["nome"],
+            "preco": float(product_row["preco"]),
+            "codigo_barras": product_row.get("codigo_barras") or ""
+        }
+        qr_data = json.dumps(payload, ensure_ascii=False)
+
+        # Gerar o QR Code
+        qr = qrcode.QRCode(
+            version=1,
+            error_correction=qrcode.constants.ERROR_CORRECT_L,
+            box_size=8,
+            border=2
+        )
+        qr.add_data(qr_data)
+        qr.make(fit=True)
+
+        qr_img = qr.make_image(fill_color="black", back_color="white")
+        
+        # Converter para formato compatível com CTk
+        qr_img_resized = qr_img.resize((250, 250), Image.Resampling.NEAREST)
+        
+        from customtkinter import CTkImage
+        ctk_qr = CTkImage(light_image=qr_img_resized, dark_image=qr_img_resized, size=(250, 250))
+        
+        lbl_qr = ctk.CTkLabel(main_frame, image=ctk_qr, text="")
+        lbl_qr.pack(pady=10)
+
+        # Botão para salvar
+        def salvar_imagem():
+            dialog.attributes("-topmost", False)
+            dest_file = filedialog.asksaveasfilename(
+                defaultextension=".png",
+                filetypes=[("Imagens PNG", "*.png")],
+                initialfile=f"qrcode_{product_row['nome']}.png",
+                parent=dialog
+            )
+            dialog.attributes("-topmost", True)
+            dialog.lift()
+            
+            if dest_file:
+                qr_img.save(dest_file)
+                messagebox.showinfo("Sucesso", "QR Code salvo com sucesso!", parent=dialog)
+
+        ctk.CTkButton(main_frame, text="💾 Salvar QR Code", command=salvar_imagem, height=35, fg_color="#6EA2B3", hover_color="#49769F", text_color="white", font=("Aileron", 11, "bold")).pack(fill="x", pady=15)
+
 
     def open_report_dialog(self):
         window = ctk.CTkToplevel(self)
@@ -5999,6 +5924,73 @@ class App(ctk.CTk):
 
         ctk.CTkLabel(dash_frame, text=f"Visão Geral - {datetime.date.today().strftime('%d/%m/%Y')}", 
                     font=("Aileron", 20, "bold"), text_color=("#001D39", "white")).pack(pady=10, anchor="w")
+
+        # Pacote Mensal do Contador (ZIP) — processamento em thread com feedback
+        pacote_frame = ctk.CTkFrame(dash_frame, fg_color=("white", "#2B2B2B"), corner_radius=12)
+        pacote_frame.pack(fill="x", pady=(0, 10))
+        ctk.CTkLabel(
+            pacote_frame,
+            text="📦 Pacote Mensal do Contador (CSVs + DRE + XMLs NF-e):",
+            font=("Aileron", 12, "bold"),
+            text_color=("#001D39", "white"),
+        ).pack(side="left", padx=12, pady=10)
+
+        entry_comp_zip = ctk.CTkEntry(pacote_frame, width=95, placeholder_text="AAAA-MM")
+        entry_comp_zip.insert(0, datetime.date.today().strftime("%Y-%m"))
+        entry_comp_zip.pack(side="left", padx=6)
+
+        lbl_zip_status = ctk.CTkLabel(pacote_frame, text="", font=("Aileron", 11), text_color="#0A4174")
+
+        def _exportar_pacote_zip():
+            comp = entry_comp_zip.get().strip() or datetime.date.today().strftime("%Y-%m")
+            dest = filedialog.asksaveasfilename(
+                parent=window,
+                title="Salvar Pacote do Contador (ZIP)",
+                defaultextension=".zip",
+                initialfile=f"pacote_contador_{comp.replace('/', '-')}.zip",
+                filetypes=[("Arquivo ZIP", "*.zip")],
+            )
+            if not dest:
+                return
+            btn_pacote_zip.configure(state="disabled", text="⏳ Gerando ZIP...")
+            lbl_zip_status.configure(text="Exportando em segundo plano...")
+
+            def _worker():
+                ok_z, res_z = self.db.exportar_pacote_contador(mes_ano=comp, destino_zip_path=dest)
+                def _done():
+                    if not window.winfo_exists():
+                        return
+                    btn_pacote_zip.configure(state="normal", text="⬇️ Gerar ZIP do Contador")
+                    if ok_z:
+                        lbl_zip_status.configure(text=f"Salvo ({res_z['qtd_vendas']} vendas, {res_z['qtd_xmls']} XMLs)")
+                        messagebox.showinfo(
+                            "Pacote do Contador Gerado",
+                            f"Arquivo ZIP gerado com sucesso:\n{res_z['zip_path']}\n\n"
+                            f"• Competência: {res_z['mes_ano']}\n"
+                            f"• Vendas incluídas: {res_z['qtd_vendas']}\n"
+                            f"• Entradas: {res_z['qtd_entradas']} | Gastos: {res_z['qtd_gastos']}\n"
+                            f"• XMLs NF-e anexados: {res_z['qtd_xmls']}",
+                            parent=window,
+                        )
+                    else:
+                        lbl_zip_status.configure(text="Erro ao gerar")
+                        messagebox.showerror("Erro", str(res_z), parent=window)
+                window.after(0, _done)
+
+            threading.Thread(target=_worker, daemon=True).start()
+
+        btn_pacote_zip = ctk.CTkButton(
+            pacote_frame,
+            text="⬇️ Gerar ZIP do Contador",
+            command=_exportar_pacote_zip,
+            height=34,
+            fg_color="#0A4174",
+            hover_color="#062F56",
+            text_color="white",
+            font=("Aileron", 12, "bold"),
+        )
+        btn_pacote_zip.pack(side="right", padx=12, pady=8)
+        lbl_zip_status.pack(side="right", padx=8)
 
         # KPI Cards Row
         kpi_row = ctk.CTkFrame(dash_frame, fg_color="transparent")
@@ -6131,17 +6123,36 @@ class App(ctk.CTk):
 
         ctk.CTkButton(vf_frame, text="Filtrar", command=carregar_vendas, width=80, fg_color="#7BBDE8", text_color="#001D39").pack(side="left", padx=10)
 
-        # Botão cancelar venda
+        # Botão cancelar venda (exige supervisor + motivo obrigatório + estorno atômico)
         def cancelar_venda_selecionada():
             sel = tree_vendas.selection()
             if not sel:
                 messagebox.showwarning("Aviso", "Selecione uma venda para cancelar.", parent=window)
                 return
-            venda_id = tree_vendas.item(sel[0])['values'][0]
-            if messagebox.askyesno("Confirmar", f"Cancelar venda #{venda_id}?\nO estoque será devolvido.", parent=window):
-                ok, msg = self.db.cancelar_venda(venda_id)
-                messagebox.showinfo("Resultado", msg, parent=window)
-                carregar_vendas()
+            vals = tree_vendas.item(sel[0])['values']
+            venda_id = vals[0]
+            if str(vals[8]).lower() == "cancelada":
+                messagebox.showinfo("Aviso", "Esta venda já está cancelada.", parent=window)
+                return
+            ok_sup, sup_info = self._exigir_supervisor(
+                f"Cancelar e estornar venda #{venda_id}",
+                parent=window,
+                exigir_motivo=True,
+                exigir_senha_sempre=True,
+            )
+            if not ok_sup:
+                return
+            ok, msg = self.db.cancelar_venda(
+                venda_id,
+                motivo=sup_info.get("motivo", ""),
+                usuario_id=sup_info.get("supervisor_id"),
+            )
+            if ok:
+                messagebox.showinfo("Sucesso", msg, parent=window)
+                self.refresh_dashboard()
+            else:
+                messagebox.showerror("Erro ao Cancelar", msg, parent=window)
+            carregar_vendas()
 
         ctk.CTkButton(vf_frame, text="Cancelar Venda", command=cancelar_venda_selecionada, width=120, fg_color="#FF6B6B", hover_color="#FF5252", text_color="white").pack(side="right", padx=10)
 
@@ -6358,7 +6369,75 @@ class App(ctk.CTk):
                 messagebox.showinfo("Sucesso", "Conta quitada!", parent=window)
                 carregar_fiados()
 
-        ctk.CTkButton(ff_frame, text="Quitar Selecionado", command=quitar_selecionado, width=140, fg_color="#28a745", hover_color="#218838").pack(side="right", padx=10)
+        def cobrar_fiado_whatsapp():
+            sel = tree_fiado.selection()
+            if not sel:
+                messagebox.showwarning("Aviso", "Selecione uma conta na lista para cobrar via WhatsApp.", parent=window)
+                return
+            vals = tree_fiado.item(sel[0])['values']
+            conta_id, cli_nome, val_str, dt_venda, dt_venc, st_conta = vals[0], vals[1], str(vals[2]), vals[3], vals[4], vals[5]
+            if st_conta == "Pago":
+                messagebox.showinfo("Já Quitada", "Esta conta já consta como paga.", parent=window)
+                return
+            try:
+                valor_num = float(val_str.replace("R$", "").replace(",", ".").strip())
+            except ValueError:
+                valor_num = 0.0
+
+            # Buscar telefone do cliente
+            contato = ""
+            try:
+                df_cli = self.db.listar_clientes()
+                m_cli = df_cli[df_cli['nome'] == cli_nome]
+                if not m_cli.empty:
+                    contato = str(m_cli.iloc[0].get('contato', '') or '').strip()
+            except Exception:
+                pass
+
+            if not contato:
+                from tkinter import simpledialog
+                contato = simpledialog.askstring(
+                    "Telefone do Cliente",
+                    f"Cliente '{cli_nome}' não possui telefone cadastrado.\nDigite o WhatsApp com DDD (ex: 11999999999):",
+                    parent=window
+                ) or ""
+                if not contato.strip():
+                    return
+
+            config_nota = self.db.get_config_nota()
+            nome_emp = config_nota.get("empresa_nome") or "Nossa Loja"
+            chave_pix = (config_nota.get("chave_pix") or "").strip()
+
+            msg_cobranca = (
+                f"Olá, *{cli_nome}*! Tudo bem? 😊\n\n"
+                f"Passando para lembrar do lançamento em aberto na *{nome_emp}*:\n"
+                f"• *Referência:* Conta #{conta_id} (Data: {dt_venda})\n"
+                f"• *Vencimento:* {dt_venc}\n"
+                f"• *Valor:* R$ {valor_num:.2f}\n"
+            )
+            if chave_pix:
+                try:
+                    from printer import gerar_payload_pix
+                    payload_pix = gerar_payload_pix(chave_pix, nome_emp, "BRASIL", valor=valor_num)
+                    msg_cobranca += (
+                        f"\n💠 *Chave PIX:* {chave_pix}\n"
+                        f"📋 *PIX Copia e Cola:*\n{payload_pix}\n"
+                    )
+                except Exception:
+                    msg_cobranca += f"\n💠 *Chave PIX:* {chave_pix}\n"
+
+            msg_cobranca += "\nQualquer dúvida ou se já tiver realizado o pagamento, é só nos responder por aqui. Muito obrigado!"
+
+            ok_q, info_q = self._enviar_whatsapp_resiliente(
+                contato, msg_cobranca, metadata={"origem": "cobranca_fiado"}
+            )
+            if ok_q:
+                messagebox.showinfo("WhatsApp (Outbox)", f"Cobrança para {cli_nome} ({contato}) adicionada à fila Outbox.", parent=window)
+            else:
+                messagebox.showwarning("Erro WhatsApp", f"Não foi possível enfileirar: {info_q}", parent=window)
+
+        ctk.CTkButton(ff_frame, text="Quitar Selecionado", command=quitar_selecionado, width=140, fg_color="#28a745", hover_color="#218838").pack(side="right", padx=(5, 10))
+        ctk.CTkButton(ff_frame, text="💬 Cobrar via WhatsApp", command=cobrar_fiado_whatsapp, width=165, fg_color="#00897B", hover_color="#00695C", text_color="white").pack(side="right", padx=5)
 
         carregar_fiados()
 
@@ -7078,6 +7157,10 @@ class App(ctk.CTk):
 
         btn_frame = ctk.CTkFrame(window, fg_color="transparent")
         btn_frame.pack(fill="x", padx=15, pady=10)
+        ctk.CTkButton(btn_frame, text="📈 Sugestão Compra (30/60/90d)",
+                      command=lambda: self.open_sugestao_compras_dialog(parent=window),
+                      height=40, fg_color="#0A4174", hover_color="#062F56", text_color="white",
+                      font=("Aileron", 12, "bold")).pack(side="left", fill="x", expand=True, padx=5)
         ctk.CTkButton(btn_frame, text="📋 Copiar para WhatsApp", command=_exportar_whatsapp,
                       height=40, fg_color="#25D366", hover_color="#1DA851", text_color="white",
                       font=("Aileron", 12, "bold")).pack(side="left", fill="x", expand=True, padx=5)
@@ -7088,10 +7171,10 @@ class App(ctk.CTk):
     # ==================== ABERTURA / FECHAMENTO DE CAIXA ====================
 
     def open_caixa_dialog(self):
-        """Dialog para abertura e fechamento de caixa com histórico."""
+        """Dialog para abertura e fechamento de caixa com histórico e sangrias."""
         dialog = ctk.CTkToplevel(self)
         dialog.title("Controle de Caixa")
-        dialog.geometry("750x550")
+        dialog.geometry("750x580")
         dialog.transient(self)
         dialog.grab_set()
 
@@ -7099,11 +7182,17 @@ class App(ctk.CTk):
         tabview.pack(padx=10, pady=10, fill="both", expand=True)
 
         tab_caixa = tabview.add("Caixa")
+        tab_sangrias = tabview.add("Sangrias / Suprimentos")
         tab_historico = tabview.add("Histórico")
 
+        # --- CONTEXTO OPERADOR ---
+        user_id = self.current_user.get("id") if self.current_user else 1
+        loja_id = self.current_user.get("loja_id") if self.current_user else 1
+        nome_operador = self.current_user.get("nome") if self.current_user else "Operador"
+
         # --- TAB CAIXA ---
-        caixa_aberto = self.db.caixa_aberto()
-        resumo_caixa = self.db.resumo_caixa_atual() if caixa_aberto else None
+        caixa_aberto = self.db.caixa_aberto(user_id)
+        resumo_caixa = self.db.resumo_caixa_atual(usuario_id=user_id) if caixa_aberto else None
 
         status_frame = ctk.CTkFrame(tab_caixa, fg_color=("white", "#2B2B2B"), corner_radius=15)
         status_frame.pack(fill="x", padx=10, pady=10)
@@ -7111,24 +7200,36 @@ class App(ctk.CTk):
         if caixa_aberto:
             ctk.CTkLabel(status_frame, text="CAIXA ABERTO", font=("Aileron", 18, "bold"),
                         text_color="#28a745").pack(pady=(15, 5))
-            ctk.CTkLabel(status_frame, text=f"Aberto em: {caixa_aberto['data_abertura'][:16].replace('T', ' ')}",
+            ctk.CTkLabel(status_frame, text=f"Operador: {nome_operador}  |  Aberto em: {caixa_aberto['data_abertura'][:16].replace('T', ' ')}",
                         font=("Aileron", 12), text_color=("#555", "#CCC")).pack()
             ctk.CTkLabel(status_frame, text=f"Valor inicial: R$ {caixa_aberto['valor_abertura']:.2f}",
                         font=("Aileron", 14, "bold"), text_color=("#001D39", "white")).pack(pady=(5, 15))
 
-            # Fechar caixa
+            # Fechar caixa (Conferência Cega - não exibe esperados antes da conferência)
             fechar_frame = ctk.CTkFrame(tab_caixa, fg_color=("white", "#2B2B2B"), corner_radius=15)
             fechar_frame.pack(fill="x", padx=10, pady=10)
-            ctk.CTkLabel(fechar_frame, text="Fechar Caixa", font=("Aileron", 14, "bold"),
-                        text_color=("#001D39", "white")).pack(pady=(15, 5), padx=15, anchor="w")
-            ctk.CTkLabel(fechar_frame, text="Valor em caixa (contagem):", font=("Aileron", 11),
-                        text_color=("#001D39", "white")).pack(padx=15, anchor="w")
-            entry_fechamento = ctk.CTkEntry(fechar_frame, placeholder_text="R$ 0,00", width=200)
-            entry_fechamento.pack(padx=15, pady=5, anchor="w")
-            entry_fechamento.insert(0, f"{resumo_caixa['esperado_dinheiro']:.2f}" if resumo_caixa else "0.00")
-            ctk.CTkLabel(fechar_frame,
-                        text=f"Valor sugerido em caixa: R$ {resumo_caixa['esperado_dinheiro']:.2f}" if resumo_caixa else "Valor sugerido em caixa: R$ 0,00",
-                        font=("Aileron", 11), text_color=("#555", "#CCC")).pack(padx=15, anchor="w")
+            ctk.CTkLabel(fechar_frame, text="Fechar Caixa (Conferência Cega)", font=("Aileron", 14, "bold"),
+                        text_color=("#001D39", "white")).pack(pady=(12, 4), padx=15, anchor="w")
+            ctk.CTkLabel(fechar_frame, text="Informe os valores apurados fisicamente antes de visualizar os saldos do sistema.",
+                        font=("Aileron", 10, "italic"), text_color=("#555", "#CCC")).pack(padx=15, pady=(0, 8), anchor="w")
+
+            conf_grid = ctk.CTkFrame(fechar_frame, fg_color="transparent")
+            conf_grid.pack(fill="x", padx=15, pady=2)
+            for col_i in range(3):
+                conf_grid.grid_columnconfigure(col_i, weight=1)
+
+            ctk.CTkLabel(conf_grid, text="Dinheiro contado (R$):", font=("Aileron", 11, "bold")).grid(row=0, column=0, sticky="w", padx=(0, 6))
+            entry_fechamento = ctk.CTkEntry(conf_grid, placeholder_text="0,00")
+            entry_fechamento.grid(row=1, column=0, sticky="ew", padx=(0, 6), pady=(2, 6))
+
+            ctk.CTkLabel(conf_grid, text="PIX conferido (R$):", font=("Aileron", 11, "bold")).grid(row=0, column=1, sticky="w", padx=3)
+            entry_conf_pix = ctk.CTkEntry(conf_grid, placeholder_text="0,00")
+            entry_conf_pix.grid(row=1, column=1, sticky="ew", padx=3, pady=(2, 6))
+
+            ctk.CTkLabel(conf_grid, text="Cartão conferido (R$):", font=("Aileron", 11, "bold")).grid(row=0, column=2, sticky="w", padx=(6, 0))
+            entry_conf_cartao = ctk.CTkEntry(conf_grid, placeholder_text="0,00")
+            entry_conf_cartao.grid(row=1, column=2, sticky="ew", padx=(6, 0), pady=(2, 6))
+
             ctk.CTkLabel(fechar_frame, text="Observação:", font=("Aileron", 11),
                         text_color=("#001D39", "white")).pack(padx=15, anchor="w")
             entry_obs_fecha = ctk.CTkEntry(fechar_frame, placeholder_text="Opcional", width=400)
@@ -7136,28 +7237,95 @@ class App(ctk.CTk):
 
             def _fechar_caixa():
                 try:
-                    valor = float(entry_fechamento.get().replace(",", "."))
+                    valor = float(entry_fechamento.get().strip().replace(",", "."))
                 except ValueError:
-                    messagebox.showerror("Erro", "Informe o valor em caixa.", parent=dialog)
+                    messagebox.showerror("Erro", "Informe o valor contado em dinheiro.", parent=dialog)
                     return
+
+                pix_str = entry_conf_pix.get().strip().replace(",", ".")
+                cartao_str = entry_conf_cartao.get().strip().replace(",", ".")
+                try:
+                    val_pix = float(pix_str) if pix_str else 0.0
+                    val_cartao = float(cartao_str) if cartao_str else 0.0
+                except ValueError:
+                    messagebox.showerror("Erro", "Valores de PIX ou Cartão inválidos.", parent=dialog)
+                    return
+
                 obs = entry_obs_fecha.get().strip()
-                ok, resultado = self.db.fechar_caixa(valor, obs)
+                ok, resultado = self.db.fechar_caixa(
+                    valor,
+                    obs,
+                    usuario_id=user_id,
+                    conferido_pix=val_pix,
+                    conferido_cartao=val_cartao,
+                )
                 if ok:
                     resumo = (
-                        f"Caixa fechado!\n\n"
+                        f"Caixa fechado com sucesso!\n\n"
                         f"Vendas no período: R$ {resultado['total_vendas']:.2f}\n"
-                        f"  Dinheiro: R$ {resultado['total_dinheiro']:.2f}\n"
-                        f"  PIX: R$ {resultado['total_pix']:.2f}\n"
-                        f"  Cartão: R$ {resultado['total_cartao']:.2f}\n\n"
-                        f"Abertura: R$ {resultado['valor_abertura']:.2f}\n"
-                        f"Esperado em caixa: R$ {resultado['esperado']:.2f}\n"
-                        f"Informado: R$ {resultado['informado']:.2f}\n"
-                        f"Diferença: R$ {resultado['diferenca']:.2f}"
+                        f"Abertura: R$ {resultado['valor_abertura']:.2f} | Suprimentos: R$ {resultado.get('total_suprimentos', 0.0):.2f} | Sangrias: R$ {resultado['total_sangrias']:.2f}\n\n"
+                        f"• Dinheiro — Esperado: R$ {resultado['esperado']:.2f} | Informado: R$ {resultado['informado']:.2f} | Dif.: R$ {resultado['diferenca']:.2f}\n"
+                        f"• PIX      — Esperado: R$ {resultado['total_pix']:.2f} | Informado: R$ {resultado.get('conferido_pix', 0.0):.2f} | Dif.: R$ {resultado.get('diferenca_pix', 0.0):.2f}\n"
+                        f"• Cartão   — Esperado: R$ {resultado['total_cartao']:.2f} | Informado: R$ {resultado.get('conferido_cartao', 0.0):.2f} | Dif.: R$ {resultado.get('diferenca_cartao', 0.0):.2f}"
                     )
-                    messagebox.showinfo("Caixa Fechado", resumo, parent=dialog)
+                    messagebox.showinfo("Caixa Fechado — Resultado da Conferência", resumo, parent=dialog)
+                    
+                    # Propor a exportação em PDF do Relatório
+                    if messagebox.askyesno("Exportar PDF", "Deseja salvar o relatório de fechamento em PDF?", parent=dialog):
+                        try:
+                            filepath = filedialog.asksaveasfilename(
+                                parent=dialog,
+                                title="Salvar Relatório de Fechamento",
+                                defaultextension=".pdf",
+                                filetypes=[("Arquivos PDF", "*.pdf")],
+                                initialfile=f"fechamento_caixa_{resultado['id']}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+                            )
+                            if filepath:
+                                from services.relatorio_caixa import gerar_pdf_fechamento
+                                resultado['usuario_id'] = user_id
+                                resultado['loja_id'] = loja_id
+                                # buscar fiado para o pdf
+                                cursor_temp = self.db.conn.cursor()
+                                cursor_temp.execute(
+                                    "SELECT COALESCE(SUM(valor_fiado), 0) FROM vendas WHERE caixa_id = ? AND status = 'Concluída'",
+                                    (resultado['id'],)
+                                )
+                                resultado['total_fiado'] = cursor_temp.fetchone()[0]
+                                gerar_pdf_fechamento(resultado, filepath)
+                                messagebox.showinfo("Sucesso", f"Relatório salvo com sucesso em:\n{filepath}", parent=dialog)
+                                # Abrir PDF automaticamente no Windows
+                                try:
+                                    if os.name == 'nt':
+                                        os.startfile(filepath)
+                                except Exception:
+                                    pass
+                        except Exception as pdf_err:
+                            messagebox.showerror("Erro PDF", f"Erro ao gerar relatório PDF: {pdf_err}", parent=dialog)
+
+                    # Oferecer envio do resumo de fechamento de caixa via WhatsApp ao gestor
+                    if messagebox.askyesno("Enviar Resumo via WhatsApp", "Deseja enviar o resumo do fechamento de caixa por WhatsApp?", parent=dialog):
+                        try:
+                            config_nota = self.db.get_config_nota()
+                            tel_gestor = (config_nota.get("empresa_telefone") or "").strip()
+                            if not tel_gestor:
+                                from tkinter import simpledialog
+                                tel_gestor = simpledialog.askstring(
+                                    "WhatsApp do Gestor",
+                                    "Informe o número de WhatsApp com DDD (ex: 11999999999):",
+                                    parent=dialog
+                                ) or ""
+                            if tel_gestor.strip():
+                                msg_wpp = f"📊 *FECHAMENTO DE CAIXA #{resultado['id']}*\n" + resumo
+                                self._enviar_whatsapp_resiliente(
+                                    tel_gestor,
+                                    msg_wpp,
+                                    metadata={"origem": "fechamento_caixa", "caixa_id": resultado.get("id")},
+                                )
+                        except Exception as wpp_err:
+                            logger.warning("Erro ao enviar resumo de caixa via WhatsApp: %s", wpp_err)
+                    
                     dialog.grab_release()
                     dialog.destroy()
-                    # Pequeno delay para garantir que o diálogo anterior foi destruído
                     self.after(200, self.open_caixa_dialog)
                 else:
                     messagebox.showerror("Erro", resultado, parent=dialog)
@@ -7168,7 +7336,7 @@ class App(ctk.CTk):
         else:
             ctk.CTkLabel(status_frame, text="CAIXA FECHADO", font=("Aileron", 18, "bold"),
                         text_color="#FF6B6B").pack(pady=(15, 5))
-            ctk.CTkLabel(status_frame, text="Abra o caixa para iniciar as operações do dia.",
+            ctk.CTkLabel(status_frame, text=f"Operador: {nome_operador}  |  Abra o caixa para iniciar as operações.",
                         font=("Aileron", 12), text_color=("#555", "#CCC")).pack(pady=(0, 15))
 
             abrir_frame = ctk.CTkFrame(tab_caixa, fg_color=("white", "#2B2B2B"), corner_radius=15)
@@ -7190,12 +7358,11 @@ class App(ctk.CTk):
                 except ValueError:
                     valor = 0.0
                 obs = entry_obs_abre.get().strip()
-                ok, msg = self.db.abrir_caixa(valor, obs)
+                ok, msg = self.db.abrir_caixa(valor, obs, usuario_id=user_id, loja_id=loja_id)
                 if ok:
                     messagebox.showinfo("Sucesso", msg, parent=dialog)
                     dialog.grab_release()
                     dialog.destroy()
-                    # Pequeno delay para garantir que o diálogo anterior foi destruído
                     self.after(200, self.open_caixa_dialog)
                 else:
                     messagebox.showerror("Erro", msg, parent=dialog)
@@ -7203,6 +7370,129 @@ class App(ctk.CTk):
             ctk.CTkButton(abrir_frame, text="ABRIR CAIXA", command=_abrir_caixa, height=40,
                          fg_color="#28a745", hover_color="#218838", text_color="white",
                          font=("Aileron", 13, "bold")).pack(padx=15, pady=15, fill="x")
+
+        # --- TAB SANGRIAS / SUPRIMENTOS ---
+        if not caixa_aberto:
+            ctk.CTkLabel(tab_sangrias, text="Abra o caixa para gerenciar sangrias e suprimentos.",
+                         font=("Aileron", 14), text_color=("#555", "#CCC")).pack(pady=50)
+        else:
+            sangria_main_frame = ctk.CTkFrame(tab_sangrias, fg_color="transparent")
+            sangria_main_frame.pack(fill="both", expand=True)
+
+            left_sangria = ctk.CTkFrame(sangria_main_frame, fg_color=("white", "#2B2B2B"), corner_radius=15)
+            left_sangria.pack(side="left", fill="both", expand=True, padx=5, pady=5)
+
+            right_sangria = ctk.CTkFrame(sangria_main_frame, fg_color=("white", "#2B2B2B"), corner_radius=15)
+            right_sangria.pack(side="right", fill="both", expand=True, padx=5, pady=5)
+
+            # Left: Registrar Sangria ou Suprimento
+            ctk.CTkLabel(left_sangria, text="Movimentação de Gaveta", font=("Aileron", 14, "bold"),
+                         text_color=("#001D39", "white")).pack(pady=8, padx=15, anchor="w")
+
+            ctk.CTkLabel(left_sangria, text="Tipo de Operação:", font=("Aileron", 11),
+                         text_color=("#001D39", "white")).pack(padx=15, anchor="w")
+            combo_tipo_mov = ctk.CTkComboBox(left_sangria, values=["Sangria (Retirada)", "Suprimento (Reforço de Troco)"], width=220, state="readonly")
+            combo_tipo_mov.pack(padx=15, pady=4, anchor="w")
+            combo_tipo_mov.set("Sangria (Retirada)")
+
+            ctk.CTkLabel(left_sangria, text="Valor (R$):", font=("Aileron", 11),
+                         text_color=("#001D39", "white")).pack(padx=15, anchor="w")
+            entry_s_valor = ctk.CTkEntry(left_sangria, placeholder_text="0.00", width=220)
+            entry_s_valor.pack(padx=15, pady=4, anchor="w")
+
+            ctk.CTkLabel(left_sangria, text="Motivo:", font=("Aileron", 11),
+                         text_color=("#001D39", "white")).pack(padx=15, anchor="w")
+            combo_s_motivo = ctk.CTkComboBox(left_sangria, values=["Depósito em Cofre", "Pagamento Fornecedor", "Troco Adicional", "Reforço de Caixa", "Outro"], width=220, state="readonly")
+            combo_s_motivo.pack(padx=15, pady=4, anchor="w")
+            combo_s_motivo.set("Depósito em Cofre")
+
+            ctk.CTkLabel(left_sangria, text="Observação:", font=("Aileron", 11),
+                         text_color=("#001D39", "white")).pack(padx=15, anchor="w")
+            entry_s_obs = ctk.CTkEntry(left_sangria, placeholder_text="Opcional", width=220)
+            entry_s_obs.pack(padx=15, pady=4, anchor="w")
+
+            # Right: Lista de Sangrias e Suprimentos
+            ctk.CTkLabel(right_sangria, text="Movimentações no Turno", font=("Aileron", 14, "bold"),
+                         text_color=("#001D39", "white")).pack(pady=10, padx=15, anchor="w")
+
+            list_frame = ctk.CTkScrollableFrame(right_sangria, fg_color="transparent")
+            list_frame.pack(fill="both", expand=True, padx=5, pady=5)
+
+            def _atualizar_lista_sangrias():
+                for widget in list_frame.winfo_children():
+                    widget.destroy()
+                df_s = self.db.listar_sangrias(caixa_aberto['id'])
+                df_sup = self.db.listar_suprimentos(caixa_aberto['id']) if hasattr(self.db, 'listar_suprimentos') else pd.DataFrame()
+                if df_s.empty and df_sup.empty:
+                    ctk.CTkLabel(list_frame, text="Nenhuma sangria ou suprimento no turno.", font=("Aileron", 11), text_color=("#555", "#CCC")).pack(pady=15)
+                else:
+                    if not df_sup.empty:
+                        for _, sup_row in df_sup.iterrows():
+                            s_card = ctk.CTkFrame(list_frame, fg_color=("#E8F5E9", "#1E3A2B"), corner_radius=8)
+                            s_card.pack(fill="x", pady=2, padx=2)
+                            lbl_info = f"[SUPRIMENTO] +R$ {sup_row['valor']:.2f} - {sup_row['motivo']}\nObs: {sup_row['observacao'] or ''}"
+                            ctk.CTkLabel(s_card, text=lbl_info, font=("Aileron", 11), justify="left", anchor="w").pack(padx=8, pady=4, fill="x")
+                    if not df_s.empty:
+                        for _, s_row in df_s.iterrows():
+                            s_card = ctk.CTkFrame(list_frame, fg_color=("gray95", "#3A3A3A"), corner_radius=8)
+                            s_card.pack(fill="x", pady=2, padx=2)
+                            lbl_info = f"[SANGRIA] -R$ {s_row['valor']:.2f} - {s_row['motivo']}\nObs: {s_row['observacao'] or ''}"
+                            ctk.CTkLabel(s_card, text=lbl_info, font=("Aileron", 11), justify="left", anchor="w").pack(padx=8, pady=4, fill="x")
+
+            def _salvar_sangria():
+                try:
+                    val = float(entry_s_valor.get().replace(",", "."))
+                    if val <= 0: raise ValueError
+                except ValueError:
+                    messagebox.showerror("Erro", "Valor inválido.", parent=dialog)
+                    return
+                motivo = combo_s_motivo.get()
+                obs = entry_s_obs.get().strip()
+                tipo_op = combo_tipo_mov.get()
+
+                if "Suprimento" in tipo_op:
+                    ok, msg = self.db.registrar_suprimento(caixa_aberto['id'], user_id, val, motivo, obs)
+                    titulo_ok = "Suprimento registrado!"
+                else:
+                    if not self._exigir_supervisor(f"Sangria de R$ {val:.2f} ({motivo})", parent=dialog):
+                        return
+                    ok, msg = self.db.registrar_sangria(caixa_aberto['id'], user_id, val, motivo, obs)
+                    titulo_ok = "Sangria registrada!"
+
+                if ok:
+                    messagebox.showinfo("Sucesso", titulo_ok, parent=dialog)
+                    entry_s_valor.delete(0, 'end')
+                    entry_s_obs.delete(0, 'end')
+                    _atualizar_lista_sangrias()
+                    dialog.destroy()
+                    self.after(200, self.open_caixa_dialog)
+                else:
+                    messagebox.showerror("Erro", msg, parent=dialog)
+
+            def _abrir_gaveta_manual():
+                if not self._exigir_supervisor("Abertura manual da gaveta de dinheiro", parent=dialog):
+                    return
+                try:
+                    printer = get_printer()
+                    printer.abrir_gaveta()
+                    self.db.registrar_alteracao(
+                        "Abrir Gaveta",
+                        f"Gaveta aberta manualmente no Caixa #{caixa_aberto['id']}",
+                        entidade="caixa",
+                        entidade_id=str(caixa_aberto['id']),
+                    )
+                    messagebox.showinfo("Gaveta", "Pulso de abertura enviado para a gaveta.", parent=dialog)
+                except Exception as exc:
+                    messagebox.showwarning("Gaveta", f"Não foi possível abrir a gaveta: {exc}", parent=dialog)
+
+            ctk.CTkButton(left_sangria, text="CONFIRMAR MOVIMENTAÇÃO", command=_salvar_sangria, height=35,
+                          fg_color="#FF9800", hover_color="#E68900", text_color="white",
+                          font=("Aileron", 12, "bold")).pack(pady=(12, 6), padx=15, fill="x")
+            ctk.CTkButton(left_sangria, text="🗄️ Abrir Gaveta (Supervisor)", command=_abrir_gaveta_manual, height=32,
+                          fg_color="#455A64", hover_color="#263238", text_color="white",
+                          font=("Aileron", 11, "bold")).pack(pady=(0, 12), padx=15, fill="x")
+
+            _atualizar_lista_sangrias()
 
         # --- TAB HISTÓRICO ---
         df_hist = self.db.historico_caixa(60)
@@ -7560,14 +7850,17 @@ class App(ctk.CTk):
                             f"Enviar nota por WhatsApp para {contato}?", parent=dialog)
                         if enviar_wpp:
                             try:
-                                from printer import enviar_whatsapp
-                                sucesso = enviar_whatsapp(contato, wpp_content or text_content)
+                                sucesso, info_env = self._enviar_whatsapp_resiliente(
+                                    contato,
+                                    wpp_content or text_content,
+                                    metadata={"origem": "recibo_servico", "servico_id": servico_id},
+                                )
                                 if sucesso:
-                                    messagebox.showinfo("WhatsApp",
-                                        "WhatsApp Web será aberto com a nota.\nClique em 'Enviar' no navegador.", parent=dialog)
+                                    messagebox.showinfo("WhatsApp (Outbox)",
+                                        f"{info_env}\nO envio ocorrerá sem travar o caixa.", parent=dialog)
                                 else:
                                     messagebox.showwarning("WhatsApp",
-                                        "Não foi possível abrir o WhatsApp.", parent=dialog)
+                                        f"Não foi possível enfileirar: {info_env}", parent=dialog)
                             except Exception as e:
                                 logger.warning("Erro WhatsApp serviço: %s", e)
                 else:
@@ -8425,17 +8718,72 @@ class App(ctk.CTk):
     # ============ NOVAS FUNCIONALIDADES ============
     # ================================================================
 
-    # --- Dashboard Auto-Refresh ---
+    # --- Dashboard Auto-Refresh (Smart Dirty-Check) & Backup Periódico ---
+    def _check_scheduled_backup(self):
+        """Executa verificação periódica do backup automático com retenção GFS (a cada 6h)."""
+        try:
+            if not self.winfo_exists():
+                return
+            success, msg = self.db.verificar_backup_diario()
+            if success:
+                logger.info("Verificação periódica de backup: %s", msg)
+            self.after(6 * 3600 * 1000, self._check_scheduled_backup)
+        except Exception as e:
+            logger.warning("Erro no agendamento periódico de backup: %s", e)
+
     def _start_auto_refresh(self):
-        """Atualiza o dashboard automaticamente a cada 60 segundos."""
+        """Atualiza o dashboard a cada 60s apenas se houve alteração real no banco de dados."""
         def _tick():
             try:
                 if self.winfo_exists():
-                    self.refresh_dashboard()
+                    db_mod = getattr(self.db, 'last_modified', 0.0)
+                    last_render = getattr(self, '_last_dashboard_render_ts', -1.0)
+                    if db_mod != last_render:
+                        self.refresh_dashboard()
                     self.after(60000, _tick)
             except Exception:
                 pass
         self.after(60000, _tick)
+        self.after(6 * 3600 * 1000, self._check_scheduled_backup)
+
+    def open_inventario_dialog(self, parent=None):
+        """Abre diálogo de Inventário Físico e Contagem Cega."""
+        from views.inventario_view import InventarioDialog
+        InventarioDialog(self, parent=parent)
+
+    def open_sugestao_compras_dialog(self, parent=None):
+        """Abre tela de Sugestão Inteligente de Compras (30/60/90 dias)."""
+        from views.compras_view import SugestaoComprasDialog
+        SugestaoComprasDialog(self, parent=parent)
+
+    def open_importar_nfe_xml(self):
+        """Faz parsing não-bloqueante de XML NF-e e abre prévia para vínculo manual antes de gravar."""
+        filepath = filedialog.askopenfilename(
+            title="Selecionar XML da NF-e (SEFAZ)",
+            filetypes=[("Arquivo XML NF-e", "*.xml"), ("Todos os arquivos", "*.*")]
+        )
+        if not filepath:
+            return
+        try:
+            self.notifier.notify("NF-e XML", "Analisando itens do XML em segundo plano...", tipo="info", duracao=3000)
+        except Exception:
+            pass
+
+        def _worker():
+            ok, dados_ou_erro = self.db.parse_nfe_xml(filepath, margem_padrao=0.35)
+
+            def _done():
+                if not self.winfo_exists():
+                    return
+                if ok:
+                    from views.nfe_preview_view import NFePreviewDialog
+                    NFePreviewDialog(self, dados_ou_erro)
+                else:
+                    messagebox.showerror("Erro ao Analisar NF-e", str(dados_ou_erro), parent=self)
+
+            self.after(0, _done)
+
+        threading.Thread(target=_worker, name="EstokeParseNFe", daemon=True).start()
 
     # --- Notificações Toast na Inicialização ---
     def _exibir_alertas_iniciais(self):
@@ -8479,844 +8827,176 @@ class App(ctk.CTk):
             logger.debug("API REST não disponível: %s", e)
 
     # ================================================================
-    # ============ CONTAS A PAGAR ============
+    # ============ VIEWS MODULARIZADAS (ONDA 5) ============
     # ================================================================
 
     def open_contas_pagar_dialog(self):
-        from tkcalendar import DateEntry
-        import datetime as _dt
-
-        window = ctk.CTkToplevel(self)
-        window.title("Contas a Pagar")
-        window.geometry("950x720")
-        window.attributes("-topmost", True)
-        window.grab_set()
-        window.focus_force()
-
-        # ===== BARRA DE NAVEGAÇÃO (sem CTkTabview) =====
-        nav_frame = ctk.CTkFrame(window, fg_color="transparent", height=40)
-        nav_frame.pack(fill="x", padx=15, pady=(10, 0))
-
-        frame_lista = ctk.CTkFrame(window, fg_color=("white", "#2B2B2B"))
-        frame_nova = ctk.CTkFrame(window, fg_color=("white", "#2B2B2B"))
-
-        def _mostrar_lista():
-            frame_nova.pack_forget()
-            frame_lista.pack(fill="both", expand=True, padx=15, pady=(5, 15))
-            btn_nav_lista.configure(fg_color="#0A4174")
-            btn_nav_nova.configure(fg_color="#555555")
-
-        def _mostrar_nova():
-            frame_lista.pack_forget()
-            frame_nova.pack(fill="both", expand=True, padx=15, pady=(5, 15))
-            btn_nav_nova.configure(fg_color="#0A4174")
-            btn_nav_lista.configure(fg_color="#555555")
-
-        btn_nav_lista = ctk.CTkButton(nav_frame, text="Contas", command=_mostrar_lista,
-                                       width=120, height=32, fg_color="#0A4174", hover_color="#062F56",
-                                       font=("Aileron", 12, "bold"))
-        btn_nav_lista.pack(side="left", padx=(0, 5))
-
-        btn_nav_nova = ctk.CTkButton(nav_frame, text="+ Nova Conta", command=_mostrar_nova,
-                                      width=140, height=32, fg_color="#555555", hover_color="#062F56",
-                                      font=("Aileron", 12, "bold"))
-        btn_nav_nova.pack(side="left", padx=5)
-
-        # ===== FRAME LISTA DE CONTAS =====
-        filtro_frame = ctk.CTkFrame(frame_lista, fg_color="transparent")
-        filtro_frame.pack(fill="x", padx=10, pady=(10, 5))
-
-        ctk.CTkLabel(filtro_frame, text="Filtro:", font=("Aileron", 11, "bold")).pack(side="left", padx=5)
-        filtro_var = ctk.StringVar(value="Pendente")
-        for txt in ["Pendente", "Pago", "Todos"]:
-            ctk.CTkRadioButton(filtro_frame, text=txt, variable=filtro_var, value=txt,
-                              font=("Aileron", 11), command=lambda: _refresh_contas()).pack(side="left", padx=8)
-
-        total_label = ctk.CTkLabel(filtro_frame, text="", font=("Aileron", 12, "bold"),
-                                   text_color=("#E65100", "#FF9800"))
-        total_label.pack(side="right", padx=15)
-
-        cols = ("id", "descricao", "valor", "vencimento", "fornecedor", "status", "parcela")
-        tree = ttk.Treeview(frame_lista, columns=cols, show="headings", height=18)
-        for c, h, w in [("id", "ID", 40), ("descricao", "Descrição", 200), ("valor", "Valor", 80),
-                        ("vencimento", "Vencimento", 100), ("fornecedor", "Fornecedor", 150),
-                        ("status", "Status", 80), ("parcela", "Parcela", 70)]:
-            tree.heading(c, text=h)
-            tree.column(c, width=w)
-        tree.pack(fill="both", expand=True, padx=10, pady=5)
-
-        btn_frame = ctk.CTkFrame(frame_lista, fg_color="transparent")
-        btn_frame.pack(fill="x", padx=10, pady=10)
-
-        def _refresh_contas():
-            for i in tree.get_children():
-                tree.delete(i)
-            filtro = filtro_var.get()
-            status = filtro if filtro != "Todos" else None
-            df = self.db.listar_contas_pagar(status=status)
-            total_pend = 0
-            for _, row in df.iterrows():
-                parc_txt = f"{int(row.get('parcela_atual', 1))}/{int(row.get('total_parcelas', 1))}"
-                venc = str(row.get('data_vencimento', ''))
-                valor = row.get('valor', 0)
-                st = row.get('status', 'Pendente')
-                if st == 'Pendente':
-                    total_pend += valor
-                tree.insert("", "end", values=(
-                    row['id'], row.get('descricao', ''), f"R$ {valor:.2f}",
-                    venc, row.get('fornecedor_nome', ''), st, parc_txt
-                ))
-            total_label.configure(text=f"Total Pendente: R$ {total_pend:.2f}")
-
-        def _pagar_selecionada():
-            sel = tree.selection()
-            if not sel:
-                messagebox.showwarning("Alerta", "Selecione uma conta.", parent=window)
-                return
-            conta_id = tree.item(sel[0])['values'][0]
-            if messagebox.askyesno("Confirmar", "Marcar esta conta como PAGA?", parent=window):
-                self.db.pagar_conta(conta_id)
-                _refresh_contas()
-                self.notifier.notify("Conta Paga", "Conta quitada com sucesso!", tipo="success")
-
-        def _cancelar_selecionada():
-            sel = tree.selection()
-            if not sel:
-                return
-            conta_id = tree.item(sel[0])['values'][0]
-            if messagebox.askyesno("Confirmar", "Cancelar esta conta?", parent=window):
-                self.db.cancelar_conta_pagar(conta_id)
-                _refresh_contas()
-
-        ctk.CTkButton(btn_frame, text="Pagar Selecionada", fg_color="#28a745", hover_color="#218838",
-                     text_color="white", font=("Aileron", 12, "bold"), height=38,
-                     command=_pagar_selecionada).pack(side="left", padx=5)
-        ctk.CTkButton(btn_frame, text="Cancelar Conta", fg_color="#dc3545", hover_color="#c82333",
-                     text_color="white", font=("Aileron", 12, "bold"), height=38,
-                     command=_cancelar_selecionada).pack(side="left", padx=5)
-        ctk.CTkButton(btn_frame, text="Atualizar", fg_color="#7BBDE8", hover_color="#49769F",
-                     text_color="#001D39", font=("Aileron", 12, "bold"), height=38,
-                     command=_refresh_contas).pack(side="right", padx=5)
-
-        _refresh_contas()
-
-        # ===== FRAME NOVA CONTA =====
-        form = ctk.CTkFrame(frame_nova, fg_color="transparent")
-        form.pack(padx=30, pady=20, fill="x")
-
-        ctk.CTkLabel(form, text="Nova Conta a Pagar", font=("Aileron", 18, "bold"),
-                    text_color=("#001D39", "white")).pack(pady=(0, 15))
-
-        fields_frame = ctk.CTkFrame(form, fg_color="transparent")
-        fields_frame.pack(fill="x")
-        fields_frame.grid_columnconfigure(1, weight=1)
-
-        entries = {}
-
-        # Descrição
-        ctk.CTkLabel(fields_frame, text="Descrição:", font=("Aileron", 11)).grid(row=0, column=0, sticky="w", padx=5, pady=5)
-        entries["desc"] = ctk.CTkEntry(fields_frame, height=35)
-        entries["desc"].grid(row=0, column=1, sticky="ew", padx=5, pady=5)
-
-        # Valor
-        ctk.CTkLabel(fields_frame, text="Valor (R$):", font=("Aileron", 11)).grid(row=1, column=0, sticky="w", padx=5, pady=5)
-        entries["valor"] = ctk.CTkEntry(fields_frame, height=35)
-        entries["valor"].grid(row=1, column=1, sticky="ew", padx=5, pady=5)
-
-        # Vencimento com calendário
-        ctk.CTkLabel(fields_frame, text="Vencimento:", font=("Aileron", 11)).grid(row=2, column=0, sticky="w", padx=5, pady=5)
-        venc_frame = ctk.CTkFrame(fields_frame, fg_color="transparent")
-        venc_frame.grid(row=2, column=1, sticky="ew", padx=5, pady=5)
-        venc_frame.grid_columnconfigure(0, weight=1)
-
-        date_entry = DateEntry(venc_frame, width=20, background='#0A4174', foreground='white',
-                              borderwidth=2, date_pattern='yyyy-mm-dd', font=("Aileron", 11),
-                              mindate=_dt.date.today(), locale='pt_BR')
-        date_entry.grid(row=0, column=0, sticky="ew")
-
-        # Categoria
-        ctk.CTkLabel(fields_frame, text="Categoria:", font=("Aileron", 11)).grid(row=3, column=0, sticky="w", padx=5, pady=5)
-        entries["cat"] = ctk.CTkEntry(fields_frame, height=35)
-        entries["cat"].grid(row=3, column=1, sticky="ew", padx=5, pady=5)
-        entries["cat"].insert(0, "Outro")
-
-        # Parcelas
-        ctk.CTkLabel(fields_frame, text="Parcelas:", font=("Aileron", 11)).grid(row=4, column=0, sticky="w", padx=5, pady=5)
-        entries["parcelas"] = ctk.CTkEntry(fields_frame, height=35)
-        entries["parcelas"].grid(row=4, column=1, sticky="ew", padx=5, pady=5)
-        entries["parcelas"].insert(0, "1")
-
-        # Observação
-        ctk.CTkLabel(fields_frame, text="Observação:", font=("Aileron", 11)).grid(row=5, column=0, sticky="w", padx=5, pady=5)
-        entries["obs"] = ctk.CTkEntry(fields_frame, height=35)
-        entries["obs"].grid(row=5, column=1, sticky="ew", padx=5, pady=5)
-
-        # Fornecedor dropdown
-        ctk.CTkLabel(fields_frame, text="Fornecedor:", font=("Aileron", 11)).grid(row=6, column=0, sticky="w", padx=5, pady=5)
-        df_forn = self.db.listar_fornecedores()
-        forn_list = ["Nenhum"] + df_forn['nome'].tolist() if not df_forn.empty else ["Nenhum"]
-        forn_var = ctk.StringVar(value="Nenhum")
-        ctk.CTkOptionMenu(fields_frame, values=forn_list, variable=forn_var, height=35).grid(
-            row=6, column=1, sticky="ew", padx=5, pady=5)
-
-        def _salvar_conta():
-            desc = entries["desc"].get().strip()
-            try:
-                valor = float(entries["valor"].get().replace(",", "."))
-            except ValueError:
-                messagebox.showerror("Erro", "Valor inválido.", parent=window)
-                return
-            venc = date_entry.get_date().isoformat()
-            if not desc:
-                messagebox.showerror("Erro", "Preencha a descrição.", parent=window)
-                return
-            cat = entries["cat"].get().strip() or "Outro"
-            try:
-                parcelas = int(entries["parcelas"].get())
-            except ValueError:
-                parcelas = 1
-            obs = entries["obs"].get().strip()
-
-            forn_id = None
-            if forn_var.get() != "Nenhum" and not df_forn.empty:
-                forn_match = df_forn[df_forn['nome'] == forn_var.get()]
-                if not forn_match.empty:
-                    forn_id = int(forn_match.iloc[0]['id'])
-
-            self.db.adicionar_conta_pagar(desc, valor, venc, forn_id, cat, total_parcelas=parcelas, observacao=obs)
-            messagebox.showinfo("Sucesso", "Conta registrada!", parent=window)
-            entries["desc"].delete(0, "end")
-            entries["valor"].delete(0, "end")
-            entries["obs"].delete(0, "end")
-            entries["parcelas"].delete(0, "end")
-            entries["parcelas"].insert(0, "1")
-            entries["cat"].delete(0, "end")
-            entries["cat"].insert(0, "Outro")
-            _refresh_contas()
-            _mostrar_lista()
-
-        ctk.CTkButton(form, text="Salvar Conta", height=42, fg_color="#7BBDE8", hover_color="#49769F",
-                     text_color="#001D39", font=("Aileron", 13, "bold"),
-                     command=_salvar_conta).pack(pady=20, fill="x")
-
-        # Iniciar mostrando a lista
-        _mostrar_lista()
-
-    # ================================================================
-    # ============ ETIQUETAS ============
-    # ================================================================
+        from views.financeiro_view import FinanceiroView
+        FinanceiroView(self).open_contas_pagar_dialog()
 
     def open_etiquetas_dialog(self):
-        import label_generator
-        window = ctk.CTkToplevel(self)
-        window.title("Gerador de Etiquetas")
-        window.geometry("700x600")
-        window.attributes("-topmost", True)
-        window.grab_set()
-        window.focus_set()
-
-        main_f = ctk.CTkFrame(window, fg_color="transparent")
-        main_f.pack(fill="both", expand=True, padx=15, pady=15)
-
-        ctk.CTkLabel(main_f, text="Gerador de Etiquetas", font=("Aileron", 18, "bold"),
-                    text_color=("#001D39", "white")).pack(pady=(0, 10))
-
-        if not label_generator.etiquetas_disponiveis():
-            ctk.CTkLabel(main_f, text="Bibliotecas de imagem não disponíveis.\nInstale: pip install pillow python-barcode qrcode",
-                        font=("Aileron", 12), text_color="red").pack(pady=30)
-            return
-
-        # Configurações
-        cfg_frame = ctk.CTkFrame(main_f, fg_color=("white", "#2B2B2B"), corner_radius=10)
-        cfg_frame.pack(fill="x", pady=(0, 10), padx=5)
-
-        ctk.CTkLabel(cfg_frame, text="Configurações:", font=("Aileron", 12, "bold")).pack(anchor="w", padx=15, pady=(10, 5))
-
-        opts_frame = ctk.CTkFrame(cfg_frame, fg_color="transparent")
-        opts_frame.pack(fill="x", padx=15, pady=(0, 10))
-
-        var_preco = ctk.BooleanVar(value=True)
-        var_codigo = ctk.BooleanVar(value=True)
-        var_qr = ctk.BooleanVar(value=False)
-
-        ctk.CTkCheckBox(opts_frame, text="Mostrar preço", variable=var_preco, font=("Aileron", 11)).pack(side="left", padx=10)
-        ctk.CTkCheckBox(opts_frame, text="Código de barras", variable=var_codigo, font=("Aileron", 11)).pack(side="left", padx=10)
-        ctk.CTkCheckBox(opts_frame, text="QR Code", variable=var_qr, font=("Aileron", 11)).pack(side="left", padx=10)
-
-        # Lista de produtos
-        ctk.CTkLabel(main_f, text="Selecione produtos para gerar etiquetas:", font=("Aileron", 11)).pack(anchor="w", padx=5)
-
-        cols = ("sel", "id", "nome", "preco", "codigo")
-        tree = ttk.Treeview(main_f, columns=cols, show="headings", height=12)
-        for c, h, w in [("sel", "☑", 30), ("id", "ID", 40), ("nome", "Produto", 250),
-                        ("preco", "Preço", 80), ("codigo", "Código", 150)]:
-            tree.heading(c, text=h)
-            tree.column(c, width=w)
-        tree.pack(fill="both", expand=True, padx=5, pady=5)
-
-        # Preencher lista
-        df = self.db.listar_produtos()
-        selected_ids = set()
-
-        def _toggle(event):
-            item = tree.identify_row(event.y)
-            if item:
-                pid = tree.item(item)['values'][1]
-                if pid in selected_ids:
-                    selected_ids.discard(pid)
-                    tree.item(item, values=("☐",) + tuple(tree.item(item)['values'][1:]))
-                else:
-                    selected_ids.add(pid)
-                    tree.item(item, values=("☑",) + tuple(tree.item(item)['values'][1:]))
-
-        tree.bind("<Button-1>", _toggle)
-
-        for _, row in df.iterrows():
-            tree.insert("", "end", values=("☐", row['id'], row['nome'],
-                        f"R$ {row['preco']:.2f}", row.get('codigo_barras', '')))
-
-        # Quantidade por etiqueta
-        qty_frame = ctk.CTkFrame(main_f, fg_color="transparent")
-        qty_frame.pack(fill="x", padx=5, pady=5)
-        ctk.CTkLabel(qty_frame, text="Cópias por produto:", font=("Aileron", 11)).pack(side="left")
-        e_qty = ctk.CTkEntry(qty_frame, width=60, height=32)
-        e_qty.insert(0, "1")
-        e_qty.pack(side="left", padx=5)
-
-        def _gerar():
-            if not selected_ids:
-                messagebox.showwarning("Alerta", "Selecione ao menos um produto.", parent=window)
-                return
-            try:
-                qty = int(e_qty.get())
-            except ValueError:
-                qty = 1
-
-            config_nota = self.db.get_config_nota()
-            cfg = {
-                'mostrar_preco': var_preco.get(),
-                'mostrar_codigo': var_codigo.get(),
-                'mostrar_qrcode': var_qr.get(),
-                'empresa_nome': config_nota.get('empresa_nome', ''),
-            }
-
-            gerados = 0
-            output_dir = os.path.join(os.path.expanduser("~"), "Documents", "EstokeAoCubo_Etiquetas")
-            for pid in selected_ids:
-                prod_row = df[df['id'] == pid]
-                if prod_row.empty:
-                    continue
-                prod = prod_row.iloc[0].to_dict()
-                for _ in range(qty):
-                    path = label_generator.gerar_etiqueta(prod, cfg, output_dir)
-                    if path:
-                        gerados += 1
-
-            if gerados > 0:
-                messagebox.showinfo("Sucesso", f"{gerados} etiqueta(s) gerada(s) em:\n{output_dir}", parent=window)
-                try:
-                    os.startfile(output_dir)
-                except Exception:
-                    pass
-            else:
-                messagebox.showerror("Erro", "Nenhuma etiqueta gerada.", parent=window)
-
-        ctk.CTkButton(main_f, text="Gerar Etiquetas", height=42, fg_color="#7BBDE8", hover_color="#49769F",
-                     text_color="#001D39", font=("Aileron", 13, "bold"),
-                     command=_gerar).pack(pady=10, fill="x", padx=5)
-
-    # ================================================================
-    # ============ DRE SIMPLIFICADO ============
-    # ================================================================
+        from views.admin_view import AdminView
+        AdminView(self).open_etiquetas_dialog()
 
     def open_dre_dialog(self):
-        window = ctk.CTkToplevel(self)
-        window.title("DRE - Demonstrativo de Resultado")
-        window.geometry("800x750")
-        window.attributes("-topmost", True)
-        window.grab_set()
-        window.focus_set()
-
-        main_f = ctk.CTkScrollableFrame(window, fg_color="transparent")
-        main_f.pack(fill="both", expand=True, padx=15, pady=15)
-
-        ctk.CTkLabel(main_f, text="Demonstrativo de Resultado do Exercício",
-                    font=("Aileron", 20, "bold"), text_color=("#001D39", "white")).pack(pady=(0, 5))
-
-        # Seletor de período
-        periodo_frame = ctk.CTkFrame(main_f, fg_color="transparent")
-        periodo_frame.pack(fill="x", pady=(0, 15))
-
-        periodo_var = ctk.StringVar(value="mes")
-        for txt, val in [("Mês Atual", "mes"), ("Trimestre", "trimestre"), ("Ano", "ano")]:
-            ctk.CTkRadioButton(periodo_frame, text=txt, variable=periodo_var, value=val,
-                              font=("Aileron", 11), command=lambda: _render_dre()).pack(side="left", padx=10)
-
-        dre_container = ctk.CTkFrame(main_f, fg_color=("white", "#2B2B2B"), corner_radius=15,
-                                     border_width=1, border_color=("#E6E6E6", "#444444"))
-        dre_container.pack(fill="x", padx=5, pady=5)
-
-        def _render_dre():
-            for w in dre_container.winfo_children():
-                w.destroy()
-
-            dre = self.db.gerar_dre(periodo_var.get())
-
-            periodo_label = {"mes": "Mês Atual", "trimestre": "Trimestre Atual", "ano": "Ano Atual"}.get(
-                dre["periodo"], "Período")
-            ctk.CTkLabel(dre_container, text=f"Período: {periodo_label} ({dre['inicio']} a {dre['fim']})",
-                        font=("Aileron", 11), text_color=("gray40", "gray70")).pack(anchor="w", padx=20, pady=(15, 10))
-
-            def _linha(parent, texto, valor, bold=False, color=None, indent=0):
-                f = ctk.CTkFrame(parent, fg_color="transparent")
-                f.pack(fill="x", padx=20 + indent, pady=2)
-                font = ("Aileron", 12, "bold") if bold else ("Aileron", 11)
-                tc = color or ("#001D39", "white")
-                ctk.CTkLabel(f, text=texto, font=font, text_color=tc).pack(side="left")
-                val_color = color or ("#001D39", "white")
-                if isinstance(valor, (int, float)):
-                    val_text = f"R$ {valor:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-                    if valor < 0:
-                        val_color = "#dc3545"
-                else:
-                    val_text = str(valor)
-                ctk.CTkLabel(f, text=val_text, font=font, text_color=val_color).pack(side="right")
-
-            def _separador(parent):
-                ctk.CTkFrame(parent, fg_color=("#E0E0E0", "#444444"), height=1).pack(fill="x", padx=20, pady=6)
-
-            _linha(dre_container, "RECEITA BRUTA", dre["receita_bruta"], bold=True)
-            _linha(dre_container, "  Vendas de Produtos", dre["receita_vendas"], indent=15)
-            _linha(dre_container, "  Serviços Prestados", dre["receita_servicos"], indent=15)
-            _separador(dre_container)
-
-            _linha(dre_container, "(-) Deduções / Descontos", -dre["deducoes"])
-            _separador(dre_container)
-
-            _linha(dre_container, "RECEITA LÍQUIDA", dre["receita_liquida"], bold=True, color="#0D47A1")
-            _separador(dre_container)
-
-            _linha(dre_container, "(-) CMV (Custo das Mercadorias)", -dre["cmv"])
-            _linha(dre_container, "(-) Custo dos Serviços", -dre["custo_servicos"])
-            _separador(dre_container)
-
-            cor_lb = "#28a745" if dre["lucro_bruto"] >= 0 else "#dc3545"
-            _linha(dre_container, "LUCRO BRUTO", dre["lucro_bruto"], bold=True, color=cor_lb)
-            _linha(dre_container, f"  Margem Bruta: {dre['margem_bruta']:.1f}%", "", indent=15)
-            _separador(dre_container)
-
-            _linha(dre_container, "(-) Despesas Fixas", -dre["despesas_fixas"])
-            _linha(dre_container, "(-) Despesas Variáveis", -dre["despesas_variaveis"])
-            _separador(dre_container)
-
-            cor_ro = "#28a745" if dre["resultado_operacional"] >= 0 else "#dc3545"
-            _linha(dre_container, "RESULTADO OPERACIONAL", dre["resultado_operacional"], bold=True, color=cor_ro)
-            _separador(dre_container)
-
-            cor_rl = "#28a745" if dre["resultado_liquido"] >= 0 else "#dc3545"
-            _linha(dre_container, "RESULTADO LÍQUIDO", dre["resultado_liquido"], bold=True, color=cor_rl)
-            _linha(dre_container, f"  Margem Líquida: {dre['margem_liquida']:.1f}%", "", indent=15)
-
-            # Rodapé
-            ctk.CTkFrame(dre_container, fg_color="transparent", height=15).pack()
-
-        _render_dre()
-
-        # Botão para abrir Fluxo de Caixa
-        btn_frame = ctk.CTkFrame(main_f, fg_color="transparent")
-        btn_frame.pack(fill="x", padx=5, pady=10)
-
-        ctk.CTkButton(btn_frame, text="Ver Fluxo de Caixa Futuro", height=40,
-                     fg_color="#2874A6", hover_color="#1B4F72", text_color="white",
-                     font=("Aileron", 12, "bold"),
-                     command=lambda: self.open_fluxo_caixa_dialog()).pack(side="left", padx=5)
-
-        ctk.CTkButton(btn_frame, text="Ver Comissões", height=40,
-                     fg_color="#5DADE2", hover_color="#3498DB", text_color="#001D39",
-                     font=("Aileron", 12, "bold"),
-                     command=lambda: self.open_comissoes_dialog()).pack(side="left", padx=5)
-
-    # ================================================================
-    # ============ FLUXO DE CAIXA FUTURO ============
-    # ================================================================
+        from views.financeiro_view import FinanceiroView
+        FinanceiroView(self).open_dre_dialog()
 
     def open_fluxo_caixa_dialog(self):
-        window = ctk.CTkToplevel(self)
-        window.title("Fluxo de Caixa Futuro")
-        window.geometry("900x650")
-        window.attributes("-topmost", True)
-        window.grab_set()
-        window.focus_set()
-
-        main_f = ctk.CTkFrame(window, fg_color="transparent")
-        main_f.pack(fill="both", expand=True, padx=15, pady=15)
-
-        ctk.CTkLabel(main_f, text="Projeção de Fluxo de Caixa",
-                    font=("Aileron", 18, "bold"), text_color=("#001D39", "white")).pack(pady=(0, 5))
-
-        # Período
-        periodo_frame = ctk.CTkFrame(main_f, fg_color="transparent")
-        periodo_frame.pack(fill="x", pady=(0, 10))
-
-        dias_var = ctk.StringVar(value="90")
-        ctk.CTkLabel(periodo_frame, text="Projetar:", font=("Aileron", 11)).pack(side="left", padx=5)
-        for txt, val in [("30 dias", "30"), ("60 dias", "60"), ("90 dias", "90")]:
-            ctk.CTkRadioButton(periodo_frame, text=txt, variable=dias_var, value=val,
-                              font=("Aileron", 11), command=lambda: _render_fluxo()).pack(side="left", padx=8)
-
-        # Saldo card
-        saldo_card = ctk.CTkFrame(main_f, fg_color=("#E3F2FD", "#1A2A3A"), corner_radius=12)
-        saldo_card.pack(fill="x", padx=5, pady=(0, 10))
-        saldo_label = ctk.CTkLabel(saldo_card, text="", font=("Aileron", 16, "bold"),
-                                   text_color=("#0D47A1", "#4da6ff"))
-        saldo_label.pack(pady=12)
-
-        # Tabela
-        cols = ("data", "tipo", "descricao", "valor", "saldo")
-        tree = ttk.Treeview(main_f, columns=cols, show="headings", height=16)
-        for c, h, w in [("data", "Data", 100), ("tipo", "Tipo", 120), ("descricao", "Descrição", 280),
-                        ("valor", "Valor", 100), ("saldo", "Saldo Projetado", 120)]:
-            tree.heading(c, text=h)
-            tree.column(c, width=w)
-        tree.pack(fill="both", expand=True, padx=5, pady=5)
-
-        def _render_fluxo():
-            for i in tree.get_children():
-                tree.delete(i)
-            dias = int(dias_var.get())
-            dados = self.db.projetar_fluxo_caixa(dias)
-            saldo_label.configure(
-                text=f"Saldo Atual: R$ {dados['saldo_atual']:,.2f}  |  "
-                     f"Média Diária Vendas: R$ {dados['media_diaria_vendas']:,.2f}")
-
-            tipo_labels = {
-                "saida": "Conta a Pagar", "saida_fixa": "Gasto Fixo",
-                "entrada": "Recebível", "projecao_vendas": "Projeção Vendas"
-            }
-
-            for item in dados["projecao"]:
-                valor = item["valor"]
-                saldo = item["saldo_acumulado"]
-                tree.insert("", "end", values=(
-                    item["data"], tipo_labels.get(item["tipo"], item["tipo"]),
-                    item["descricao"],
-                    f"R$ {valor:+,.2f}",
-                    f"R$ {saldo:,.2f}"
-                ))
-
-        _render_fluxo()
-
-    # ================================================================
-    # ============ CONTROLE DE COMISSÕES ============
-    # ================================================================
+        from views.financeiro_view import FinanceiroView
+        FinanceiroView(self).open_fluxo_caixa_dialog()
 
     def open_comissoes_dialog(self):
-        window = ctk.CTkToplevel(self)
-        window.title("Controle de Comissões")
-        window.geometry("800x550")
-        window.attributes("-topmost", True)
-        window.grab_set()
-        window.focus_set()
-
-        main_f = ctk.CTkFrame(window, fg_color="transparent")
-        main_f.pack(fill="both", expand=True, padx=15, pady=15)
-
-        ctk.CTkLabel(main_f, text="Relatório de Comissões", font=("Aileron", 18, "bold"),
-                    text_color=("#001D39", "white")).pack(pady=(0, 10))
-
-        # Período
-        periodo_frame = ctk.CTkFrame(main_f, fg_color="transparent")
-        periodo_frame.pack(fill="x", pady=(0, 10))
-
-        periodo_var = ctk.StringVar(value="mes")
-        for txt, val in [("Semana", "semana"), ("Mês", "mes"), ("Ano", "ano")]:
-            ctk.CTkRadioButton(periodo_frame, text=txt, variable=periodo_var, value=val,
-                              font=("Aileron", 11), command=lambda: _render_comissoes()).pack(side="left", padx=10)
-
-        total_label = ctk.CTkLabel(main_f, text="", font=("Aileron", 14, "bold"),
-                                   text_color=("#E65100", "#FF9800"))
-        total_label.pack(pady=5)
-
-        cols = ("vendedor", "taxa", "vendas", "faturamento", "lucro", "comissao")
-        tree = ttk.Treeview(main_f, columns=cols, show="headings", height=12)
-        for c, h, w in [("vendedor", "Vendedor", 150), ("taxa", "Taxa %", 70), ("vendas", "Nº Vendas", 80),
-                        ("faturamento", "Faturamento", 120), ("lucro", "Lucro", 100), ("comissao", "Comissão", 100)]:
-            tree.heading(c, text=h)
-            tree.column(c, width=w)
-        tree.pack(fill="both", expand=True, padx=5, pady=5)
-
-        def _render_comissoes():
-            for i in tree.get_children():
-                tree.delete(i)
-            dados = self.db.calcular_comissoes(periodo_var.get())
-            df = dados["vendas"]
-            total_com = 0
-            for _, row in df.iterrows():
-                com = row.get('comissao_vendas', 0) or 0
-                total_com += com
-                tree.insert("", "end", values=(
-                    row.get('vendedor', ''),
-                    f"{row.get('taxa_comissao', 0):.1f}%",
-                    int(row.get('num_vendas', 0)),
-                    f"R$ {row.get('faturamento', 0):,.2f}",
-                    f"R$ {row.get('lucro', 0):,.2f}",
-                    f"R$ {com:,.2f}",
-                ))
-            total_label.configure(text=f"Total Comissões a Pagar: R$ {total_com:,.2f}")
-
-        _render_comissoes()
-
-    # ================================================================
-    # ============ GESTÃO DE LOJAS (Múltiplas Filiais) ============
-    # ================================================================
+        from views.financeiro_view import FinanceiroView
+        FinanceiroView(self).open_comissoes_dialog()
 
     def open_lojas_dialog(self):
-        window = ctk.CTkToplevel(self)
-        window.title("Gestão de Lojas/Filiais")
-        window.geometry("650x500")
-        window.attributes("-topmost", True)
-        window.grab_set()
-        window.focus_set()
-
-        main_f = ctk.CTkFrame(window, fg_color="transparent")
-        main_f.pack(fill="both", expand=True, padx=15, pady=15)
-
-        ctk.CTkLabel(main_f, text="Lojas / Filiais", font=("Aileron", 18, "bold"),
-                    text_color=("#001D39", "white")).pack(pady=(0, 10))
-
-        # Lista
-        cols = ("id", "nome", "endereco", "telefone", "cnpj")
-        tree = ttk.Treeview(main_f, columns=cols, show="headings", height=10)
-        for c, h, w in [("id", "ID", 40), ("nome", "Nome", 180), ("endereco", "Endereço", 200),
-                        ("telefone", "Telefone", 120), ("cnpj", "CNPJ", 140)]:
-            tree.heading(c, text=h)
-            tree.column(c, width=w)
-        tree.pack(fill="both", expand=True, padx=5, pady=5)
-
-        def _refresh():
-            for i in tree.get_children():
-                tree.delete(i)
-            df = self.db.listar_lojas()
-            for _, row in df.iterrows():
-                tree.insert("", "end", values=(row['id'], row['nome'], row.get('endereco', ''),
-                            row.get('telefone', ''), row.get('cnpj', '')))
-
-        # Form nova loja
-        form = ctk.CTkFrame(main_f, fg_color=("white", "#2B2B2B"), corner_radius=10)
-        form.pack(fill="x", padx=5, pady=10)
-
-        entries = {}
-        row_f = ctk.CTkFrame(form, fg_color="transparent")
-        row_f.pack(fill="x", padx=15, pady=10)
-
-        for i, (label, key, w) in enumerate([("Nome", "nome", 150), ("Endereço", "end", 180),
-                                              ("Telefone", "tel", 100), ("CNPJ", "cnpj", 130)]):
-            ctk.CTkLabel(row_f, text=label + ":", font=("Aileron", 10)).grid(row=0, column=i*2, padx=2)
-            e = ctk.CTkEntry(row_f, width=w, height=32)
-            e.grid(row=0, column=i*2+1, padx=2)
-            entries[key] = e
-
-        btn_f = ctk.CTkFrame(form, fg_color="transparent")
-        btn_f.pack(fill="x", padx=15, pady=(0, 10))
-
-        def _add():
-            nome = entries["nome"].get().strip()
-            if not nome:
-                messagebox.showerror("Erro", "Nome obrigatório.", parent=window)
-                return
-            self.db.adicionar_loja(nome, entries["end"].get().strip(),
-                                   entries["tel"].get().strip(), entries["cnpj"].get().strip())
-            for e in entries.values():
-                e.delete(0, "end")
-            _refresh()
-
-        def _remove():
-            sel = tree.selection()
-            if not sel:
-                return
-            lid = tree.item(sel[0])['values'][0]
-            if messagebox.askyesno("Confirmar", "Desativar esta loja?", parent=window):
-                self.db.remover_loja(lid)
-                _refresh()
-
-        ctk.CTkButton(btn_f, text="Adicionar", fg_color="#28a745", hover_color="#218838",
-                     text_color="white", font=("Aileron", 11, "bold"), height=32,
-                     command=_add).pack(side="left", padx=5)
-        ctk.CTkButton(btn_f, text="Remover", fg_color="#dc3545", hover_color="#c82333",
-                     text_color="white", font=("Aileron", 11, "bold"), height=32,
-                     command=_remove).pack(side="left", padx=5)
-
-        _refresh()
-
-    # ================================================================
-    # ============ GESTÃO DE USUÁRIOS ============
-    # ================================================================
+        from views.admin_view import AdminView
+        AdminView(self).open_lojas_dialog()
 
     def open_usuarios_dialog(self):
-        window = ctk.CTkToplevel(self)
-        window.title("Gestão de Usuários")
-        window.geometry("800x600")
-        window.attributes("-topmost", True)
-        window.grab_set()
-        window.focus_set()
+        from views.admin_view import AdminView
+        AdminView(self).open_usuarios_dialog()
 
-        tabview = ctk.CTkTabview(window, fg_color=("white", "#2B2B2B"))
-        tabview.pack(fill="both", expand=True, padx=15, pady=15)
 
-        tab_lista = tabview.add("Usuários")
-        tab_novo = tabview.add("Novo Usuário")
+def run_self_test() -> int:
+    """
+    Executa smoke test completo de boot isolado (--self-test) em ambiente virgem (ESTOKE_DATA_DIR).
+    Grava relatório JSON estruturado sem depender de console/stdout (compatível com console=False).
+    """
+    report_dir = paths.get_app_data_path()
+    report_path = os.path.join(report_dir, "selftest_report.json")
+    report = {
+        "status": "error",
+        "frozen": bool(getattr(sys, "frozen", False)),
+        "executable": sys.executable,
+        "python_version": sys.version,
+        "data_dir": report_dir,
+        "resource_dir": paths.get_resource_path(),
+        "checks": {},
+        "error": "",
+    }
+    try:
+        # 1. Validar módulos nativos, empacotados e internos
+        modulos = [
+            "sqlite3",
+            "cryptography",
+            "numpy",
+            "pandas",
+            "PIL",
+            "reportlab",
+            "customtkinter",
+            "certifi",
+            "flask",
+            "google.genai",
+            "paths",
+            "migrations",
+            "views.pdv_view",
+            "views.inventario_view",
+            "views.nfe_preview_view",
+            "views.compras_view",
+            "views.financeiro_view",
+            "views.admin_view",
+            "services.fiscal_service",
+            "services.outbox_service",
+            "services.scheduler",
+            "services.updater",
+            "services.compras_service",
+            "services.relatorio_caixa",
+            "services.mercadopago_service",
+            # Dependências pesadas carregadas sob demanda pelas telas (dashboard, NF-e, etiquetas, scanner)
+            "unittest",
+            "pyparsing",
+            "matplotlib",
+            "matplotlib.figure",
+            "matplotlib.backends.backend_tkagg",
+            "pdfplumber",
+            "pdfplumber.display",
+            "qrcode",
+            "barcode",
+            "escpos",
+            "cv2",
+            "pyzbar.pyzbar",
+            "label_generator",
+            "invoice_generator",
+            "ai_module",
+            "notifications",
+            "api_server",
+            "printer",
+        ]
+        for mod_name in modulos:
+            __import__(mod_name)
+        report["checks"]["imports"] = {"ok": True, "count": len(modulos)}
 
-        # ===== ABA LISTA =====
-        cols = ("id", "nome", "login", "perfil", "ativo", "loja")
-        tree = ttk.Treeview(tab_lista, columns=cols, show="headings", height=15)
-        for c, h, w in [("id", "ID", 40), ("nome", "Nome", 180), ("login", "Login", 120),
-                        ("perfil", "Perfil", 100), ("ativo", "Ativo", 60), ("loja", "Loja", 80)]:
-            tree.heading(c, text=h)
-            tree.column(c, width=w)
-        tree.pack(fill="both", expand=True, padx=10, pady=10)
+        # 2. Validar bundle SSL certifi e recursos empacotados
+        import certifi
+        cacert = certifi.where()
+        icon_ico = paths.get_resource_path("icon", "icon-cubo.ico")
+        if not os.path.isfile(cacert):
+            raise FileNotFoundError(f"certifi cacert.pem ausente: {cacert}")
+        if not os.path.isfile(icon_ico):
+            raise FileNotFoundError(f"Ícone principal ausente: {icon_ico}")
+        report["checks"]["assets"] = {"ok": True, "cacert": cacert, "icon": icon_ico}
 
-        def _refresh():
-            for i in tree.get_children():
-                tree.delete(i)
-            df = self.db.listar_usuarios()
-            for _, row in df.iterrows():
-                tree.insert("", "end", values=(
-                    row['id'], row['nome'], row['login'], row['perfil'],
-                    "Sim" if row['ativo'] else "Não", row.get('loja_id', '') or '-'
-                ))
+        # 3. Validar gravação de config.json, banco SQLite, migrações, backup criptografado e PDF ReportLab
+        cfg = config.load_config()
+        cfg["_selftest_boot"] = True
+        config.save_config(cfg)
 
-        btn_frame = ctk.CTkFrame(tab_lista, fg_color="transparent")
-        btn_frame.pack(fill="x", padx=10, pady=10)
+        import migrations
+        db = database.Database(db_name="selftest.db")
+        try:
+            ver = migrations.get_user_version(db.conn)
+            if ver != migrations.LATEST_SCHEMA_VERSION:
+                raise RuntimeError(f"Versão de schema inesperada: {ver} != {migrations.LATEST_SCHEMA_VERSION}")
+            ok_bk, bk_path = db.criar_backup()
+            if not ok_bk:
+                raise RuntimeError(f"Falha ao criar backup criptografado no self-test: {bk_path}")
+        finally:
+            db.close()
 
-        def _desativar():
-            sel = tree.selection()
-            if not sel:
-                return
-            uid = tree.item(sel[0])['values'][0]
-            if messagebox.askyesno("Confirmar", "Desativar este usuário?", parent=window):
-                self.db.remover_usuario(uid)
-                _refresh()
+        from services.relatorio_caixa import gerar_pdf_fechamento
+        pdf_tmp = paths.get_temp_dir("selftest_caixa.pdf")
+        gerar_pdf_fechamento({"id": 1, "total_vendas": 100.0, "conciliacao_pix": {}}, pdf_tmp)
+        if not os.path.isfile(pdf_tmp) or os.path.getsize(pdf_tmp) < 500:
+            raise RuntimeError("PDF ReportLab de smoke test não foi gerado corretamente.")
 
-        def _alterar_senha():
-            sel = tree.selection()
-            if not sel:
-                return
-            uid = tree.item(sel[0])['values'][0]
-            nome = tree.item(sel[0])['values'][1]
+        report["checks"]["database_migrations_backup"] = {"ok": True, "schema_version": ver, "enc_exists": os.path.exists(os.path.join(report_dir, "selftest.db.enc"))}
+        report["checks"]["reportlab_pdf"] = {"ok": True, "size_bytes": os.path.getsize(pdf_tmp)}
 
-            dlg = ctk.CTkToplevel(window)
-            dlg.title(f"Alterar Senha - {nome}")
-            dlg.geometry("350x200")
-            dlg.attributes("-topmost", True)
-            dlg.grab_set()
+        # 4. Renderizar gráfico matplotlib (valida mpl-data, fontes e cadeia pyparsing/unittest do dashboard)
+        from matplotlib.figure import Figure as _SelfTestFigure
+        fig = _SelfTestFigure(figsize=(3, 2), dpi=80)
+        ax = fig.add_subplot(111)
+        ax.pie([3, 2, 1], labels=["A", "B", "C"])
+        png_tmp = paths.get_temp_dir("selftest_chart.png")
+        fig.savefig(png_tmp)
+        if not os.path.isfile(png_tmp) or os.path.getsize(png_tmp) < 500:
+            raise RuntimeError("Gráfico matplotlib de smoke test não foi gerado corretamente.")
+        report["checks"]["matplotlib_chart"] = {"ok": True, "size_bytes": os.path.getsize(png_tmp)}
+        report["status"] = "ok"
+        code = 0
+    except Exception as exc:
+        import traceback
+        report["status"] = "error"
+        report["error"] = f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}"
+        code = 1
 
-            ctk.CTkLabel(dlg, text="Nova Senha:", font=("Aileron", 12)).pack(padx=20, pady=(20, 5))
-            e_pw = ctk.CTkEntry(dlg, show="*", height=35)
-            e_pw.pack(padx=20, fill="x")
-
-            def _save():
-                pw = e_pw.get().strip()
-                if len(pw) < 4:
-                    messagebox.showerror("Erro", "Senha deve ter 4+ caracteres.", parent=dlg)
-                    return
-                self.db.alterar_senha_usuario(uid, pw)
-                messagebox.showinfo("Sucesso", "Senha alterada!", parent=dlg)
-                dlg.destroy()
-
-            ctk.CTkButton(dlg, text="Salvar", height=38, fg_color="#7BBDE8", hover_color="#49769F",
-                         command=_save).pack(padx=20, pady=20, fill="x")
-
-        ctk.CTkButton(btn_frame, text="Desativar", fg_color="#dc3545", hover_color="#c82333",
-                     text_color="white", font=("Aileron", 11, "bold"), height=35,
-                     command=_desativar).pack(side="left", padx=5)
-        ctk.CTkButton(btn_frame, text="Alterar Senha", fg_color="#5DADE2", hover_color="#3498DB",
-                     text_color="#001D39", font=("Aileron", 11, "bold"), height=35,
-                     command=_alterar_senha).pack(side="left", padx=5)
-
-        _refresh()
-
-        # ===== ABA NOVO USUÁRIO =====
-        form = ctk.CTkFrame(tab_novo, fg_color="transparent")
-        form.pack(padx=30, pady=20, fill="both", expand=True)
-
-        ctk.CTkLabel(form, text="Cadastrar Novo Usuário", font=("Aileron", 18, "bold"),
-                    text_color=("#001D39", "white")).pack(pady=(0, 15))
-
-        fields_frame = ctk.CTkFrame(form, fg_color="transparent")
-        fields_frame.pack(fill="x")
-        fields_frame.grid_columnconfigure(1, weight=1)
-
-        entries_u = {}
-        for i, (label, key) in enumerate([("Nome Completo", "nome"), ("Login", "login"), ("Senha", "senha")]):
-            ctk.CTkLabel(fields_frame, text=label + ":", font=("Aileron", 11)).grid(row=i, column=0, sticky="w", padx=5, pady=8)
-            show = "*" if key == "senha" else ""
-            e = ctk.CTkEntry(fields_frame, height=35, show=show)
-            e.grid(row=i, column=1, sticky="ew", padx=5, pady=8)
-            entries_u[key] = e
-
-        # Perfil
-        ctk.CTkLabel(fields_frame, text="Perfil:", font=("Aileron", 11)).grid(row=3, column=0, sticky="w", padx=5, pady=8)
-        perfil_var = ctk.StringVar(value="vendedor")
-        ctk.CTkOptionMenu(fields_frame, values=["admin", "gerente", "vendedor", "caixa"],
-                          variable=perfil_var, height=35).grid(row=3, column=1, sticky="ew", padx=5, pady=8)
-
-        # Loja
-        ctk.CTkLabel(fields_frame, text="Loja:", font=("Aileron", 11)).grid(row=4, column=0, sticky="w", padx=5, pady=8)
-        df_lojas = self.db.listar_lojas()
-        loja_nomes = ["Todas"] + df_lojas['nome'].tolist() if not df_lojas.empty else ["Todas"]
-        loja_var = ctk.StringVar(value="Todas")
-        ctk.CTkOptionMenu(fields_frame, values=loja_nomes, variable=loja_var, height=35).grid(
-            row=4, column=1, sticky="ew", padx=5, pady=8)
-
-        # Tabela de permissões
-        perm_frame = ctk.CTkFrame(form, fg_color=("white", "#2B2B2B"), corner_radius=10)
-        perm_frame.pack(fill="x", pady=10)
-        ctk.CTkLabel(perm_frame, text="Permissões por Perfil:", font=("Aileron", 11, "bold")).pack(padx=15, pady=(10, 5), anchor="w")
-
-        perm_text = (
-            "Admin: Acesso total\n"
-            "Gerente: Relatórios, configurações, vendas, estoque, financeiro\n"
-            "Vendedor: Vendas, produtos, clientes, kits, etiquetas, chat IA\n"
-            "Caixa: Vendas, caixa, clientes"
-        )
-        ctk.CTkLabel(perm_frame, text=perm_text, font=("Aileron", 10),
-                    text_color=("gray40", "gray70"), justify="left").pack(padx=15, pady=(0, 10), anchor="w")
-
-        def _criar_usuario():
-            nome = entries_u["nome"].get().strip()
-            login = entries_u["login"].get().strip()
-            senha = entries_u["senha"].get().strip()
-            if not nome or not login or not senha:
-                messagebox.showerror("Erro", "Preencha todos os campos.", parent=window)
-                return
-            if len(senha) < 4:
-                messagebox.showerror("Erro", "Senha deve ter 4+ caracteres.", parent=window)
-                return
-            perfil = perfil_var.get()
-
-            loja_id = None
-            if loja_var.get() != "Todas" and not df_lojas.empty:
-                match = df_lojas[df_lojas['nome'] == loja_var.get()]
-                if not match.empty:
-                    loja_id = int(match.iloc[0]['id'])
-
-            ok, msg = self.db.adicionar_usuario(nome, login, senha, perfil, loja_id)
-            if ok:
-                messagebox.showinfo("Sucesso", msg, parent=window)
-                for e in entries_u.values():
-                    e.delete(0, "end")
-                _refresh()
-            else:
-                messagebox.showerror("Erro", msg, parent=window)
-
-        ctk.CTkButton(form, text="Criar Usuário", height=42, fg_color="#7BBDE8", hover_color="#49769F",
-                     text_color="#001D39", font=("Aileron", 13, "bold"),
-                     command=_criar_usuario).pack(pady=10, fill="x")
+    try:
+        with open(report_path, "w", encoding="utf-8") as rf:
+            json.dump(report, rf, indent=2, ensure_ascii=False)
+    except Exception:
+        pass
+    return code
 
 
 if __name__ == '__main__':
+    if "--self-test" in sys.argv[1:]:
+        sys.exit(run_self_test())
+
     import atexit
     app = App()
+    crash_handler.install_crash_handlers(app=app, show_ui=True)
     
     def fechar_banco_atexit():
         try:

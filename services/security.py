@@ -95,3 +95,35 @@ def _verify_pbkdf2(password: str, stored_hash: str) -> bool:
         int(iterations_str)
     )
     return hmac.compare_digest(dk, expected)
+
+
+def validar_cpf(cpf: str) -> bool:
+    """Valida CPF pelos dígitos verificadores oficiais (Módulo 11)."""
+    digits = "".join(c for c in str(cpf or "") if c.isdigit())
+    if len(digits) != 11 or len(set(digits)) == 1:
+        return False
+    for i in range(9, 11):
+        soma = sum(int(digits[num]) * ((i + 1) - num) for num in range(i))
+        digito = ((soma * 10) % 11) % 10
+        if digito != int(digits[i]):
+            return False
+    return True
+
+
+def validar_cnpj(cnpj: str) -> bool:
+    """Valida CNPJ pelos dígitos verificadores oficiais (Módulo 11)."""
+    digits = "".join(c for c in str(cnpj or "") if c.isdigit())
+    if len(digits) != 14 or len(set(digits)) == 1:
+        return False
+    pesos_1 = [5, 4, 3, 2, 9, 8, 7, 6, 5, 4, 3, 2]
+    soma_1 = sum(int(digits[i]) * pesos_1[i] for i in range(12))
+    resto_1 = soma_1 % 11
+    dig_1 = 0 if resto_1 < 2 else 11 - resto_1
+    if int(digits[12]) != dig_1:
+        return False
+    pesos_2 = [6, 5, 4, 3, 2, 9, 8, 7, 6, 5, 4, 3, 2]
+    soma_2 = sum(int(digits[i]) * pesos_2[i] for i in range(13))
+    resto_2 = soma_2 % 11
+    dig_2 = 0 if resto_2 < 2 else 11 - resto_2
+    return int(digits[13]) == dig_2
+

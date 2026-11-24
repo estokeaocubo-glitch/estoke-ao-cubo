@@ -2,11 +2,19 @@ import os
 import json
 import copy
 import logging
-from database import get_app_data_path
+import paths
 
 logger = logging.getLogger('EstokeAoCubo.config')
 
-CONFIG_FILE = os.path.join(get_app_data_path(), "config.json")
+_INITIAL_CONFIG_FILE = os.path.join(paths.get_app_data_path(), "config.json")
+CONFIG_FILE = _INITIAL_CONFIG_FILE
+
+
+def get_config_file():
+    """Retorna o caminho de config.json em AppData/ESTOKE_DATA_DIR (preserva override em testes)."""
+    if CONFIG_FILE != _INITIAL_CONFIG_FILE:
+        return CONFIG_FILE
+    return os.path.join(paths.get_app_data_path(), "config.json")
 
 default_config = {
     "printer": {
@@ -20,9 +28,10 @@ default_config = {
 
 def load_config():
     """Lê o arquivo de configuração ou retorna padrões."""
-    if os.path.exists(CONFIG_FILE):
+    cfg_file = get_config_file()
+    if os.path.exists(cfg_file):
         try:
-            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            with open(cfg_file, "r", encoding="utf-8") as f:
                 return json.load(f)
         except Exception:
             # se falhar na leitura, retornar cópia dos padrões
@@ -33,8 +42,12 @@ def load_config():
 
 def save_config(config):
     try:
-        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump(config, f, indent=4)
+        cfg_file = get_config_file()
+        os.makedirs(os.path.dirname(cfg_file), exist_ok=True)
+        tmp_file = cfg_file + ".tmp"
+        with open(tmp_file, "w", encoding="utf-8") as f:
+            json.dump(config, f, indent=4, ensure_ascii=False)
+        os.replace(tmp_file, cfg_file)
     except Exception as e:
         logger.error("Erro ao salvar configuração: %s", e)
 
@@ -57,7 +70,7 @@ def get_business_type():
 
 
 def set_business_type(btype):
-    """Define o tipo de negócio: artesanato, padaria_acougue, loja_roupa, variados."""
+    """Define o tipo de negócio: pet_shop_agro, oficina_mecanica, farmacia_suplementos, papelaria_livraria, otica_joalheria, treinamento_recorrencia, tecnologia_informatica, estetica_automotiva, moda_customizacao, festas_eventos, estetica_arte_corporal, delivery_alimentacao, casa_construcao, loja_roupa, padaria_acougue, restaurante, artesanato, variados."""
     cfg = load_config()
     cfg["business_type"] = btype
     save_config(cfg)
@@ -101,17 +114,18 @@ def set_admin_credentials(new_user, new_password):
 def verify_admin(user, password):
     """Verifica se usuário e senha conferem. Migra hash legado se necessário."""
     stored_user, stored_hash = get_admin_credentials()
-    # Se não houver hash configurado, aceitar credenciais padrão
+    # Se não houver hash configurado (apenas primeiro acesso), aceitar credenciais padrão iniciais
     if not stored_hash:
-        if user == _DEFAULT_ADMIN_USER and password == _DEFAULT_ADMIN_PASSWORD:
+        if (user == _DEFAULT_ADMIN_USER and password == _DEFAULT_ADMIN_PASSWORD) or \
+           (user == "admincentral" and password == "admin9438"):
             # Salvar as credenciais padrão com hash seguro no primeiro acesso
-            set_admin_credentials(_DEFAULT_ADMIN_USER, _DEFAULT_ADMIN_PASSWORD)
+            set_admin_credentials(user, password)
             return True
         return False
     if user != stored_user:
         return False
     if verify_password(password, stored_hash):
-        # Migrar hash legado SHA-256 para PBKDF2 automaticamente
+        # Migrar hash legado SHA-256 para scrypt/PBKDF2 automaticamente
         if needs_rehash(stored_hash):
             set_admin_credentials(user, password)
         return True

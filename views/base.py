@@ -33,10 +33,12 @@ class BaseDialog(ctk.CTkToplevel):
         if topmost:
             self.attributes("-topmost", True)
         
-        # Herdar ícone do app
+        # Herdar ícone do app em alta definição (após timer de 200ms do CustomTkinter)
         try:
             if hasattr(app, '_icon_path_ico') and app._icon_path_ico:
                 self.after(50, lambda: self.iconbitmap(app._icon_path_ico))
+            if hasattr(app, '_aplicar_icone_win32_hd'):
+                self.after(250, lambda: app._aplicar_icone_win32_hd(self))
         except Exception:
             pass
         
