@@ -322,56 +322,8 @@ class App(ctk.CTk):
 
     def _get_os_config(self):
         """Retorna status, cores, ícones e rótulos de OS adaptados ao tipo de negócio."""
-        bt = getattr(self, 'business_type', None) or 'variados'
-        if bt == "restaurante":
-            statuses = ["Recebido", "Preparando", "Pronto", "Entregue", "Concluído"]
-            colors = {"Recebido": "#3498DB", "Preparando": "#F39C12", "Pronto": "#27AE60",
-                      "Entregue": "#2ECC71", "Concluído": "#28a745"}
-            icons = {"Recebido": "📥", "Preparando": "🍳", "Pronto": "✅",
-                     "Entregue": "🍽️", "Concluído": "🏁"}
-            title = "🍽️ PEDIDOS"
-            equip_label = "Prato / Pedido:"
-            equip_placeholder = "Ex: X-Burguer, Pizza Calabresa, Combo 1..."
-        elif bt == "padaria_acougue":
-            statuses = ["Recebido", "Em Preparo", "Pronto p/ Retirada", "Entregue", "Concluído"]
-            colors = {"Recebido": "#3498DB", "Em Preparo": "#F39C12", "Pronto p/ Retirada": "#27AE60",
-                      "Entregue": "#2ECC71", "Concluído": "#28a745"}
-            icons = {"Recebido": "📥", "Em Preparo": "🥩", "Pronto p/ Retirada": "✅",
-                     "Entregue": "📦", "Concluído": "🏁"}
-            title = "🥩 ENCOMENDAS"
-            equip_label = "Produto / Encomenda:"
-            equip_placeholder = "Ex: Bolo de Aniversário, 5kg Picanha, Pão Encomenda..."
-        elif bt == "loja_roupa":
-            statuses = ["Recebido", "Em Ajuste", "Pronto p/ Retirada", "Entregue", "Concluído"]
-            colors = {"Recebido": "#3498DB", "Em Ajuste": "#9B59B6", "Pronto p/ Retirada": "#27AE60",
-                      "Entregue": "#2ECC71", "Concluído": "#28a745"}
-            icons = {"Recebido": "📥", "Em Ajuste": "✂️", "Pronto p/ Retirada": "✅",
-                     "Entregue": "👗", "Concluído": "🏁"}
-            title = "✂️ AJUSTES / COSTURAS"
-            equip_label = "Peça / Item:"
-            equip_placeholder = "Ex: Vestido Longo, Calça Jeans (barra), Terno..."
-        elif bt == "artesanato":
-            statuses = ["Recebido", "Em Produção", "Acabamento", "Pronto", "Entregue", "Concluído"]
-            colors = {"Recebido": "#3498DB", "Em Produção": "#F39C12", "Acabamento": "#9B59B6",
-                      "Pronto": "#27AE60", "Entregue": "#2ECC71", "Concluído": "#28a745"}
-            icons = {"Recebido": "📥", "Em Produção": "🎨", "Acabamento": "✨",
-                     "Pronto": "✅", "Entregue": "📦", "Concluído": "🏁"}
-            title = "🎨 ENCOMENDAS"
-            equip_label = "Peça / Encomenda:"
-            equip_placeholder = "Ex: Quadro Personalizado, Vaso Cerâmica, Kit Presente..."
-        else:  # variados / assistência técnica
-            statuses = ["Recebido", "Em Análise", "Aguardando Peça", "Em Execução", "Pronto", "Entregue", "Concluído"]
-            colors = {"Recebido": "#3498DB", "Em Análise": "#F39C12", "Aguardando Peça": "#E67E22",
-                      "Em Execução": "#9B59B6", "Pronto": "#27AE60", "Entregue": "#2ECC71", "Concluído": "#28a745"}
-            icons = {"Recebido": "📥", "Em Análise": "🔍", "Aguardando Peça": "⏳",
-                     "Em Execução": "🔧", "Pronto": "✅", "Entregue": "📦", "Concluído": "🏁"}
-            title = "🔧 SERVIÇOS (OS)"
-            equip_label = "Equipamento / Item:"
-            equip_placeholder = "Ex: iPhone 14, Notebook Dell, Motor X..."
-        return {
-            "statuses": statuses, "colors": colors, "icons": icons,
-            "title": title, "equip_label": equip_label, "equip_placeholder": equip_placeholder,
-        }
+        from services.nicho_service import NichoService
+        return NichoService().get_os_config(getattr(self, 'business_type', None))
 
     def _show_first_access_screen(self):
         """Tela de primeiro acesso — escolha do tipo de negócio."""
@@ -403,44 +355,8 @@ class App(ctk.CTk):
         cards_frame = ctk.CTkScrollableFrame(inner, width=880, height=360, fg_color="transparent")
         cards_frame.pack(pady=(0, 10))
 
-        business_options = [
-            {"key": "pet_shop_agro", "title": "Pet Shop & Agro", "icon": "🐾",
-             "desc": "Produtos, ração a granel,\nbanho, tosa e agendamento", "color": "#27AE60"},
-            {"key": "oficina_mecanica", "title": "Oficina & Motopeças", "icon": "🔧",
-             "desc": "OS completa, mecânicos,\npeças e dados do veículo", "color": "#D35400"},
-            {"key": "farmacia_suplementos", "title": "Farmácia & Nutrição", "icon": "💊",
-             "desc": "Controle por lote e validade,\nalertas de vencimento", "color": "#16A085"},
-            {"key": "papelaria_livraria", "title": "Papelaria & Livraria", "icon": "📚",
-             "desc": "Alto volume de SKUs, ISBN,\nleitor rápido e código barras", "color": "#8E44AD"},
-            {"key": "otica_joalheria", "title": "Ótica & Joalheria", "icon": "👓",
-             "desc": "Alto valor, nº de série único,\ngarantias e receitas", "color": "#E67E22"},
-            {"key": "treinamento_recorrencia", "title": "Estúdios & Treino", "icon": "🥋",
-             "desc": "Mensalidades, turmas/alunos\ne vendas no balcão", "color": "#2980B9"},
-            {"key": "tecnologia_informatica", "title": "Tecnologia & TI", "icon": "💻",
-             "desc": "Manutenção, upgrades, hardware,\nservidores e assistência", "color": "#0088FF"},
-            {"key": "estetica_automotiva", "title": "Estética Automotiva", "icon": "🚗",
-             "desc": "Car detailing, polimento,\nhigienização e lavagem", "color": "#E74C3C"},
-            {"key": "moda_customizacao", "title": "Moda & Customização", "icon": "👗",
-             "desc": "Boutiques, ateliês, ajustes\nrápidos e peças sob medida", "color": "#9B59B6"},
-            {"key": "festas_eventos", "title": "Festas & Eventos", "icon": "🎉",
-             "desc": "Suprimentos, locação de itens,\ndecoração e pegue-monte", "color": "#F39C12"},
-            {"key": "estetica_arte_corporal", "title": "Arte Corporal & Estética", "icon": "✂️",
-             "desc": "Tatuagem, barbearias, salões\ne agendamentos digitais", "color": "#1ABC9C"},
-            {"key": "delivery_alimentacao", "title": "Delivery & Alimentação", "icon": "🍔",
-             "desc": "Lanches, doces, combos ágeis\ne automação via WhatsApp", "color": "#E67E22"},
-            {"key": "casa_construcao", "title": "Casa & Construção", "icon": "🔨",
-             "desc": "Ferragens, suprimentos do dia a dia\ne gestão para condomínios", "color": "#34495E"},
-            {"key": "loja_roupa", "title": "Loja de Roupas Geral", "icon": "👔",
-             "desc": "Tamanhos P/M/G/GG, calçados\ne controle de trocas", "color": "#7BBDE8"},
-            {"key": "padaria_acougue", "title": "Padaria & Açougue", "icon": "🥖",
-             "desc": "Venda por peso (kg/g),\nbalança e perecíveis", "color": "#D4A373"},
-            {"key": "restaurante", "title": "Restaurante & Bar", "icon": "🍽️",
-             "desc": "Mesas, comandas digitais,\ncozinha e garçons", "color": "#E07B56"},
-            {"key": "artesanato", "title": "Artesanato & Handmade", "icon": "🎨",
-             "desc": "Produtos manuais, insumos\ne cálculo de materiais", "color": "#E8A87C"},
-            {"key": "variados", "title": "Comércio Geral", "icon": "🏪",
-             "desc": "Mercados, conveniências,\nprodutos diversos", "color": "#85C1E9"},
-        ]
+        from services.nicho_service import NichoService
+        business_options = NichoService().listar_nichos()
 
         select_buttons = []
 
@@ -718,64 +634,10 @@ class App(ctk.CTk):
         self._sidebar_scroll.grid(row=1, column=0, sticky="nsew", padx=0, pady=0)
         self._sidebar_scroll.grid_columnconfigure(0, weight=1)
 
+        from services.nicho_service import NichoService
         self.sidebar_buttons = [
-            "SALDO", "GASTOS", "CAIXA", "KITS", "INVENTÁRIO", "COMPRAS", "CATEGORIAS", "FORNECEDORES",
-            "CLIENTES", "ANOTA TUDO", "VENDEDORES", "CONTAS PAGAR", "ETIQUETAS", "CONFIG", "CHAT IA"
+            item["texto"] for item in NichoService().get_sidebar_buttons(self.business_type)
         ]
-        
-        # Botões condicionais por tipo de negócio
-        if self.business_type == "pet_shop_agro":
-            self.sidebar_buttons.insert(2, "BANHO & TOSA")
-            self.sidebar_buttons.insert(3, "PETS & VACINAS")
-            self.sidebar_buttons.insert(4, "RAÇÃO A GRANEL")
-        if self.business_type == "oficina_mecanica":
-            self.sidebar_buttons.insert(2, "ORDEM SERVIÇO")
-            self.sidebar_buttons.insert(3, "MECÂNICOS")
-            self.sidebar_buttons.insert(4, "VEÍCULOS")
-            self.sidebar_buttons.insert(5, "ORÇAMENTOS")
-        if self.business_type == "farmacia_suplementos":
-            self.sidebar_buttons.insert(2, "LOTES & VALIDADE")
-            self.sidebar_buttons.insert(3, "VENCIMENTOS")
-        if self.business_type == "papelaria_livraria":
-            self.sidebar_buttons.insert(2, "LEITOR RÁPIDO")
-            self.sidebar_buttons.insert(3, "REPOSIÇÃO")
-        if self.business_type == "otica_joalheria":
-            self.sidebar_buttons.insert(2, "RECEITAS & GRAUS")
-            self.sidebar_buttons.insert(3, "Nº SÉRIE")
-            self.sidebar_buttons.insert(4, "GARANTIAS")
-        if self.business_type == "treinamento_recorrencia":
-            self.sidebar_buttons.insert(2, "MENSALIDADES")
-            self.sidebar_buttons.insert(3, "ALUNOS & TURMAS")
-        if self.business_type in ("padaria_acougue", "artesanato", "moda_customizacao", "delivery_alimentacao", "estetica_automotiva"):
-            self.sidebar_buttons.insert(2, "INSUMOS")
-            self.sidebar_buttons.insert(3, "PRODUÇÃO")
-        if self.business_type in ("loja_roupa", "moda_customizacao"):
-            self.sidebar_buttons.insert(2, "TROCAS")
-            if self.business_type == "moda_customizacao":
-                self.sidebar_buttons.insert(3, "AJUSTES / ATELIÊ")
-        if self.business_type == "variados":
-            self.sidebar_buttons.insert(2, "REPOSIÇÃO")
-        if self.business_type in ("restaurante", "delivery_alimentacao"):
-            self.sidebar_buttons.insert(2, "PEDIDOS / MESAS")
-            self.sidebar_buttons.insert(3, "COZINHA")
-            if self.business_type == "delivery_alimentacao":
-                self.sidebar_buttons.insert(4, "COMBOS")
-        if self.business_type == "tecnologia_informatica":
-            self.sidebar_buttons.insert(2, "ORDEM SERVIÇO")
-            self.sidebar_buttons.insert(3, "HARDWARE")
-            self.sidebar_buttons.insert(4, "GARANTIAS")
-        if self.business_type == "estetica_automotiva":
-            self.sidebar_buttons.insert(2, "AGENDAMENTOS")
-            self.sidebar_buttons.insert(3, "VEÍCULOS")
-        if self.business_type == "festas_eventos":
-            self.sidebar_buttons.insert(2, "LOCAÇÃO")
-            self.sidebar_buttons.insert(3, "RESERVAS")
-        if self.business_type == "estetica_arte_corporal":
-            self.sidebar_buttons.insert(2, "AGENDAMENTOS")
-            self.sidebar_buttons.insert(3, "PROFISSIONAIS")
-        if self.business_type == "casa_construcao":
-            self.sidebar_buttons.insert(2, "ORÇAMENTOS")
-            self.sidebar_buttons.insert(3, "CONDOMÍNIOS")
         
         for i, btn_text in enumerate(self.sidebar_buttons):
             btn = ctk.CTkButton(self._sidebar_scroll, text=btn_text, height=44, corner_radius=30,
@@ -1775,64 +1637,44 @@ class App(ctk.CTk):
         if not self._tem_permissao(btn_text):
             messagebox.showwarning("Acesso Negado", f"Seu perfil não tem permissão para '{btn_text}'.")
             return
-        if btn_text == "GASTOS":
-            self.open_gastos_dialog()
-        elif btn_text == "KITS":
-            self.open_kit_manager()
-        elif btn_text == "INVENTÁRIO":
-            self.open_inventario_dialog()
-        elif btn_text == "COMPRAS":
-            self.open_sugestao_compras_dialog()
-        elif btn_text == "CHAT IA":
-            self.open_chat_ai()
-        elif btn_text == "SALDO":
-            self.open_saldo_dialog()
-        elif btn_text == "CAIXA":
-            self.open_caixa_dialog()
-        elif btn_text == "CATEGORIAS":
-            self.open_categorias_manager()
-        elif btn_text == "FORNECEDORES":
-            self.open_generic_manager("Fornecedores", self.db.listar_fornecedores, self.db.adicionar_fornecedor, self.db.remover_fornecedor, ["Nome", "Contato", "Produto Fornecido"])
-        elif btn_text == "CLIENTES":
-            self.open_clientes_manager()
-        elif btn_text == "ANOTA TUDO":
-            self.open_anota_tudo_dialog()
-        elif btn_text == "VENDEDORES":
-            self.open_vendedores_dialog()
-        elif btn_text == "CONFIG":
-            self._ask_admin_login(self.open_config_dialog)
-        elif btn_text == "INSUMOS":
-            self.open_insumos_manager()
-        elif btn_text == "PRODUÇÃO":
-            self.open_producao_dialog()
-        elif btn_text == "TROCAS":
-            self.open_trocas_dialog()
-        elif btn_text == "REPOSIÇÃO":
-            self.open_lista_reposicao()
-        elif btn_text == "MESAS":
-            self.open_mesas_manager()
-        elif btn_text == "COMANDAS":
-            self.open_comandas_dialog()
-        elif btn_text == "COZINHA":
-            self.open_cozinha_dialog()
-        elif btn_text == "CONTAS PAGAR":
-            self.open_contas_pagar_dialog()
-        elif btn_text == "ETIQUETAS":
-            self.open_etiquetas_dialog()
-        elif btn_text in ("ORDEM SERVIÇO", "AJUSTES / ATELIÊ", "BANHO & TOSA"):
-            self.open_servico_dialog()
-        elif btn_text in ("HARDWARE", "RAÇÃO A GRANEL", "MEDICAMENTOS"):
-            self.open_insumos_manager()
-        elif btn_text in ("GARANTIAS", "TROCAS", "Nº SÉRIE"):
-            self.open_trocas_dialog()
-        elif btn_text in ("AGENDAMENTOS", "RESERVAS", "LOCAÇÃO", "ORÇAMENTOS", "LOTES & VALIDADE", "VENCIMENTOS"):
-            self.open_anota_tudo_dialog()
-        elif btn_text in ("VEÍCULOS", "CONDOMÍNIOS", "PROFISSIONAIS", "PETS & VACINAS", "MECÂNICOS", "RECEITAS & GRAUS", "ALUNOS & TURMAS", "MENSALIDADES"):
-            self.open_clientes_manager()
-        elif btn_text in ("COMBOS", "PEDIDOS / MESAS"):
-            self.open_mesas_manager()
-        elif btn_text == "LEITOR RÁPIDO":
-            self.open_sell_product_dialog()
+        from services.nicho_service import NichoService
+        try:
+            acao = NichoService().acao_do_botao(btn_text)
+        except ValueError:
+            return
+
+        dispatch = {
+            "gastos_dialog": self.open_gastos_dialog,
+            "kit_manager": self.open_kit_manager,
+            "inventario_dialog": self.open_inventario_dialog,
+            "sugestao_compras_dialog": self.open_sugestao_compras_dialog,
+            "chat_ai": self.open_chat_ai,
+            "saldo_dialog": self.open_saldo_dialog,
+            "caixa_dialog": self.open_caixa_dialog,
+            "categorias_manager": self.open_categorias_manager,
+            "fornecedores_manager": lambda: self.open_generic_manager(
+                "Fornecedores", self.db.listar_fornecedores, self.db.adicionar_fornecedor,
+                self.db.remover_fornecedor, ["Nome", "Contato", "Produto Fornecido"]
+            ),
+            "clientes_manager": self.open_clientes_manager,
+            "anota_tudo_dialog": self.open_anota_tudo_dialog,
+            "vendedores_dialog": self.open_vendedores_dialog,
+            "config_dialog": lambda: self._ask_admin_login(self.open_config_dialog),
+            "insumos_manager": self.open_insumos_manager,
+            "producao_dialog": self.open_producao_dialog,
+            "trocas_dialog": self.open_trocas_dialog,
+            "lista_reposicao": self.open_lista_reposicao,
+            "mesas_manager": self.open_mesas_manager,
+            "comandas_dialog": self.open_comandas_dialog,
+            "cozinha_dialog": self.open_cozinha_dialog,
+            "contas_pagar_dialog": self.open_contas_pagar_dialog,
+            "etiquetas_dialog": self.open_etiquetas_dialog,
+            "servico_dialog": self.open_servico_dialog,
+            "sell_product_dialog": self.open_sell_product_dialog,
+        }
+        handler = dispatch.get(acao)
+        if handler:
+            handler()
 
     def topbar_event(self, btn_text):
         if not self.current_user:
@@ -2631,28 +2473,24 @@ class App(ctk.CTk):
         lbl_detalhes_calc.pack(pady=5)
 
         def calcular_margem():
+            from services.precificacao_service import PrecificacaoService
             try:
-                custo = float(e_custo_calc.get().replace(",", "."))
-                venda = float(e_venda_calc.get().replace(",", "."))
-                if custo <= 0:
-                    lbl_resultado_calc.configure(text="Custo deve ser > 0", text_color="#FF6B6B")
-                    return
-                lucro = venda - custo
-                margem_pct = (lucro / custo) * 100
-                markup = (lucro / venda) * 100 if venda > 0 else 0
-
-                cor = "#28a745" if lucro > 0 else "#FF6B6B"
+                res = PrecificacaoService().calcular_margem(e_custo_calc.get(), e_venda_calc.get())
+                # Preserva rótulos históricos desta calculadora (bug de rótulos invertidos sinalizado no Lote 2)
+                cor = "#28a745" if res["lucro"] > 0 else "#FF6B6B"
                 lbl_resultado_calc.configure(
-                    text=f"Lucro: R$ {lucro:.2f}  |  Margem: {margem_pct:.1f}%",
+                    text=f"Lucro: R$ {res['lucro']:.2f}  |  Margem: {res['markup_pct']:.1f}%",
                     text_color=cor
                 )
                 lbl_detalhes_calc.configure(
-                    text=f"Markup sobre venda: {markup:.1f}%\n"
-                         f"Para cada R$ 1,00 investido, retorna R$ {venda/custo:.2f}" if custo > 0 else ""
+                    text=f"Markup sobre venda: {res['margem_pct']:.1f}%\n"
+                         f"Para cada R$ 1,00 investido, retorna R$ {res['retorno_por_real']:.2f}"
                 )
-            except ValueError:
-                lbl_resultado_calc.configure(text="Valores inválidos!", text_color="#FF6B6B")
-                lbl_detalhes_calc.configure(text="")
+            except ValueError as err:
+                msg = str(err) if "Custo deve ser > 0" in str(err) else "Valores inválidos!"
+                lbl_resultado_calc.configure(text=msg, text_color="#FF6B6B")
+                if msg == "Valores inválidos!":
+                    lbl_detalhes_calc.configure(text="")
 
         ctk.CTkButton(calc_frame, text="CALCULAR MARGEM DE LUCRO", command=calcular_margem,
                       fg_color="#0A4174", hover_color="#062F56", text_color="white",
@@ -4397,23 +4235,17 @@ class App(ctk.CTk):
         lbl_live_margin.pack(padx=15, pady=(0, 5), anchor="w")
 
         def _calcular_margem_live(*args):
+            from services.precificacao_service import PrecificacaoService
+            custo_v = e_preco_compra.get().strip()
+            venda_v = e_preco.get().strip()
+            if not custo_v or not venda_v:
+                lbl_live_margin.configure(text="")
+                return
             try:
-                custo_v = e_preco_compra.get().strip().replace(",", ".")
-                venda_v = e_preco.get().strip().replace(",", ".")
-                if not custo_v or not venda_v:
-                    lbl_live_margin.configure(text="")
-                    return
-                custo_f = float(custo_v)
-                venda_f = float(venda_v)
-                if custo_f <= 0:
-                    lbl_live_margin.configure(text="")
-                    return
-                lucro = venda_f - custo_f
-                margem_pct = (lucro / venda_f) * 100 if venda_f > 0 else 0
-                markup_pct = (lucro / custo_f) * 100
-                cor = "#28a745" if lucro >= 0 else "#FF6B6B"
+                res = PrecificacaoService().calcular_margem(custo_v, venda_v)
+                cor = "#28a745" if res["lucro"] >= 0 else "#FF6B6B"
                 lbl_live_margin.configure(
-                    text=f"💰 Lucro: R$ {lucro:.2f}  |  Margem: {margem_pct:.1f}%  |  Markup: {markup_pct:.1f}%",
+                    text=f"💰 Lucro: R$ {res['lucro']:.2f}  |  Margem: {res['margem_pct']:.1f}%  |  Markup: {res['markup_pct']:.1f}%",
                     text_color=cor
                 )
             except ValueError:
@@ -4607,22 +4439,24 @@ class App(ctk.CTk):
             adv_entries[key] = e
 
         def calcular_sugestao():
+            from services.precificacao_service import PrecificacaoService
             try:
-                custo = float(e_preco_compra.get().replace(",", "."))
-                horas = float(adv_entries["horas"].get().replace(",", "."))
-                v_hora = float(adv_entries["v_hora"].get().replace(",", "."))
                 margem = float(adv_entries["margem"].get().replace(",", ".")) / 100.0
                 risco = float(adv_entries["risco"].get().replace(",", ".")) / 100.0
-                raridade = 1.0
-                
-                engine = ai_module.PricingEngine()
-                res = engine.calcular_preco_etico(custo, horas, v_hora, margem, risco, raridade)
-                
+                res = PrecificacaoService().sugerir_preco(
+                    custo_material=e_preco_compra.get(),
+                    horas_trabalho=adv_entries["horas"].get(),
+                    valor_hora=adv_entries["v_hora"].get(),
+                    margem_lucro=margem,
+                    fator_risco=risco,
+                    fator_raridade=1.0,
+                )
+
                 e_preco.delete(0, "end")
                 e_preco.insert(0, f"{res['preco_sugerido']:.2f}")
                 _calcular_margem_live()
-                
-                messagebox.showinfo("Cálculo Detalhado", 
+
+                messagebox.showinfo("Cálculo Detalhado",
                                 f"Preço Sugerido: R$ {res['preco_sugerido']:.2f}\n\n"
                                 f"Custo Base: R$ {res['custo_base']:.2f}\n"
                                 f"Fórmula: {res['detalhes']}", parent=dialog)
@@ -7752,50 +7586,44 @@ class App(ctk.CTk):
         e_custo.bind("<KeyRelease>", _atualizar_lucro)
 
         def _registrar_servico():
-            descricao = e_descricao.get("1.0", "end-1c").strip()
-            if not descricao:
-                messagebox.showerror("Erro", "Descreva o serviço realizado.", parent=dialog)
-                return
+            from services.servico_service import ServicoService
+            svc = ServicoService(self.db, invoice_gen=invoice_generator)
             try:
-                valor = float(e_valor.get().replace(",", "."))
-                if valor <= 0:
-                    raise ValueError
-            except ValueError:
-                messagebox.showerror("Erro", "Valor inválido.", parent=dialog)
-                return
-            try:
-                custo = float(e_custo.get().replace(",", ".")) if e_custo.get().strip() else 0
-            except ValueError:
-                custo = 0
-
-            cliente = combo_cliente.get()
-            forma = combo_forma.get()
-            obs = e_obs.get().strip()
-            contato = e_contato.get().strip()
-            vendedor_serv = combo_vendedor_serv.get().strip()
-            equipamento = e_equip.get().strip()
-            status_os = combo_status_os.get()
-
-            ok, result = self.db.registrar_servico(cliente, descricao, valor, custo, forma, obs, vendedor=vendedor_serv,
-                                                    status_os=status_os, contato_cliente=contato, equipamento=equipamento)
-            if not ok:
-                messagebox.showerror("Erro", f"Erro ao registrar: {result}", parent=dialog)
-                return
-
-            servico_id = result
-
-            # Gerar nota de serviço (SEM custo — custo é interno)
-            try:
-                config_nota = self.db.get_config_nota()
-                dados_cliente = {"nome": cliente}
-                if contato:
-                    dados_cliente["contato"] = contato
-
-                file_path, text_content, wpp_content = invoice_generator.gerar_nota_servico(
-                    descricao, valor, dados_cliente, id_servico=servico_id,
-                    forma_pagamento=forma, observacao=obs,
-                    abrir_arquivo=False, config_nota=config_nota
+                os_data = svc.registrar_os(
+                    cliente=combo_cliente.get(),
+                    descricao=e_descricao.get("1.0", "end-1c"),
+                    valor=e_valor.get(),
+                    custo=e_custo.get(),
+                    forma_pagamento=combo_forma.get(),
+                    observacao=e_obs.get(),
+                    vendedor=combo_vendedor_serv.get(),
+                    status_os=combo_status_os.get(),
+                    contato_cliente=e_contato.get(),
+                    equipamento=e_equip.get(),
                 )
+            except (ValueError, RuntimeError) as err:
+                messagebox.showerror("Erro", str(err), parent=dialog)
+                return
+
+            servico_id = os_data["servico_id"]
+            valor = os_data["valor"]
+            contato = os_data["contato_cliente"]
+
+            # Gerar nota de serviço via ServicoService (SEM custo — custo é interno)
+            try:
+                nota = svc.gerar_nota_os(
+                    servico_id=servico_id,
+                    descricao=os_data["descricao"],
+                    valor=valor,
+                    cliente=os_data["cliente"],
+                    contato=contato,
+                    forma_pagamento=os_data["forma_pagamento"],
+                    observacao=os_data["observacao"],
+                    abrir_arquivo=False,
+                )
+                file_path = nota["file_path"]
+                text_content = nota["text_content"]
+                wpp_content = nota["wpp_content"]
 
                 if file_path and text_content:
                     resp = messagebox.askyesno("Imprimir Nota",
@@ -7803,14 +7631,7 @@ class App(ctk.CTk):
                         parent=dialog)
                     if resp:
                         try:
-                            printer = get_printer()
-                            logo_path = None
-                            logo_file = config_nota.get('empresa_logo', '')
-                            if logo_file:
-                                logo_path = os.path.join(self.db.data_dir, "product_images", logo_file)
-                                if not os.path.isfile(logo_path):
-                                    logo_path = None
-                            printer.print_text(text_content, logo_path=logo_path)
+                            get_printer().print_text(text_content, logo_path=nota["logo_path"])
                             messagebox.showinfo("Sucesso", "Nota enviada para impressão!", parent=dialog)
                         except Exception as e:
                             logger.warning("Erro ao imprimir nota de serviço: %s", e)
@@ -7828,9 +7649,17 @@ class App(ctk.CTk):
                             f"Enviar nota por WhatsApp para {contato}?", parent=dialog)
                         if enviar_wpp:
                             try:
+                                msg_wpp = svc.montar_mensagem_whatsapp_os(
+                                    wpp_content=wpp_content,
+                                    text_content=text_content,
+                                    servico_id=servico_id,
+                                    descricao=os_data["descricao"],
+                                    valor=valor,
+                                    cliente=os_data["cliente"],
+                                )
                                 sucesso, info_env = self._enviar_whatsapp_resiliente(
                                     contato,
-                                    wpp_content or text_content,
+                                    msg_wpp,
                                     metadata={"origem": "recibo_servico", "servico_id": servico_id},
                                 )
                                 if sucesso:
@@ -8005,9 +7834,8 @@ class App(ctk.CTk):
                     btn_f = ctk.CTkFrame(f, fg_color="transparent")
                     btn_f.pack(fill="x", padx=15, pady=(0, 6))
                     def _change_status(s_id=sid, current=st):
-                        idx = status_os_all.index(current) if current in status_os_all else 0
-                        next_st = status_os_all[min(idx + 1, len(status_os_all) - 1)]
-                        self.db.atualizar_status_servico(s_id, next_st)
+                        from services.servico_service import ServicoService
+                        ServicoService(self.db).avancar_status(s_id, current, status_os_all)
                         _refresh_hist()
                     ctk.CTkButton(btn_f, text=f"Avançar Status →", height=24, font=("Aileron", 10),
                                   fg_color=cor_st, hover_color="#333", text_color="white",
@@ -8533,21 +8361,21 @@ class App(ctk.CTk):
         e_desc.bind("<KeyRelease>", _recalc)
 
         def _confirmar():
-            taxa = taxa_10 if var_taxa.get() else 0
+            from services.servico_service import ServicoService
             try:
-                desc = float(e_desc.get().replace(",", "."))
-            except ValueError:
-                desc = 0
-            pgto = var_pgto.get()
-            obs = e_obs.get().strip()
-            ok, msg = self.db.fechar_comanda(comanda_id, pgto, taxa, desc, obs)
-            if ok:
-                messagebox.showinfo("Sucesso", msg, parent=dialog)
+                res = ServicoService(self.db).fechar_comanda(
+                    comanda_id=comanda_id,
+                    forma_pagamento=var_pgto.get(),
+                    aplicar_taxa_10=bool(var_taxa.get()),
+                    desconto=e_desc.get(),
+                    observacao=e_obs.get(),
+                )
+                messagebox.showinfo("Sucesso", res["mensagem"], parent=dialog)
                 dialog.destroy()
                 if hasattr(self, '_refresh_mesas'):
                     self._refresh_mesas()
-            else:
-                messagebox.showerror("Erro", msg, parent=dialog)
+            except (ValueError, RuntimeError) as err:
+                messagebox.showerror("Erro", str(err), parent=dialog)
 
         ctk.CTkButton(frame, text="CONFIRMAR FECHAMENTO", height=40, fg_color="#28a745",
                       hover_color="#218838", text_color="white", font=("Aileron", 13, "bold"),
@@ -8583,15 +8411,12 @@ class App(ctk.CTk):
         lbl_result.pack(pady=15)
 
         def _calc(*_):
+            from services.servico_service import ServicoService
             try:
-                n = int(e_pessoas.get())
-                if n < 1:
-                    n = 1
-            except ValueError:
-                n = 1
-            resultado = self.db.dividir_conta(comanda_id, n)
-            if resultado:
+                resultado = ServicoService(self.db).dividir_conta(comanda_id, e_pessoas.get())
                 lbl_result.configure(text=f"R$ {resultado['valor_por_pessoa']:.2f} por pessoa")
+            except ValueError:
+                pass
 
         e_pessoas.bind("<KeyRelease>", _calc)
         _calc()
