@@ -5196,7 +5196,22 @@ class Database:
     # ============================================================
 
     def gerar_dre(self, periodo="mes", loja_id=None):
-        """Gera Demonstrativo de Resultado do Exercício simplificado (incluindo vendas do dia atual com timestamp)."""
+        """
+        Gera Demonstrativo de Resultado do Exercício simplificado com somas em Decimal
+        (ROUND_HALF_UP na saída), comparação de datas via date() (incluindo 1º e último dia)
+        e filtro opcional por loja_id.
+
+        Decisão (b): pagar_conta() já gera lançamento em gastos; portanto contas_pagas é
+        retornado apenas como campo informativo (contas_pagas_informativo=True), sem dupla dedução.
+        """
+        from decimal import Decimal, ROUND_HALF_UP
+
+        def _dec(val):
+            return Decimal(str(val or 0))
+
+        def _round2(val_dec):
+            return float(val_dec.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
         hoje = datetime.date.today()
         if periodo == "mes":
             inicio = hoje.replace(day=1).isoformat()
@@ -5212,112 +5227,142 @@ class Database:
             inicio = hoje.replace(day=1).isoformat()
             fim = hoje.isoformat()
 
-        fim_ts = fim + "T23:59:59.999999"
         cursor = self.conn.cursor()
 
         loja_clause = " AND (loja_id = ? OR loja_id IS NULL)" if loja_id is not None else ""
-        params_ts = (inicio, fim_ts, loja_id) if loja_id is not None else (inicio, fim_ts)
         params_dt = (inicio, fim, loja_id) if loja_id is not None else (inicio, fim)
 
-        # Receita Bruta (vendas + serviços)
+        # Receita Bruta (vendas + serviços) comparando datas via date()
         cursor.execute(
-            f"SELECT COALESCE(SUM(valor_total), 0) FROM vendas WHERE status='Concluída' AND data_venda >= ? AND data_venda <= ?{loja_clause}",
-            params_ts
+            f"SELECT COALESCE(SUM(valor_total), 0) FROM vendas WHERE status='Concluída' AND date(data_venda) BETWEEN date(?) AND date(?){loja_clause}",
+            params_dt
         )
-        receita_vendas = round(float(cursor.fetchone()[0] or 0.0), 2)
+        receita_vendas_d = _dec(cursor.fetchone()[0])
 
         cursor.execute(
-            f"SELECT COALESCE(SUM(valor), 0) FROM servicos WHERE data >= ? AND data <= ?{loja_clause}",
-            params_ts
+            f"SELECT COALESCE(SUM(valor), 0) FROM servicos WHERE date(data) BETWEEN date(?) AND date(?){loja_clause}",
+            params_dt
         )
-        receita_servicos = round(float(cursor.fetchone()[0] or 0.0), 2)
+        receita_servicos_d = _dec(cursor.fetchone()[0])
 
-        receita_bruta = round(receita_vendas + receita_servicos, 2)
+        receita_bruta_d = receita_vendas_d + receita_servicos_d
 
         # Deduções (descontos dados)
         cursor.execute(
-            f"SELECT COALESCE(SUM(desconto), 0) FROM vendas WHERE status='Concluída' AND data_venda >= ? AND data_venda <= ?{loja_clause}",
-            params_ts
+            f"SELECT COALESCE(SUM(desconto), 0) FROM vendas WHERE status='Concluída' AND date(data_venda) BETWEEN date(?) AND date(?){loja_clause}",
+            params_dt
         )
-        deducoes = round(float(cursor.fetchone()[0] or 0.0), 2)
+        deducoes_d = _dec(cursor.fetchone()[0])
 
-        receita_liquida = round(receita_bruta - deducoes, 2)
+        receita_liquida_d = receita_bruta_d - deducoes_d
 
         # CMV (custo das mercadorias vendidas = valor_liquido - lucro; custo dos serviços)
         cursor.execute(
-            f"SELECT COALESCE(SUM((valor_total - COALESCE(desconto, 0)) - lucro), 0) FROM vendas WHERE status='Concluída' AND data_venda >= ? AND data_venda <= ?{loja_clause}",
-            params_ts
+            f"SELECT COALESCE(SUM((valor_total - COALESCE(desconto, 0)) - lucro), 0) FROM vendas WHERE status='Concluída' AND date(data_venda) BETWEEN date(?) AND date(?){loja_clause}",
+            params_dt
         )
-        cmv = round(float(cursor.fetchone()[0] or 0.0), 2)
+        cmv_d = _dec(cursor.fetchone()[0])
 
         cursor.execute(
-            f"SELECT COALESCE(SUM(custo), 0) FROM servicos WHERE data >= ? AND data <= ?{loja_clause}",
-            params_ts
+            f"SELECT COALESCE(SUM(custo), 0) FROM servicos WHERE date(data) BETWEEN date(?) AND date(?){loja_clause}",
+            params_dt
         )
-        custo_servicos = round(float(cursor.fetchone()[0] or 0.0), 2)
+        custo_servicos_d = _dec(cursor.fetchone()[0])
 
-        custo_total = round(cmv + custo_servicos, 2)
-        lucro_bruto = round(receita_liquida - custo_total, 2)
+        custo_total_d = cmv_d + custo_servicos_d
+        lucro_bruto_d = receita_liquida_d - custo_total_d
 
         # Despesas Operacionais (gastos fixos + variáveis)
         cursor.execute(
-            f"SELECT COALESCE(SUM(valor), 0) FROM gastos WHERE data >= ? AND data <= ? AND tipo='Fixo'{loja_clause}",
+            f"SELECT COALESCE(SUM(valor), 0) FROM gastos WHERE date(data) BETWEEN date(?) AND date(?) AND tipo='Fixo'{loja_clause}",
             params_dt
         )
-        despesas_fixas = round(float(cursor.fetchone()[0] or 0.0), 2)
+        despesas_fixas_d = _dec(cursor.fetchone()[0])
 
         cursor.execute(
-            f"SELECT COALESCE(SUM(valor), 0) FROM gastos WHERE data >= ? AND data <= ? AND tipo != 'Fixo'{loja_clause}",
+            f"SELECT COALESCE(SUM(valor), 0) FROM gastos WHERE date(data) BETWEEN date(?) AND date(?) AND tipo != 'Fixo'{loja_clause}",
             params_dt
         )
-        despesas_variaveis = round(float(cursor.fetchone()[0] or 0.0), 2)
+        despesas_variaveis_d = _dec(cursor.fetchone()[0])
 
-        despesas_total = round(despesas_fixas + despesas_variaveis, 2)
-        resultado_operacional = round(lucro_bruto - despesas_total, 2)
+        despesas_total_d = despesas_fixas_d + despesas_variaveis_d
+        resultado_operacional_d = lucro_bruto_d - despesas_total_d
 
-        # Contas a pagar pagas no período
-        cursor.execute("SELECT COALESCE(SUM(valor), 0) FROM contas_pagar WHERE status='Pago' AND data_pagamento >= ? AND data_pagamento <= ?",
-                      (inicio, fim))
-        contas_pagas = round(float(cursor.fetchone()[0] or 0.0), 2)
+        # Contas a pagar pagas no período (informativo — pagar_conta já lança em gastos)
+        cursor.execute(
+            "SELECT COALESCE(SUM(valor), 0) FROM contas_pagar WHERE status='Pago' AND date(data_pagamento) BETWEEN date(?) AND date(?)",
+            (inicio, fim)
+        )
+        contas_pagas_d = _dec(cursor.fetchone()[0])
 
-        resultado_liquido = resultado_operacional
+        resultado_liquido_d = resultado_operacional_d
+
+        margem_bruta = (
+            _round2((lucro_bruto_d / receita_liquida_d) * Decimal(100))
+            if receita_liquida_d > 0
+            else 0.0
+        )
+        margem_liquida = (
+            _round2((resultado_liquido_d / receita_liquida_d) * Decimal(100))
+            if receita_liquida_d > 0
+            else 0.0
+        )
 
         return {
             "periodo": periodo,
             "inicio": inicio,
             "fim": fim,
-            "receita_vendas": receita_vendas,
-            "receita_servicos": receita_servicos,
-            "receita_bruta": receita_bruta,
-            "deducoes": deducoes,
-            "receita_liquida": receita_liquida,
-            "cmv": cmv,
-            "custo_servicos": custo_servicos,
-            "custo_total": custo_total,
-            "lucro_bruto": lucro_bruto,
-            "despesas_fixas": despesas_fixas,
-            "despesas_variaveis": despesas_variaveis,
-            "despesas_total": despesas_total,
-            "resultado_operacional": resultado_operacional,
-            "contas_pagas": contas_pagas,
-            "resultado_liquido": resultado_liquido,
-            "margem_bruta": round((lucro_bruto / receita_liquida * 100), 2) if receita_liquida > 0 else 0,
-            "margem_liquida": round((resultado_liquido / receita_liquida * 100), 2) if receita_liquida > 0 else 0,
+            "receita_vendas": _round2(receita_vendas_d),
+            "receita_servicos": _round2(receita_servicos_d),
+            "receita_bruta": _round2(receita_bruta_d),
+            "deducoes": _round2(deducoes_d),
+            "receita_liquida": _round2(receita_liquida_d),
+            "cmv": _round2(cmv_d),
+            "custo_servicos": _round2(custo_servicos_d),
+            "custo_total": _round2(custo_total_d),
+            "lucro_bruto": _round2(lucro_bruto_d),
+            "despesas_fixas": _round2(despesas_fixas_d),
+            "despesas_variaveis": _round2(despesas_variaveis_d),
+            "despesas_total": _round2(despesas_total_d),
+            "resultado_operacional": _round2(resultado_operacional_d),
+            "contas_pagas": _round2(contas_pagas_d),
+            "contas_pagas_informativo": True,
+            "resultado_liquido": _round2(resultado_liquido_d),
+            "margem_bruta": margem_bruta,
+            "margem_liquida": margem_liquida,
         }
 
     # ============================================================
     # ============ FLUXO DE CAIXA FUTURO ============
     # ============================================================
 
-    def projetar_fluxo_caixa(self, dias=90):
-        """Projeta fluxo de caixa futuro baseado em recorrências e IA."""
+    def projetar_fluxo_caixa(self, dias=90, loja_id=None):
+        """
+        Projeta fluxo de caixa futuro com:
+        - gastos fixos deduplicados deterministicamente pelo lançamento mais recente de cada descrição,
+          projetados por mês civil (mesmo dia ou último dia do mês);
+        - média diária = soma das vendas da janela de 30 dias / 30 (incluindo dias sem venda);
+        - saldo acumulado em Decimal (arredondado só na saída com ROUND_HALF_UP);
+        - filtro opcional por loja_id.
+        """
+        import calendar
+        from decimal import Decimal, ROUND_HALF_UP
+
+        def _dec(val):
+            return Decimal(str(val or 0))
+
+        def _round2(val_dec):
+            return float(val_dec.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
         hoje = datetime.date.today()
+        data_limite = hoje + datetime.timedelta(days=dias)
+        data_limite_iso = data_limite.isoformat()
         projecao = []
 
-        # Saldo atual
-        saldo_atual = self.get_saldo_atual()
+        # Saldo atual (filtrado por loja quando informado)
+        saldo_atual_d = _dec(self.get_saldo_atual(loja_id=loja_id))
 
-        # 1. Contas a pagar pendentes (saídas programadas)
+        # 1. Contas a pagar pendentes (saídas programadas; tabela global)
         df_contas = self.listar_contas_pagar(status='Pendente', dias_futuros=dias)
         if not df_contas.empty:
             for _, row in df_contas.iterrows():
@@ -5325,69 +5370,122 @@ class Database:
                     "data": row['data_vencimento'],
                     "tipo": "saida",
                     "descricao": f"Conta: {row['descricao']}",
-                    "valor": -row['valor'],
+                    "_valor_dec": -_dec(row['valor']),
                 })
 
-        # 2. Gastos fixos recorrentes (projetar meses futuros)
+        # 2. Gastos fixos recorrentes: deduplicação determinística (mais recente por descrição) + mês civil
         cursor = self.conn.cursor()
-        cursor.execute("SELECT descricao, valor FROM gastos WHERE tipo='Fixo' GROUP BY descricao ORDER BY data DESC")
-        gastos_fixos = cursor.fetchall()
-        for desc, valor in gastos_fixos:
-            for mes_offset in range(1, (dias // 30) + 1):
-                data_proj = (hoje + datetime.timedelta(days=30 * mes_offset)).isoformat()
-                if data_proj <= (hoje + datetime.timedelta(days=dias)).isoformat():
+        loja_clause = " AND (loja_id = ? OR loja_id IS NULL)" if loja_id is not None else ""
+        params_loja = (loja_id,) if loja_id is not None else ()
+        cursor.execute(
+            f"SELECT id, descricao, valor, data FROM gastos WHERE tipo='Fixo'{loja_clause} ORDER BY date(data) DESC, id DESC",
+            params_loja,
+        )
+        gastos_fixos_recentes = {}
+        for _gid, desc, valor, data_gasto in cursor.fetchall():
+            if desc not in gastos_fixos_recentes:
+                gastos_fixos_recentes[desc] = (_dec(valor), str(data_gasto or ""))
+
+        for desc, (valor_d, data_ref_str) in gastos_fixos_recentes.items():
+            try:
+                dia_base = datetime.date.fromisoformat(data_ref_str[:10]).day
+            except ValueError:
+                dia_base = hoje.day
+
+            mes_offset = 0
+            while True:
+                total_meses = (hoje.year * 12 + (hoje.month - 1)) + mes_offset
+                ano_alvo, mes_idx = divmod(total_meses, 12)
+                mes_alvo = mes_idx + 1
+                ultimo_dia = calendar.monthrange(ano_alvo, mes_alvo)[1]
+                data_proj_dt = datetime.date(ano_alvo, mes_alvo, min(dia_base, ultimo_dia))
+                if data_proj_dt > data_limite:
+                    break
+                if data_proj_dt > hoje:
                     projecao.append({
-                        "data": data_proj,
+                        "data": data_proj_dt.isoformat(),
                         "tipo": "saida_fixa",
                         "descricao": f"Fixo: {desc}",
-                        "valor": -valor,
+                        "_valor_dec": -valor_d,
                     })
+                mes_offset += 1
 
-        # 3. Fiados a receber
+        # 3. Fiados a receber (tabela global)
         df_fiados = self.listar_fiados(status='Pendente')
         if not df_fiados.empty:
             for _, row in df_fiados.iterrows():
                 venc = row.get('data_vencimento', '')
-                if venc and venc <= (hoje + datetime.timedelta(days=dias)).isoformat():
+                if venc and venc <= data_limite_iso:
                     projecao.append({
                         "data": venc,
                         "tipo": "entrada",
                         "descricao": f"Fiado: {row.get('descricao', 'Recebível')}",
-                        "valor": row['valor'],
+                        "_valor_dec": _dec(row['valor']),
                     })
 
-        # 4. Média diária de vendas (projeção)
-        cursor.execute("""SELECT AVG(total_dia) FROM (
-            SELECT SUM(valor_total) as total_dia FROM vendas 
-            WHERE status='Concluída' AND data_venda >= ? GROUP BY DATE(data_venda))""",
-            ((hoje - datetime.timedelta(days=30)).isoformat(),))
-        media_diaria = cursor.fetchone()[0] or 0
-        if media_diaria > 0:
-            for d in range(1, dias + 1, 7):  # Projeção semanal
+        # 4. Média diária de vendas = soma das vendas na janela de 30 dias / 30 (inclui dias sem venda)
+        janela_dias = 30
+        inicio_janela = (hoje - datetime.timedelta(days=janela_dias)).isoformat()
+        params_vendas = (inicio_janela, loja_id) if loja_id is not None else (inicio_janela,)
+        cursor.execute(
+            f"SELECT COALESCE(SUM(valor_total), 0) FROM vendas WHERE status='Concluída' AND date(data_venda) >= date(?){loja_clause}",
+            params_vendas,
+        )
+        soma_vendas_30d_d = _dec(cursor.fetchone()[0])
+        media_diaria_d = soma_vendas_30d_d / Decimal(janela_dias)
+        if media_diaria_d > 0:
+            valor_semanal_d = media_diaria_d * Decimal(7)
+            for d in range(1, dias + 1, 7):
                 data_proj = (hoje + datetime.timedelta(days=d)).isoformat()
                 projecao.append({
                     "data": data_proj,
                     "tipo": "projecao_vendas",
-                    "descricao": f"Projeção vendas (semana)",
-                    "valor": media_diaria * 7,
+                    "descricao": "Projeção vendas (semana)",
+                    "_valor_dec": valor_semanal_d,
                 })
 
         projecao.sort(key=lambda x: x['data'])
-        
-        # Calcular saldo acumulado
-        saldo = saldo_atual
+
+        # Calcular saldo acumulado em Decimal (arredondamento apenas na saída)
+        saldo_d = saldo_atual_d
+        projecao_saida = []
         for item in projecao:
-            saldo += item['valor']
-            item['saldo_acumulado'] = saldo
-        
-        return {"saldo_atual": saldo_atual, "projecao": projecao, "media_diaria_vendas": media_diaria}
+            val_d = item["_valor_dec"]
+            saldo_d += val_d
+            projecao_saida.append({
+                "data": item["data"],
+                "tipo": item["tipo"],
+                "descricao": item["descricao"],
+                "valor": _round2(val_d),
+                "saldo_acumulado": _round2(saldo_d),
+            })
+
+        return {
+            "saldo_atual": _round2(saldo_atual_d),
+            "projecao": projecao_saida,
+            "media_diaria_vendas": _round2(media_diaria_d),
+        }
 
     # ============================================================
     # ============ CONTROLE DE COMISSÕES ============
     # ============================================================
 
-    def calcular_comissoes(self, periodo="mes"):
-        """Calcula comissões detalhadas por vendedor no período."""
+    def calcular_comissoes(self, periodo="mes", loja_id=None):
+        """
+        Calcula comissões detalhadas por vendedor no período:
+        - Base líquida: valor_total - COALESCE(desconto, 0);
+        - Vendedor removido/sem cadastro: taxa 0.0, comissão 0.0 e sem_cadastro=True (nunca NaN/NULL);
+        - Somas e comissões com Decimal (ROUND_HALF_UP na saída);
+        - Filtro opcional por loja_id.
+        """
+        from decimal import Decimal, ROUND_HALF_UP
+
+        def _dec(val):
+            return Decimal(str(val or 0))
+
+        def _round2(val_dec):
+            return float(val_dec.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
         hoje = datetime.date.today()
         if periodo == "mes":
             inicio = hoje.replace(day=1).isoformat()
@@ -5396,32 +5494,60 @@ class Database:
         else:
             inicio = hoje.replace(month=1, day=1).isoformat()
 
-        query = """
-            SELECT v.vendedor, vd.comissao as taxa_comissao,
+        loja_v = " AND (v.loja_id = ? OR v.loja_id IS NULL)" if loja_id is not None else ""
+        loja_s = " AND (s.loja_id = ? OR s.loja_id IS NULL)" if loja_id is not None else ""
+        params = [inicio, loja_id] if loja_id is not None else [inicio]
+
+        query = f"""
+            SELECT v.vendedor,
+                   COALESCE(vd.comissao, 0.0) as taxa_comissao,
+                   CASE WHEN vd.id IS NULL THEN 1 ELSE 0 END as sem_cadastro,
                    COUNT(*) as num_vendas,
-                   SUM(v.valor_total) as faturamento,
-                   SUM(v.lucro) as lucro,
-                   SUM(v.valor_total) * (vd.comissao / 100.0) as comissao_vendas
+                   SUM(v.valor_total - COALESCE(v.desconto, 0)) as faturamento,
+                   SUM(v.lucro) as lucro
             FROM vendas v
             LEFT JOIN vendedores vd ON v.vendedor = vd.nome
-            WHERE v.status = 'Concluída' AND v.data_venda >= ? AND v.vendedor != ''
+            WHERE v.status = 'Concluída' AND date(v.data_venda) >= date(?) AND v.vendedor != ''{loja_v}
             GROUP BY v.vendedor
-            ORDER BY comissao_vendas DESC
         """
-        df = pd.read_sql_query(query, self.conn, params=[inicio])
+        df = pd.read_sql_query(query, self.conn, params=params)
+        if not df.empty:
+            df["taxa_comissao"] = df["taxa_comissao"].fillna(0.0).astype(float)
+            df["sem_cadastro"] = df["sem_cadastro"].astype(bool)
+            df["faturamento"] = df["faturamento"].apply(lambda x: _round2(_dec(x)))
+            df["lucro"] = df["lucro"].apply(lambda x: _round2(_dec(x)))
+            df["comissao_vendas"] = [
+                _round2(_dec(fat) * _dec(taxa) / Decimal(100))
+                for fat, taxa in zip(df["faturamento"], df["taxa_comissao"])
+            ]
+            df = df.sort_values("comissao_vendas", ascending=False).reset_index(drop=True)
+        else:
+            df = pd.DataFrame(columns=["vendedor", "taxa_comissao", "sem_cadastro", "num_vendas", "faturamento", "lucro", "comissao_vendas"])
 
         # Adicionar serviços
-        query_serv = """
-            SELECT s.vendedor, vd.comissao as taxa_comissao,
+        query_serv = f"""
+            SELECT s.vendedor,
+                   COALESCE(vd.comissao, 0.0) as taxa_comissao,
+                   CASE WHEN vd.id IS NULL THEN 1 ELSE 0 END as sem_cadastro,
                    COUNT(*) as num_servicos,
-                   SUM(s.valor) as faturamento_servicos,
-                   SUM(s.valor) * (vd.comissao / 100.0) as comissao_servicos
+                   SUM(s.valor) as faturamento_servicos
             FROM servicos s
             LEFT JOIN vendedores vd ON s.vendedor = vd.nome
-            WHERE s.data >= ? AND s.vendedor != ''
+            WHERE date(s.data) >= date(?) AND s.vendedor != ''{loja_s}
             GROUP BY s.vendedor
         """
-        df_serv = pd.read_sql_query(query_serv, self.conn, params=[inicio])
+        df_serv = pd.read_sql_query(query_serv, self.conn, params=params)
+        if not df_serv.empty:
+            df_serv["taxa_comissao"] = df_serv["taxa_comissao"].fillna(0.0).astype(float)
+            df_serv["sem_cadastro"] = df_serv["sem_cadastro"].astype(bool)
+            df_serv["faturamento_servicos"] = df_serv["faturamento_servicos"].apply(lambda x: _round2(_dec(x)))
+            df_serv["comissao_servicos"] = [
+                _round2(_dec(fat) * _dec(taxa) / Decimal(100))
+                for fat, taxa in zip(df_serv["faturamento_servicos"], df_serv["taxa_comissao"])
+            ]
+            df_serv = df_serv.sort_values("comissao_servicos", ascending=False).reset_index(drop=True)
+        else:
+            df_serv = pd.DataFrame(columns=["vendedor", "taxa_comissao", "sem_cadastro", "num_servicos", "faturamento_servicos", "comissao_servicos"])
 
         return {"vendas": df, "servicos": df_serv, "periodo_inicio": inicio}
 

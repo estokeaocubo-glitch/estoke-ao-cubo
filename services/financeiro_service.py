@@ -246,37 +246,59 @@ class FinanceiroService:
         """Gera DRE simplificado do período ('mes', 'trimestre' ou 'ano')."""
         return self.db.gerar_dre(periodo=periodo, loja_id=loja_id)
 
-    def projetar_fluxo(self, dias: int = 90) -> dict[str, Any]:
-        """Projeta o fluxo de caixa futuro (ex.: 30, 60 ou 90 dias)."""
+    def projetar_fluxo(
+        self, dias: int = 90, loja_id: int | None = None
+    ) -> dict[str, Any]:
+        """Projeta o fluxo de caixa futuro (ex.: 30, 60 ou 90 dias), com filtro opcional por loja."""
         dias_int = int(dias)
         if dias_int <= 0:
             raise ValueError("O horizonte de projeção em dias deve ser positivo.")
-        return self.db.projetar_fluxo_caixa(dias_int)
+        return self.db.projetar_fluxo_caixa(dias_int, loja_id=loja_id)
 
-    def calcular_comissoes(self, periodo: str = "mes") -> dict[str, Any]:
+    def calcular_comissoes(
+        self, periodo: str = "mes", loja_id: int | None = None
+    ) -> dict[str, Any]:
         """
-        Calcula comissões de vendedores no período ('semana', 'mes' ou 'ano'),
-        convertendo os DataFrames do banco em listas de dicts puras.
+        Calcula comissões de vendedores (vendas líquidas + serviços) no período
+        ('semana', 'mes' ou 'ano') usando Decimal com arredondamento ROUND_HALF_UP na saída.
         """
-        dados = self.db.calcular_comissoes(periodo)
+        from decimal import Decimal, ROUND_HALF_UP
+
+        def _dec(val: Any) -> Decimal:
+            return Decimal(str(val or 0))
+
+        def _round2(val_d: Decimal) -> float:
+            return float(val_d.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+        dados = self.db.calcular_comissoes(periodo, loja_id=loja_id)
         df_vendas = dados.get("vendas")
         df_servicos = dados.get("servicos")
-        vendas_list = (
-            df_vendas.to_dict(orient="records")
-            if df_vendas is not None and not df_vendas.empty
-            else []
-        )
-        servicos_list = (
-            df_servicos.to_dict(orient="records")
-            if df_servicos is not None and not df_servicos.empty
-            else []
-        )
-        total_comissoes_vendas = sum(
-            float(r.get("comissao_vendas", 0) or 0.0) for r in vendas_list
-        )
+
+        vendas_list: list[dict[str, Any]] = []
+        if df_vendas is not None and not df_vendas.empty:
+            for r in df_vendas.to_dict(orient="records"):
+                r["taxa_comissao"] = float(r.get("taxa_comissao") or 0.0)
+                r["sem_cadastro"] = bool(r.get("sem_cadastro", False))
+                r["comissao_vendas"] = float(r.get("comissao_vendas") or 0.0)
+                vendas_list.append(r)
+
+        servicos_list: list[dict[str, Any]] = []
+        if df_servicos is not None and not df_servicos.empty:
+            for r in df_servicos.to_dict(orient="records"):
+                r["taxa_comissao"] = float(r.get("taxa_comissao") or 0.0)
+                r["sem_cadastro"] = bool(r.get("sem_cadastro", False))
+                r["comissao_servicos"] = float(r.get("comissao_servicos") or 0.0)
+                servicos_list.append(r)
+
+        tot_vendas_d = sum((_dec(r["comissao_vendas"]) for r in vendas_list), Decimal("0"))
+        tot_servicos_d = sum((_dec(r["comissao_servicos"]) for r in servicos_list), Decimal("0"))
+        tot_geral_d = tot_vendas_d + tot_servicos_d
+
         return {
             "periodo_inicio": dados.get("periodo_inicio", ""),
             "vendas": vendas_list,
             "servicos": servicos_list,
-            "total_comissoes_vendas": total_comissoes_vendas,
+            "total_comissoes_vendas": _round2(tot_vendas_d),
+            "total_comissoes_servicos": _round2(tot_servicos_d),
+            "total_comissoes": _round2(tot_geral_d),
         }

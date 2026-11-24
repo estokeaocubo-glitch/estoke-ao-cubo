@@ -6062,7 +6062,11 @@ class App(ctk.CTk):
         def exportar_csv():
             filename = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV Files", "*.csv")])
             if filename:
-                rel_svc.exportar_historico_csv(filename)
+                rel_svc.exportar_historico_csv(
+                    filename,
+                    periodo=combo_periodo.get(),
+                    tipo=combo_tipo.get(),
+                )
                 messagebox.showinfo("Sucesso", "Relatório exportado!", parent=window)
         
         ctk.CTkButton(filter_frame, text="Exportar Dados (CSV)", command=exportar_csv, width=150, fg_color="#0A4174", hover_color="#062F56").pack(side="right", padx=15)

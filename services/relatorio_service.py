@@ -65,11 +65,17 @@ class RelatorioService:
                 "detalhes": "Dados insuficientes para previsão.",
             }
 
-    def dados_dashboard(self) -> dict[str, Any]:
+    def dados_dashboard(self, loja_id: int | None = None) -> dict[str, Any]:
         """
         Retorna todas as séries e KPIs puros do dashboard principal e da aba
         'Dashboard & IA' de relatórios (sem construir figuras gráficas).
+
+        KPI 'Faturamento Hoje': como a tabela entradas não possui coluna de origem/tipo,
+        o faturamento líquido diário soma vendas (exceto canceladas) + serviços concluídos
+        do dia em Decimal, e a contagem vem diretamente da tabela vendas (exceto canceladas).
         """
+        from decimal import Decimal, ROUND_HALF_UP
+
         # 1. Série do gráfico de pizza: Top 5 produtos por quantidade + 'Outros'
         df_produtos = self.db.listar_produtos()
         if df_produtos is not None and not df_produtos.empty:
@@ -85,7 +91,7 @@ class RelatorioService:
             sizes = [1]
 
         # 2. Série do gráfico de barras: Gastos agrupados por categoria
-        df_gastos = self.db.listar_gastos()
+        df_gastos = self.db.listar_gastos(loja_id=loja_id)
         if df_gastos is not None and not df_gastos.empty:
             gastos_por_cat = df_gastos.groupby("categoria")["valor"].sum()
             cats = gastos_por_cat.index.tolist()
@@ -94,22 +100,41 @@ class RelatorioService:
             cats = ["Sem Gastos"]
             vals = [0]
 
-        # 3. KPIs de hoje (preserva consultas exatas da UI original)
+        # 3. KPIs de hoje: vendas não canceladas (valor líquido) + serviços concluídos
         today_str = self._hoje_iso()
         sales_today = 0.0
         count_sales_today = 0
+        loja_clause = " AND (loja_id = ? OR loja_id IS NULL)" if loja_id is not None else ""
+        params_hoje = (today_str, loja_id) if loja_id is not None else (today_str,)
         try:
             with self.db._lock:
                 cursor = self.db.conn.cursor()
-                cursor.execute("SELECT SUM(valor) FROM entradas WHERE data = ?", (today_str,))
-                res = cursor.fetchone()[0]
-                sales_today = float(res) if res else 0.0
+                cursor.execute(
+                    f"""SELECT COALESCE(SUM(valor_total - COALESCE(desconto, 0)), 0), COUNT(*)
+                        FROM vendas
+                        WHERE status != 'Cancelada' AND date(data_venda) = date(?){loja_clause}""",
+                    params_hoje,
+                )
+                row_v = cursor.fetchone()
+                vendas_hoje_d = Decimal(str((row_v[0] if row_v else 0) or 0))
+                count_sales_today = int((row_v[1] if row_v else 0) or 0)
 
                 cursor.execute(
-                    "SELECT COUNT(*) FROM historico WHERE acao LIKE 'Venda%' AND data_hora LIKE ?",
-                    (f"{today_str}%",),
+                    f"""SELECT COALESCE(SUM(valor), 0)
+                        FROM servicos
+                        WHERE date(data) = date(?)
+                          AND COALESCE(status, 'Concluído') != 'Cancelado'
+                          AND COALESCE(status_os, 'Concluído') IN ('Concluído', 'Entregue', 'Finalizado', ''){loja_clause}""",
+                    params_hoje,
                 )
-                count_sales_today = int(cursor.fetchone()[0])
+                row_s = cursor.fetchone()
+                servicos_hoje_d = Decimal(str((row_s[0] if row_s else 0) or 0))
+
+                sales_today = float(
+                    (vendas_hoje_d + servicos_hoje_d).quantize(
+                        Decimal("0.01"), rounding=ROUND_HALF_UP
+                    )
+                )
         except Exception as exc:
             logger.warning("Erro ao consultar KPIs diários do dashboard: %s", exc)
 
@@ -528,11 +553,17 @@ class RelatorioService:
             )
         return registros
 
-    def exportar_historico_csv(self, destino_csv_path: str) -> None:
-        """Exporta a tabela historico completa para CSV (preserva comportamento atual)."""
-        with self.db._lock:
-            df = pd.read_sql_query("SELECT * FROM historico", self.db.conn)
+    def exportar_historico_csv(
+        self,
+        destino_csv_path: str,
+        periodo: str = "Histórico Completo",
+        tipo: str = "Tudo",
+    ) -> int:
+        """Exporta para CSV apenas os registros do histórico correspondentes aos filtros ativos."""
+        registros = self.listar_historico(periodo=periodo, tipo=tipo)
+        df = pd.DataFrame(registros, columns=["id", "data_hora", "acao", "detalhe"])
         df.to_csv(destino_csv_path, index=False)
+        return len(registros)
 
     def gerar_pacote_contador(
         self, mes_ano: str | None = None, destino_zip_path: str | None = None

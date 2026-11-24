@@ -580,14 +580,14 @@ class FinanceiroView:
         return window
 
     def open_comissoes_dialog(self) -> ctk.CTkToplevel:
-        window = self._new_dialog("Controle de Comissões", "800x550", focus_mode="set")
+        window = self._new_dialog("Controle de Comissões", "850x680", focus_mode="set")
 
         main_f = ctk.CTkFrame(window, fg_color="transparent")
         main_f.pack(fill="both", expand=True, padx=15, pady=15)
 
         ctk.CTkLabel(
             main_f,
-            text="Relatório de Comissões",
+            text="Relatório de Comissões (Vendas Líquidas + Serviços)",
             font=("Aileron", 18, "bold"),
             text_color=("#001D39", "white"),
         ).pack(pady=(0, 10))
@@ -609,38 +609,76 @@ class FinanceiroView:
         total_label = ctk.CTkLabel(
             main_f,
             text="",
-            font=("Aileron", 14, "bold"),
+            font=("Aileron", 13, "bold"),
             text_color=("#E65100", "#FF9800"),
         )
         total_label.pack(pady=5)
 
+        ctk.CTkLabel(
+            main_f,
+            text="Comissões de Vendas",
+            font=("Aileron", 12, "bold"),
+            text_color=("#001D39", "white"),
+        ).pack(anchor="w", padx=5, pady=(4, 2))
+
         cols = ("vendedor", "taxa", "vendas", "faturamento", "lucro", "comissao")
-        tree = ttk.Treeview(main_f, columns=cols, show="headings", height=12)
+        tree = ttk.Treeview(main_f, columns=cols, show="headings", height=8)
         for c, h, w in [
-            ("vendedor", "Vendedor", 150),
+            ("vendedor", "Vendedor", 180),
             ("taxa", "Taxa %", 70),
             ("vendas", "Nº Vendas", 80),
-            ("faturamento", "Faturamento", 120),
+            ("faturamento", "Fat. Líquido", 120),
             ("lucro", "Lucro", 100),
             ("comissao", "Comissão", 100),
         ]:
             tree.heading(c, text=h)
             tree.column(c, width=w)
-        tree.pack(fill="both", expand=True, padx=5, pady=5)
+        tree.pack(fill="both", expand=True, padx=5, pady=3)
+
+        ctk.CTkLabel(
+            main_f,
+            text="Comissões de Serviços",
+            font=("Aileron", 12, "bold"),
+            text_color=("#001D39", "white"),
+        ).pack(anchor="w", padx=5, pady=(8, 2))
+
+        cols_serv = ("vendedor", "taxa", "servicos", "faturamento", "comissao")
+        tree_serv = ttk.Treeview(main_f, columns=cols_serv, show="headings", height=6)
+        for c, h, w in [
+            ("vendedor", "Vendedor", 200),
+            ("taxa", "Taxa %", 80),
+            ("servicos", "Nº Serviços", 90),
+            ("faturamento", "Faturamento", 130),
+            ("comissao", "Comissão", 110),
+        ]:
+            tree_serv.heading(c, text=h)
+            tree_serv.column(c, width=w)
+        tree_serv.pack(fill="both", expand=True, padx=5, pady=3)
 
         def _render_comissoes():
             from services.financeiro_service import FinanceiroService
 
             for i in tree.get_children():
                 tree.delete(i)
-            dados = FinanceiroService(self.db).calcular_comissoes(periodo_var.get())
+            for i in tree_serv.get_children():
+                tree_serv.delete(i)
+
+            cur_user = getattr(self.app, "current_user", None)
+            loja_id = cur_user.get("loja_id") if isinstance(cur_user, dict) else None
+            dados = FinanceiroService(self.db).calcular_comissoes(
+                periodo_var.get(), loja_id=loja_id
+            )
+
             for row in dados["vendas"]:
+                nome_v = str(row.get("vendedor", ""))
+                if row.get("sem_cadastro"):
+                    nome_v = f"{nome_v} (vendedor removido)"
                 com = row.get("comissao_vendas", 0) or 0
                 tree.insert(
                     "",
                     "end",
                     values=(
-                        row.get("vendedor", ""),
+                        nome_v,
                         f"{row.get('taxa_comissao', 0):.1f}%",
                         int(row.get("num_vendas", 0)),
                         f"R$ {row.get('faturamento', 0):,.2f}",
@@ -648,7 +686,31 @@ class FinanceiroView:
                         f"R$ {com:,.2f}",
                     ),
                 )
-            total_label.configure(text=f"Total Comissões a Pagar: R$ {dados['total_comissoes_vendas']:,.2f}")
+
+            for row in dados["servicos"]:
+                nome_v = str(row.get("vendedor", ""))
+                if row.get("sem_cadastro"):
+                    nome_v = f"{nome_v} (vendedor removido)"
+                com_s = row.get("comissao_servicos", 0) or 0
+                tree_serv.insert(
+                    "",
+                    "end",
+                    values=(
+                        nome_v,
+                        f"{row.get('taxa_comissao', 0):.1f}%",
+                        int(row.get("num_servicos", 0)),
+                        f"R$ {row.get('faturamento_servicos', 0):,.2f}",
+                        f"R$ {com_s:,.2f}",
+                    ),
+                )
+
+            total_label.configure(
+                text=(
+                    f"Vendas: R$ {dados['total_comissoes_vendas']:,.2f}  |  "
+                    f"Serviços: R$ {dados['total_comissoes_servicos']:,.2f}  |  "
+                    f"Total Geral: R$ {dados['total_comissoes']:,.2f}"
+                )
+            )
 
         _render_comissoes()
         return window
