@@ -17,32 +17,55 @@ class DreamConcurrencyError(Exception):
 
 class SonhosService:
     def __init__(self, conn: sqlite3.Connection, lock: Optional[threading.RLock] = None):
-        # Aceita tanto sqlite3.Connection quanto instância de Database
+        # Aceita tanto instância de Database quanto sqlite3.Connection (retrocompatibilidade)
         if hasattr(conn, "conn") and hasattr(conn, "_lock"):
             self._db = conn
-            self.conn = conn.conn
-            self._lock = lock or conn._lock
-            self._ensure_open_fn = getattr(conn, "_ensure_open", None)
+            self._raw_conn = None
+            self._explicit_lock = lock
+            self._raw_lock = None
+            self._ensure_open_fn = None
         else:
             self._db = None
-            self.conn = conn
-            self._lock = lock
+            self._raw_conn = conn
+            self._explicit_lock = lock
+            self._raw_lock = lock
             self._ensure_open_fn = None
-            if self._lock is None:
+            if self._raw_lock is None:
                 try:
                     from database import Database
                     db_lock, ensure_fn = Database.get_lock_for_connection(conn)
                     if db_lock is not None:
-                        self._lock = db_lock
+                        self._raw_lock = db_lock
                         self._ensure_open_fn = ensure_fn
                 except Exception:
                     pass
-            if self._lock is None:
-                self._lock = threading.RLock()
+            if self._raw_lock is None:
+                self._raw_lock = threading.RLock()
         self._ensure_table()
+
+    @property
+    def conn(self) -> sqlite3.Connection:
+        """Lê dinamicamente self._db.conn quando vinculado a Database (resiste a restaurar_backup)."""
+        if self._db is not None:
+            return self._db.conn
+        return self._raw_conn
+
+    @property
+    def _lock(self) -> threading.RLock:
+        """Lê dinamicamente self._db._lock quando vinculado a Database."""
+        if self._explicit_lock is not None:
+            return self._explicit_lock
+        if self._db is not None:
+            return self._db._lock
+        return self._raw_lock
 
     def _ensure_open(self):
         """Valida que a conexão gerenciada pelo Database ainda está aberta."""
+        if self._db is not None:
+            ensure_fn = getattr(self._db, "_ensure_open", None)
+            if ensure_fn is not None:
+                ensure_fn()
+            return
         if self._ensure_open_fn is not None:
             self._ensure_open_fn()
 

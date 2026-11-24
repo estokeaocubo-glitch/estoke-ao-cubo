@@ -159,9 +159,9 @@ class App(ctk.CTk):
         self.db = database.Database()
         self.ai = ai_module.ExpensePredictor(self.db)
 
-        # Inicializar camada de anotações
+        # Inicializar camada de anotações (recebe Database para resistir a restaurar_backup)
         from services.dreams_service import SonhosService
-        self.sonhos_service = SonhosService(self.db.conn)
+        self.sonhos_service = SonhosService(self.db)
 
         # Sessão do usuário logado (None = sem login multi-usuário)
         self.current_user = None
@@ -481,41 +481,28 @@ class App(ctk.CTk):
 
     def reimprimir_ultimo_cupom(self, parent=None):
         """Reimprime o último cupom emitido na sessão atual ou recuperado do cache de recibos (F11)."""
+        from services.impressao_service import ImpressaoService
+
         target_parent = parent or self
         ultimo = getattr(self, "_ultimo_cupom", None)
-        if ultimo and ultimo.get("text"):
-            try:
-                printer = get_printer()
-                printer.print_text(ultimo["text"], logo_path=ultimo.get("logo_path"), venda_id=ultimo.get("venda_id"))
-                self.db.registrar_alteracao(
-                    "Reimprimir Cupom",
-                    f"Reimpressão do último cupom (Venda #{ultimo.get('venda_id') or 'N/A'})",
-                    entidade="impressoes",
-                    entidade_id=str(ultimo.get("venda_id") or ""),
-                )
-                try:
-                    self.notifier.notify("Reimpressão", "Último cupom reenviado para impressão!", "info")
-                except Exception:
-                    messagebox.showinfo("Reimpressão", "Último cupom reenviado para impressão!", parent=target_parent)
-                return True
-            except Exception as exc:
-                logger.warning("Erro ao reimprimir último cupom: %s", exc)
-                messagebox.showerror("Erro de Impressão", f"Não foi possível reimprimir: {exc}", parent=target_parent)
-                return False
-
+        svc = ImpressaoService(self.db, printer_factory=get_printer)
         try:
-            from printer import ReceiptAuditor
-            cached = ReceiptAuditor().recuperar_ultimo_recibo()
-            if cached and "=== INICIO RECIBO" in cached:
-                get_printer().print_text(cached)
-                self.db.registrar_alteracao("Reimprimir Cupom", "Reimpressão do último recibo em cache.")
-                messagebox.showinfo("Reimpressão", "Último recibo do histórico enviado para impressão!", parent=target_parent)
-                return True
+            res = svc.reimprimir_ultimo_cupom(ultimo_cupom=ultimo)
+            if res["origem"] == "sessao":
+                try:
+                    self.notifier.notify("Reimpressão", res["mensagem"], "info")
+                except Exception:
+                    messagebox.showinfo("Reimpressão", res["mensagem"], parent=target_parent)
+            else:
+                messagebox.showinfo("Reimpressão", res["mensagem"], parent=target_parent)
+            return True
+        except LookupError as exc:
+            messagebox.showinfo("Reimpressão", str(exc), parent=target_parent)
+            return False
         except Exception as exc:
-            logger.warning("Erro ao recuperar recibo para reimpressão: %s", exc)
-
-        messagebox.showinfo("Reimpressão", "Nenhum cupom recente disponível para reimprimir.", parent=target_parent)
-        return False
+            logger.warning("Erro ao reimprimir último cupom: %s", exc)
+            messagebox.showerror("Erro de Impressão", f"Não foi possível reimprimir: {exc}", parent=target_parent)
+            return False
 
     def _show_login_screen(self):
         """Tela de login — autenticação do usuário."""
@@ -986,26 +973,38 @@ class App(ctk.CTk):
             self._fullscreen = False
             self.attributes("-fullscreen", False)
     
-    def _on_closing(self):
-        """Confirmação antes de fechar a aplicação (encerra workers e dispara instalador pendente)."""
-        if messagebox.askyesno("Sair", "Deseja realmente fechar o Estoke ao Cubo?"):
+    def _on_closing(self, confirmar: bool = True):
+        """Encerramento controlado (para API, workers, consolida WAL, fecha e criptografa banco)."""
+        if confirmar and not messagebox.askyesno("Sair", "Deseja realmente fechar o Estoke ao Cubo?"):
+            return
+        try:
+            if getattr(self, "api_server", None):
+                self.api_server.stop()
+        except Exception:
+            pass
+        try:
+            sched = getattr(self, "routine_scheduler", None)
+            if sched is not None and hasattr(sched, "stop"):
+                sched.stop()
+        except Exception:
+            pass
+        try:
+            if getattr(self, "outbox_service", None):
+                self.outbox_service.stop_worker(timeout=1.5)
+        except Exception:
+            pass
+        try:
+            self.db.close()
+        except Exception:
+            pass
+        pending_installer = getattr(self, "_pending_installer_path", None)
+        if pending_installer:
             try:
-                if getattr(self, "outbox_service", None):
-                    self.outbox_service.stop_worker(timeout=1.5)
-            except Exception:
-                pass
-            try:
-                self.db.close()
-            except Exception:
-                pass
-            pending_installer = getattr(self, "_pending_installer_path", None)
-            if pending_installer:
-                try:
-                    from services.updater import launch_installer_on_exit
-                    launch_installer_on_exit(pending_installer)
-                except Exception as exc:
-                    logger.warning("Não foi possível disparar instalador na saída: %s", exc)
-            self.destroy()
+                from services.updater import launch_installer_on_exit
+                launch_installer_on_exit(pending_installer)
+            except Exception as exc:
+                logger.warning("Não foi possível disparar instalador na saída: %s", exc)
+        self.destroy()
 
     @staticmethod
     def _safe_float(val, default=0.0):
@@ -1939,15 +1938,14 @@ class App(ctk.CTk):
         lbl_printer_name = ctk.CTkLabel(frame, text="Impressora Windows:")
         combo_printer_name = ctk.CTkComboBox(frame, variable=printer_name_var, values=[""], state="readonly")
 
-        try:
-            from printer import WindowsRawPrinter
-            impressoras = WindowsRawPrinter.listar_impressoras()
-            if impressoras:
-                combo_printer_name.configure(values=impressoras)
-                if not printer_name_var.get() and impressoras:
-                    printer_name_var.set(impressoras[0])
-        except Exception:
-            impressoras = []
+        from services.impressao_service import ImpressaoService
+
+        imp_svc = ImpressaoService(self.db, printer_factory=get_printer)
+        impressoras = imp_svc.listar_impressoras()
+        if impressoras:
+            combo_printer_name.configure(values=impressoras)
+            if not printer_name_var.get():
+                printer_name_var.set(impressoras[0])
 
         interface_var = ctk.StringVar(value=cfg.get("interface", "file"))
         lbl_interface = ctk.CTkLabel(frame, text="Interface:")
@@ -1980,23 +1978,13 @@ class App(ctk.CTk):
         atualizar_campos_tipo()
 
         def save_config_action():
-            tipo = type_var.get()
-            newcfg = {
-                "enabled": enabled_var.get(),
-                "type": tipo,
-                "interface": interface_var.get() if tipo == "escpos" else "file",
-                "settings": {}
-            }
-            if tipo == "windows":
-                newcfg["settings"]["printer_name"] = printer_name_var.get()
-            elif tipo == "escpos":
-                try:
-                    parsed = json.loads(entry_params.get())
-                    if isinstance(parsed, dict):
-                        newcfg["settings"] = parsed
-                except Exception:
-                    pass
-            set_printer_config(newcfg)
+            imp_svc.salvar_config_impressora(
+                enabled=enabled_var.get(),
+                tipo=type_var.get(),
+                printer_name=printer_name_var.get(),
+                interface=interface_var.get(),
+                params_json=entry_params.get(),
+            )
             messagebox.showinfo("Configurações", "Configurações salvas!", parent=dialog)
 
         btn_frame = ctk.CTkFrame(frame, fg_color="transparent")
@@ -2004,10 +1992,9 @@ class App(ctk.CTk):
         ctk.CTkButton(btn_frame, text="Salvar", command=save_config_action, fg_color="#7BBDE8", text_color="#001D39").pack(side="left", expand=True, fill="x", padx=5)
 
         def test_printer():
-            printer = get_printer()
             try:
-                printer.print_text("== TESTE DE IMPRESSÃO ==\n")
-                messagebox.showinfo("Teste", "Envio concluído (ou mensagem registrada).", parent=dialog)
+                res = imp_svc.testar_impressora()
+                messagebox.showinfo("Teste", res["mensagem"], parent=dialog)
             except Exception as e:
                 messagebox.showerror("Teste", f"Falha: {e}", parent=dialog)
 
@@ -2077,7 +2064,12 @@ class App(ctk.CTk):
                     "Um backup de segurança será criado antes.\n\nDeseja continuar?", parent=dialog):
                 ok, msg = self.db.restaurar_backup(path)
                 if ok:
-                    messagebox.showinfo("Sucesso", msg, parent=dialog)
+                    messagebox.showinfo(
+                        "Backup Restaurado",
+                        "Backup restaurado. O Estoke será fechado para concluir a restauração — abra novamente em seguida.",
+                        parent=dialog,
+                    )
+                    self._on_closing(confirmar=False)
                 else:
                     messagebox.showerror("Erro", msg, parent=dialog)
 
@@ -2217,152 +2209,9 @@ class App(ctk.CTk):
                 preview_cfg[key] = entry.get().strip()
             preview_cfg['empresa_logo'] = _temp_logo_path[0]
 
-            # Obter dados da última venda real ou mock fallback
             try:
-                cursor = self.db.conn.cursor()
-                cursor.execute("SELECT id, data_venda, cliente FROM vendas ORDER BY id DESC LIMIT 1")
-                last_venda = cursor.fetchone()
-                if last_venda:
-                    v_id, data_venda, cliente_nome = last_venda
-                    cursor.execute("""
-                        SELECT p.nome, v.quantidade, (v.valor_total / v.quantidade) as preco, v.desconto
-                        FROM vendas v
-                        LEFT JOIN produtos p ON v.produto_id = p.id
-                        WHERE v.data_venda = ? AND v.cliente = ?
-                    """, (data_venda, cliente_nome))
-                    rows = cursor.fetchall()
-                    
-                    itens = []
-                    total_bruto = 0.0
-                    total_desconto = 0.0
-                    for r in rows:
-                        nome_p = r[0] or "Produto"
-                        qtd = r[1] or 1
-                        preco = r[2] or 0.0
-                        desc_item = r[3] or 0.0
-                        total_desconto += desc_item
-                        total_bruto += (preco * qtd)
-                        itens.append({'nome': nome_p, 'qtd': qtd, 'preco': preco})
-                    
-                    cliente = {'nome': cliente_nome}
-                    if cliente_nome != "Consumidor Final":
-                        cursor.execute("SELECT contato FROM clientes WHERE nome=?", (cliente_nome,))
-                        c_row = cursor.fetchone()
-                        if c_row:
-                            cliente['contato'] = c_row[0]
-                    total_liquido = total_bruto - total_desconto
-                else:
-                    raise Exception("Sem vendas")
-            except Exception:
-                # Fallback se banco vazio ou erro
-                itens = [
-                    {'nome': 'Produto Exemplo A', 'qtd': 2, 'preco': 49.90},
-                    {'nome': 'Produto Exemplo B', 'qtd': 1, 'preco': 29.90},
-                ]
-                cliente = {'nome': 'Cliente Teste', 'contato': '(11) 99999-0000'}
-                total_liquido = 119.70
-                total_desconto = 10.00
-                v_id = 'PREVIEW'
-
-            _, text_content, _ = invoice_generator.gerar_nota_txt(
-                itens, cliente, total_liquido,
-                id_venda=v_id, desconto=total_desconto,
-                abrir_arquivo=False, config_nota=preview_cfg
-            )
-            if not text_content:
-                messagebox.showwarning("Aviso", "Erro ao gerar pré-visualização.", parent=dialog)
-                return
-
-            # Renderizar como imagem usando PIL
-            try:
-                from PIL import Image, ImageDraw, ImageFont
-                margin = 12
-                receipt_width = 360
-                font_size = 14
-                title_font_size = 20
-                line_spacing = 2
-
-                try:
-                    font = ImageFont.truetype("consola.ttf", font_size)
-                    title_font = ImageFont.truetype("consola.ttf", title_font_size)
-                except Exception:
-                    try:
-                        font = ImageFont.truetype("cour.ttf", font_size)
-                        title_font = ImageFont.truetype("cour.ttf", title_font_size)
-                    except Exception:
-                        font = ImageFont.load_default()
-                        title_font = font
-
-                lines = text_content.split('\n')
-                dummy = Image.new('RGB', (1, 1))
-                dd = ImageDraw.Draw(dummy)
-                bbox = dd.textbbox((0, 0), 'Ag', font=font)
-                line_h = bbox[3] - bbox[1] + line_spacing
-                bbox_t = dd.textbbox((0, 0), 'Ag', font=title_font)
-                title_h = bbox_t[3] - bbox_t[1] + line_spacing
-
-                # Verificar se há logo
-                logo_img = None
-                logo_h = 0
-                logo_file = _temp_logo_path[0]
-                if logo_file:
-                    logo_full = os.path.join(self.db.data_dir, "product_images", logo_file)
-                    if os.path.isfile(logo_full):
-                        logo_img = Image.open(logo_full)
-                        logo_img.thumbnail((receipt_width - 2 * margin, 80), Image.LANCZOS)
-                        logo_h = logo_img.size[1]
-
-                title_line = None
-                text_lines = []
-                found = False
-                for l in lines:
-                    s = l.strip()
-                    if not found and s:
-                        title_line = s
-                        found = True
-                    else:
-                        text_lines.append(l)
-                while text_lines and not text_lines[-1].strip():
-                    text_lines.pop()
-
-                logo_gap = 8 if logo_img else 0
-                text_height = len(text_lines) * line_h + (title_h if title_line else 0)
-                total_h = margin + logo_h + logo_gap + text_height + margin
-
-                img = Image.new('RGB', (receipt_width, total_h), 'white')
-                draw = ImageDraw.Draw(img)
-                y = margin
-
-                if logo_img:
-                    lx = (receipt_width - logo_img.size[0]) // 2
-                    if logo_img.mode == 'RGBA':
-                        img.paste(logo_img, (lx, y), logo_img)
-                    else:
-                        img.paste(logo_img, (lx, y))
-                    y += logo_h + logo_gap
-
-                if title_line:
-                    tb = draw.textbbox((0, 0), title_line, font=title_font)
-                    tw = tb[2] - tb[0]
-                    draw.text(((receipt_width - tw) // 2, y), title_line, fill='black', font=title_font)
-                    y += title_h + 2
-
-                for line in text_lines:
-                    stripped = line.strip()
-                    if stripped and all(c == '-' for c in stripped):
-                        tb = draw.textbbox((0, 0), stripped, font=font)
-                        tw = tb[2] - tb[0]
-                        draw.text(((receipt_width - tw) // 2, y), stripped, fill='black', font=font)
-                    else:
-                        draw.text((margin, y), line, fill='black', font=font)
-                    y += line_h
-
-                img = img.crop((0, 0, receipt_width, y + margin))
-
-                # Salvar e abrir
-                import tempfile
-                tmp = os.path.join(tempfile.gettempdir(), "estokeaocubo_preview.png")
-                img.save(tmp, 'PNG')
+                res_prev = imp_svc.gerar_preview_cupom(preview_cfg)
+                tmp = res_prev["png_path"]
                 if os.name == 'nt':
                     os.startfile(tmp)
                 else:
@@ -2372,6 +2221,8 @@ class App(ctk.CTk):
                 messagebox.showwarning("Aviso",
                     "Biblioteca Pillow não instalada.\nInstale com: pip install Pillow",
                     parent=dialog)
+            except RuntimeError as exc:
+                messagebox.showwarning("Aviso", str(exc), parent=dialog)
             except Exception as e:
                 logger.warning("Erro na pré-visualização: %s", e)
                 messagebox.showwarning("Aviso", f"Erro ao gerar pré-visualização:\n{e}", parent=dialog)
@@ -7145,18 +6996,27 @@ class App(ctk.CTk):
                     messagebox.showerror("Erro", msg, parent=dialog)
 
             def _abrir_gaveta_manual():
-                if not self._exigir_supervisor("Abertura manual da gaveta de dinheiro", parent=dialog):
+                from services.impressao_service import ImpressaoService
+                from views.supervisor_dialog import solicitar_autorizacao_supervisor
+
+                ok_sup, sup_info = solicitar_autorizacao_supervisor(
+                    self,
+                    acao="Abertura manual da gaveta de dinheiro",
+                    exigir_motivo=False,
+                    parent=dialog,
+                )
+                if not ok_sup:
                     return
                 try:
-                    printer = get_printer()
-                    printer.abrir_gaveta()
-                    self.db.registrar_alteracao(
-                        "Abrir Gaveta",
-                        f"Gaveta aberta manualmente no Caixa #{caixa_aberto['id']}",
-                        entidade="caixa",
-                        entidade_id=str(caixa_aberto['id']),
+                    imp_gav = ImpressaoService(
+                        self.db,
+                        printer_factory=get_printer,
+                        operador=self.current_user,
                     )
+                    imp_gav.abrir_gaveta(autorizacao=sup_info, caixa_id=caixa_aberto['id'])
                     messagebox.showinfo("Gaveta", "Pulso de abertura enviado para a gaveta.", parent=dialog)
+                except PermissionError as perm_err:
+                    messagebox.showerror("Acesso Negado", str(perm_err), parent=dialog)
                 except Exception as exc:
                     messagebox.showwarning("Gaveta", f"Não foi possível abrir a gaveta: {exc}", parent=dialog)
 

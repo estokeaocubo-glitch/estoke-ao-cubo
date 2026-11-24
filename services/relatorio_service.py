@@ -408,7 +408,12 @@ class RelatorioService:
             msg_cobranca += f"\n📋 *PIX Copia e Cola:*\n{payload_pix}\n"
         elif chave_pix:
             try:
-                payload_pix = gerar_payload_pix(chave_pix, nome_emp, "BRASIL", valor=valor_num)
+                payload_pix = gerar_payload_pix(
+                    chave=chave_pix,
+                    valor=valor_num,
+                    nome_recebedor=nome_emp,
+                    cidade_recebedor="BRASIL",
+                )
                 origem_pix = "chave_estatica"
                 msg_cobranca += (
                     f"\n💠 *Chave PIX:* {chave_pix}\n"

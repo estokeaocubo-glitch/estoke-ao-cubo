@@ -3072,51 +3072,55 @@ class Database:
         return {"mantidos": sorted(keep), "removidos": sorted(removed)}
 
     def criar_backup(self):
-        """Cria backup criptografado do banco com integrity_check e retenção GFS (7d/4s/12m)."""
+        """Cria backup criptografado do banco com integrity_check e retenção GFS (I/O pesado fora do lock)."""
         try:
             backup_dir = os.path.join(self.data_dir, "backups")
             os.makedirs(backup_dir, exist_ok=True)
-            
+
             timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
             backup_plain = os.path.join(backup_dir, f"estoque_backup_{timestamp}.db")
             backup_enc = backup_plain + ".enc"
-            
-            # Usar backup API do SQLite para cópia segura + verificação de integridade
+
+            # 1. Apenas o snapshot SQLite via backup API ocorre sob lock
             backup_conn = sqlite3.connect(backup_plain)
             try:
-                self.conn.backup(backup_conn)
+                with self._lock:
+                    self._ensure_open()
+                    self.conn.backup(backup_conn)
+                    enc_key = self._enc_key
+                # 2. Verificação de integridade já no arquivo temp, fora do lock
                 res_int = backup_conn.execute("PRAGMA integrity_check").fetchone()
                 if not res_int or res_int[0] != "ok":
                     raise sqlite3.DatabaseError(f"Falha no integrity_check do backup: {res_int}")
             finally:
                 backup_conn.close()
-            
-            # Criptografar o backup e remover plaintext
-            _encrypt_file(backup_plain, backup_enc, self._enc_key)
+
+            # 3. Criptografia, ACL, retenção e limpeza 100% fora do lock
+            _encrypt_file(backup_plain, backup_enc, enc_key)
             _restrict_file_acl_windows(backup_enc)
             if os.path.exists(backup_enc) and os.path.getsize(backup_enc) > 0:
                 os.remove(backup_plain)
             else:
                 logger.error("Criptografia do backup falhou — mantendo plaintext.")
                 return True, backup_plain
-            
+
             logger.info("Backup criptografado criado e verificado: %s", backup_enc)
-            
+
             # Aplicar política de retenção 7 diários / 4 semanais / 12 mensais
             self.aplicar_retencao_backups(backup_dir, diarios=7, semanais=4, mensais=12)
-            
+
             # Limpar backups plaintext legados (.db sem .enc)
             for f in list(os.listdir(backup_dir)):
                 if f.startswith("estoque_backup_") and f.endswith(".db") and not f.endswith(".db.enc"):
                     try:
                         legacy_path = os.path.join(backup_dir, f)
-                        _encrypt_file(legacy_path, legacy_path + ".enc", self._enc_key)
+                        _encrypt_file(legacy_path, legacy_path + ".enc", enc_key)
                         if os.path.exists(legacy_path + ".enc") and os.path.getsize(legacy_path + ".enc") > 0:
                             os.remove(legacy_path)
                             logger.info("Backup legado migrado para criptografado: %s", f)
                     except Exception as e:
                         logger.warning("Erro ao migrar backup legado %s: %s", f, e)
-            
+
             return True, backup_enc
         except Exception as e:
             logger.error("Erro ao criar backup: %s", e)
@@ -3143,30 +3147,27 @@ class Database:
             return False, str(e)
 
     def restaurar_backup(self, backup_path):
-        """Restaura banco de dados a partir de um arquivo de backup (criptografado ou legado)."""
+        """
+        Restaura banco de dados a partir de um backup (.db.enc ou .db):
+        1. Fora do lock: descriptografa/copia para arquivo temporário e valida PRAGMA integrity_check;
+        2. Sob lock: fecha conexão, preserva estoque.db.pre-restore para rollback, efetua a troca e reabre;
+        3. Em falha durante a troca: executa rollback automático a partir de estoque.db.pre-restore.
+        """
+        staged_db = None
         try:
             if not os.path.exists(backup_path):
                 return False, "Arquivo de backup não encontrado."
-            
-            # Criar backup de segurança antes de restaurar
-            self.criar_backup()
-            
-            # Fechar conexão atual
-            self.conn.close()
-            
-            # Guardar cópia de segurança do db atual caso restauração falhe
-            db_backup_tmp = self.db_path + ".restore_tmp"
-            if os.path.exists(self.db_path):
-                shutil.copy2(self.db_path, db_backup_tmp)
-            
+
+            # 1. Fora do lock: preparar cópia temporária e validar integridade ANTES da troca
+            enc_key = self._enc_key
+            staged_db = f"{self.db_path}.staged_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
             try:
                 if backup_path.endswith(".db.enc"):
-                    _decrypt_file(backup_path, self.db_path, self._enc_key)
+                    _decrypt_file(backup_path, staged_db, enc_key)
                 else:
-                    shutil.copy2(backup_path, self.db_path)
-                
-                # Verificar integridade do banco restaurado (incluindo existência de tabelas essenciais)
-                test_conn = sqlite3.connect(self.db_path)
+                    shutil.copy2(backup_path, staged_db)
+
+                test_conn = sqlite3.connect(staged_db)
                 try:
                     res = test_conn.execute("PRAGMA integrity_check").fetchone()
                     if not res or res[0] != "ok":
@@ -3175,34 +3176,77 @@ class Database:
                 finally:
                     test_conn.close()
             except Exception as e:
-                # Restaurar cópia de segurança
-                logger.error("Falha na restauração, revertendo: %s", e)
-                if os.path.exists(db_backup_tmp):
-                    shutil.copy2(db_backup_tmp, self.db_path)
-                self.conn = self._open_connection()
-                return False, f"Erro ao restaurar: {e}"
-            finally:
-                # Limpar arquivo temporário
-                if os.path.exists(db_backup_tmp):
-                    os.remove(db_backup_tmp)
-            
-            # Reconectar com pragmas de concorrência e sincronizar .enc
-            self.conn = self._open_connection()
+                logger.error("Backup inválido ou corrompido (rejeitado antes da troca): %s", e)
+                return False, f"Backup corrompido ou inválido: {e}"
+
+            # 2. Criar backup de segurança antes da troca (fora do lock principal)
+            self.criar_backup()
+
+            # 3. Sob lock: somente troca do arquivo, backup pre-restore e reabertura da conexão
+            pre_restore_path = self.db_path + ".pre-restore"
+            with self._lock:
+                self._ensure_open()
+                old_conn = getattr(self, "conn", None)
+                if old_conn is not None:
+                    try:
+                        old_conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                    except Exception:
+                        pass
+                    with Database._CONN_REGISTRY_LOCK:
+                        Database._CONN_REGISTRY.pop(id(old_conn), None)
+                    try:
+                        old_conn.close()
+                    except Exception:
+                        pass
+
+                # Guardar cópia de rollback permanente estoque.db.pre-restore
+                if os.path.exists(self.db_path):
+                    shutil.copy2(self.db_path, pre_restore_path)
+
+                try:
+                    for suffix in ("-wal", "-shm"):
+                        w_path = self.db_path + suffix
+                        if os.path.exists(w_path):
+                            os.remove(w_path)
+                    shutil.copy2(staged_db, self.db_path)
+                    self.conn = self._open_connection()
+                except Exception as e:
+                    logger.error("Falha na troca durante restauração, executando rollback de pre-restore: %s", e)
+                    for suffix in ("-wal", "-shm"):
+                        w_path = self.db_path + suffix
+                        if os.path.exists(w_path):
+                            try:
+                                os.remove(w_path)
+                            except Exception:
+                                pass
+                    if os.path.exists(pre_restore_path):
+                        shutil.copy2(pre_restore_path, self.db_path)
+                    self.conn = self._open_connection()
+                    return False, f"Erro ao restaurar (rollback aplicado): {e}"
+
+            # 4. Sincronizar .enc fora do lock
             try:
-                _encrypt_file(self.db_path, self.enc_path, self._enc_key)
+                _encrypt_file(self.db_path, self.enc_path, enc_key)
             except Exception:
                 pass
-            
-            logger.info("Backup restaurado de: %s", backup_path)
+
+            logger.info("Backup restaurado de: %s (pre-restore preservado em %s)", backup_path, pre_restore_path)
             return True, "Backup restaurado com sucesso! Reinicie o aplicativo para aplicar todas as alterações."
         except Exception as e:
             logger.error("Erro ao restaurar backup: %s", e)
             try:
-                if not hasattr(self, 'conn') or self.conn is None:
-                    self.conn = self._open_connection()
+                with self._lock:
+                    if not hasattr(self, "conn") or self.conn is None:
+                        self.conn = self._open_connection()
             except Exception:
                 pass
             return False, str(e)
+        finally:
+            if staged_db and os.path.exists(staged_db):
+                try:
+                    os.remove(staged_db)
+                except Exception:
+                    pass
 
     def listar_backups(self):
         """Lista todos os backups disponíveis (criptografados e legados) com data e tamanho."""
@@ -3263,25 +3307,27 @@ class Database:
             else:
                 inicio = None
             
-            if tipo == "vendas":
-                query = "SELECT id, data_venda, quantidade, valor_total, lucro, forma_pagamento, cliente, status FROM vendas WHERE status != 'Cancelada'"
-                params = []
-                if inicio:
-                    query += " AND data_venda >= ?"
-                    params.append(inicio.isoformat())
-                query += " ORDER BY data_venda DESC"
-                df = pd.read_sql_query(query, self.conn, params=params)
-                titulo = f"Relatório de Vendas - {periodo.title()}"
-            elif tipo == "estoque":
-                df = pd.read_sql_query("SELECT id, nome, quantidade, preco, categoria, preco_compra FROM produtos ORDER BY nome", self.conn)
-                titulo = "Relatório de Estoque"
-            elif tipo == "financeiro":
-                df_e = pd.read_sql_query("SELECT data, valor, descricao, 'Entrada' as tipo FROM entradas ORDER BY data DESC LIMIT 100", self.conn)
-                df_g = pd.read_sql_query("SELECT data, valor, descricao, categoria as tipo FROM gastos ORDER BY data DESC LIMIT 100", self.conn)
-                df = pd.concat([df_e, df_g]).sort_values('data', ascending=False)
-                titulo = f"Relatório Financeiro - {periodo.title()}"
-            else:
-                return False, "Tipo de relatório inválido."
+            with self._lock:
+                self._ensure_open()
+                if tipo == "vendas":
+                    query = "SELECT id, data_venda, quantidade, valor_total, lucro, forma_pagamento, cliente, status FROM vendas WHERE status != 'Cancelada'"
+                    params = []
+                    if inicio:
+                        query += " AND data_venda >= ?"
+                        params.append(inicio.isoformat())
+                    query += " ORDER BY data_venda DESC"
+                    df = pd.read_sql_query(query, self.conn, params=params)
+                    titulo = f"Relatório de Vendas - {periodo.title()}"
+                elif tipo == "estoque":
+                    df = pd.read_sql_query("SELECT id, nome, quantidade, preco, categoria, preco_compra FROM produtos ORDER BY nome", self.conn)
+                    titulo = "Relatório de Estoque"
+                elif tipo == "financeiro":
+                    df_e = pd.read_sql_query("SELECT data, valor, descricao, 'Entrada' as tipo FROM entradas ORDER BY data DESC LIMIT 100", self.conn)
+                    df_g = pd.read_sql_query("SELECT data, valor, descricao, categoria as tipo FROM gastos ORDER BY data DESC LIMIT 100", self.conn)
+                    df = pd.concat([df_e, df_g]).sort_values('data', ascending=False)
+                    titulo = f"Relatório Financeiro - {periodo.title()}"
+                else:
+                    return False, "Tipo de relatório inválido."
             
             # Gerar arquivo de relatório em texto formatado (compatível sem reportlab)
             report_dir = os.path.join(self.data_dir, "relatorios")
@@ -4148,51 +4194,52 @@ class Database:
         return pd.read_sql_query(query, self.conn)
 
     def exportar_backup_externo(self, destino_dir):
-        """Exporta um pacote de backup e recuperação externo (para Nuvem/Google Drive/OneDrive/Pendrive)."""
+        """Exporta pacote de backup e Kit de Recuperação externo (apenas snapshot SQLite sob lock)."""
         try:
-            with self._lock:
-                os.makedirs(destino_dir, exist_ok=True)
-                ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-                pkg_dir = os.path.join(destino_dir, f"EstokeAoCubo_Backup_{ts}")
-                os.makedirs(pkg_dir, exist_ok=True)
+            os.makedirs(destino_dir, exist_ok=True)
+            ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            pkg_dir = os.path.join(destino_dir, f"EstokeAoCubo_Backup_{ts}")
+            os.makedirs(pkg_dir, exist_ok=True)
 
-                # 1. Cópia limpa do SQLite via API nativa de backup
-                plain_db = os.path.join(pkg_dir, f"estoque_backup_{ts}.db")
-                b_conn = sqlite3.connect(plain_db)
-                try:
+            # 1. Apenas o snapshot limpo do SQLite ocorre sob lock
+            plain_db = os.path.join(pkg_dir, f"estoque_backup_{ts}.db")
+            b_conn = sqlite3.connect(plain_db)
+            try:
+                with self._lock:
+                    self._ensure_open()
                     self.conn.backup(b_conn)
-                finally:
-                    b_conn.close()
+                    enc_key = self._enc_key
+            finally:
+                b_conn.close()
 
-                # 2. Criptografar backup com a chave do sistema
-                enc_db = plain_db + ".enc"
-                _encrypt_file(plain_db, enc_db, self._enc_key)
-                if os.path.exists(enc_db) and os.path.getsize(enc_db) > 0:
-                    os.remove(plain_db)
+            # 2. Criptografia, chave de recuperação, config e LEIA_ME 100% fora do lock
+            enc_db = plain_db + ".enc"
+            _encrypt_file(plain_db, enc_db, enc_key)
+            if os.path.exists(enc_db) and os.path.getsize(enc_db) > 0:
+                os.remove(plain_db)
 
-                # 3. Exportar chave de recuperação (Fernet base64) e config.json para recuperação em outro PC
-                key_recovery_file = os.path.join(pkg_dir, "CHAVE_RECUPERACAO.key")
-                with open(key_recovery_file, "wb") as fk:
-                    fk.write(self._enc_key)
+            key_recovery_file = os.path.join(pkg_dir, "CHAVE_RECUPERACAO.key")
+            with open(key_recovery_file, "wb") as fk:
+                fk.write(enc_key)
 
-                cfg_path = os.path.join(self.data_dir, "config.json")
-                if os.path.exists(cfg_path):
-                    shutil.copy2(cfg_path, os.path.join(pkg_dir, "config.json"))
+            cfg_path = os.path.join(self.data_dir, "config.json")
+            if os.path.exists(cfg_path):
+                shutil.copy2(cfg_path, os.path.join(pkg_dir, "config.json"))
 
-                leia_me = os.path.join(pkg_dir, "LEIA_ME_RECUPERACAO.txt")
-                with open(leia_me, "w", encoding="utf-8") as fl:
-                    fl.write(
-                        "=== KIT DE RECUPERAÇÃO EXTERNA - ESTOKE AO CUBO ===\n"
-                        f"Data de geração: {datetime.datetime.now().strftime('%d/%m/%Y %H:%M:%S')}\n\n"
-                        "COMO RESTAURAR EM UM NOVO COMPUTADOR:\n"
-                        "1. Instale o Estoke Ao Cubo no novo computador.\n"
-                        "2. Copie o arquivo CHAVE_RECUPERACAO.key para %LOCALAPPDATA%\\EstokeAoCubo\\.db_key\n"
-                        "3. No menu Configurações > Backup, clique em Restaurar e selecione o arquivo .db.enc desta pasta.\n"
-                        "Mantenha esta pasta em local seguro (Google Drive, OneDrive ou Pendrive privado).\n"
-                    )
+            leia_me = os.path.join(pkg_dir, "LEIA_ME_RECUPERACAO.txt")
+            with open(leia_me, "w", encoding="utf-8") as fl:
+                fl.write(
+                    "=== KIT DE RECUPERAÇÃO EXTERNA - ESTOKE AO CUBO ===\n"
+                    f"Data de geração: {datetime.datetime.now().strftime('%d/%m/%Y %H:%M:%S')}\n\n"
+                    "COMO RESTAURAR EM UM NOVO COMPUTADOR:\n"
+                    "1. Instale o Estoke Ao Cubo no novo computador.\n"
+                    "2. Copie o arquivo CHAVE_RECUPERACAO.key para %LOCALAPPDATA%\\EstokeAoCubo\\.db_key\n"
+                    "3. No menu Configurações > Backup, clique em Restaurar e selecione o arquivo .db.enc desta pasta.\n"
+                    "Mantenha esta pasta em local seguro (Google Drive, OneDrive ou Pendrive privado).\n"
+                )
 
-                self.registrar_alteracao("Backup Externo", f"Kit exportado para {pkg_dir}")
-                return True, pkg_dir
+            self.registrar_alteracao("Backup Externo", f"Kit exportado para {pkg_dir}")
+            return True, pkg_dir
         except Exception as e:
             logger.error("Erro ao exportar backup externo: %s", e)
             return False, str(e)
@@ -4301,6 +4348,7 @@ class Database:
                     duplicatas.append({"n_dup": n_dup, "d_venc": d_venc, "v_dup": round(v_dup, 2)})
 
             with self._lock:
+                self._ensure_open()
                 cursor = self.conn.cursor()
                 cursor.execute("SELECT id FROM fornecedores WHERE nome = ?", (forn_nome,))
                 f_row = cursor.fetchone()
@@ -5744,6 +5792,7 @@ class Database:
             os.makedirs(os.path.dirname(os.path.abspath(destino_zip_path)), exist_ok=True)
 
         with self._lock:
+            self._ensure_open()
             cur = self.conn.cursor()
             vendas = cur.execute(
                 """
@@ -6230,6 +6279,16 @@ def _aplicar_lock_metodos_database(cls):
         "cancelar_venda",
         "is_trial_mode",
         "aplicar_retencao_backups",
+        # Auditoria A (Lote 5): I/O pesado fora do lock (lock adquirido apenas no acesso SQLite)
+        "criar_backup",
+        "restaurar_backup",
+        "exportar_relatorio_pdf",
+        "exportar_backup_externo",
+        "parse_nfe_xml",
+        "_processar_imagem_importacao",
+        "preparar_e_validar_importacao",
+        "importar_imagem_avulsa",
+        "exportar_pacote_contador",
     }
 
     def _envolver(fn):

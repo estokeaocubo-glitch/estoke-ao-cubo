@@ -316,9 +316,9 @@ class PDVDialog(ctk.CTkToplevel):
                     return
                 ret, frame = cap.read()
                 if ret:
-                    from pyzbar import pyzbar as _pyzbar
+                    from services.hardware_service import HardwareService
 
-                    barcodes = _pyzbar.decode(frame)
+                    code_data, barcodes = HardwareService().decodificar_frame(frame)
                     for bc in barcodes:
                         pts = bc.polygon
                         if len(pts) == 4:
@@ -330,15 +330,14 @@ class PDVDialog(ctk.CTkToplevel):
                                     (0, 255, 0),
                                     3,
                                 )
-                        code_data = bc.data.decode("utf-8", errors="ignore")
-                        if code_data:
-                            _cam_running[0] = False
-                            cap.release()
-                            cam_win.destroy()
-                            self.entry_scan.delete(0, "end")
-                            self.entry_scan.insert(0, code_data)
-                            self.entry_scan.event_generate("<Return>")
-                            return
+                    if code_data:
+                        _cam_running[0] = False
+                        cap.release()
+                        cam_win.destroy()
+                        self.entry_scan.delete(0, "end")
+                        self.entry_scan.insert(0, code_data)
+                        self.entry_scan.event_generate("<Return>")
+                        return
 
                     frame_rgb = _cv2.cvtColor(frame, _cv2.COLOR_BGR2RGB)
                     pil_img = Image.fromarray(frame_rgb)
@@ -1321,26 +1320,15 @@ class PDVDialog(ctk.CTkToplevel):
         self.entry_cpf_nota.pack(side="left", fill="x", expand=True)
 
         def _ler_balanca_serial(_event=None):
+            from services.hardware_service import HardwareError, HardwareService
+
             peso_lido = None
             try:
-                import serial
-                import serial.tools.list_ports
-
-                for p_info in serial.tools.list_ports.comports():
-                    try:
-                        with serial.Serial(
-                            p_info.device, baudrate=9600, bytesize=8, parity="N", stopbits=1, timeout=0.6
-                        ) as ser:
-                            ser.write(b"\x05")
-                            raw = ser.read(16).decode("ascii", errors="ignore")
-                            m = re.search(r"(\d{5})", raw)
-                            if m:
-                                peso_lido = int(m.group(1)) / 1000.0
-                                break
-                    except Exception:
-                        continue
+                peso_lido = HardwareService().ler_peso_balanca(timeout=0.6)
+            except HardwareError:
+                peso_lido = None
             except Exception:
-                pass
+                peso_lido = None
 
             if peso_lido is None:
                 val_str = simpledialog.askstring(
