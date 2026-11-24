@@ -2902,13 +2902,44 @@ class Database:
                ORDER BY ci.data_hora""", self.conn)
 
     def dividir_conta(self, comanda_id, num_pessoas):
-        """Calcula divisão da conta."""
+        """
+        Calcula divisão da conta em centavos inteiros (Decimal + ROUND_HALF_UP),
+        distribuindo o resto (+1 centavo) nas primeiras partes.
+
+        Casos degenerados preservados por compatibilidade:
+        - num_pessoas <= 0: usa divisor n = 1, preservando 'pessoas' informado;
+        - total < 0: preserva cálculo legado round(total / n, 2).
+        """
+        from decimal import Decimal, ROUND_HALF_UP
+
         comanda = self.get_comanda(comanda_id)
         if not comanda:
             return None
         total = comanda['total'] + comanda.get('taxa_servico', 0) - comanda.get('desconto', 0)
-        valor_por_pessoa = total / max(num_pessoas, 1)
-        return {"total": total, "pessoas": num_pessoas, "valor_por_pessoa": round(valor_por_pessoa, 2)}
+        n = max(int(num_pessoas), 1)
+        if total < 0:
+            vpp_neg = round(total / n, 2)
+            return {
+                "total": total,
+                "pessoas": num_pessoas,
+                "valor_por_pessoa": vpp_neg,
+                "partes": [vpp_neg] * n,
+            }
+        total_dec = Decimal(str(total)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        total_centavos = int(total_dec * 100)
+        base = total_centavos // n
+        resto = total_centavos % n
+        partes = [
+            float((Decimal(base + (1 if i < resto else 0)) / Decimal(100)).quantize(Decimal("0.01")))
+            for i in range(n)
+        ]
+        total_final = float(total_dec)
+        return {
+            "total": total_final,
+            "pessoas": num_pessoas,
+            "valor_por_pessoa": round(total_final / n, 2),
+            "partes": partes,
+        }
 
     def close(self):
         with self._lock:

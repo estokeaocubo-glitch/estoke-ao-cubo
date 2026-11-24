@@ -279,10 +279,6 @@ class TestServicoService:
         assert res["taxa_servico"] == pytest.approx(10.0)
         assert res["total_final"] == pytest.approx(105.0)
 
-    @pytest.mark.xfail(
-        reason="Comportamento atual de Database.dividir_conta usa round(total / n, 2) sem distribuir resto de centavos (3 x 33.33 = 99.99 != 100.00)",
-        strict=True,
-    )
     def test_dividir_conta_centavos_100_por_3(self, isolated_db):
         svc = ServicoService(isolated_db)
         isolated_db.adicionar_produto("Combo", 10, 100.0, categoria="Geral", preco_compra=40.0)
@@ -291,7 +287,7 @@ class TestServicoService:
         isolated_db.adicionar_item_comanda(comanda_id, prod_id, "Combo", 1, 100.0)
 
         div = svc.dividir_conta(comanda_id, 3)
-        soma_centavos = round(div["valor_por_pessoa"] * 100) * div["pessoas"]
+        soma_centavos = sum(round(p * 100) for p in div["partes"])
         total_centavos = round(div["total"] * 100)
         assert soma_centavos == total_centavos
 

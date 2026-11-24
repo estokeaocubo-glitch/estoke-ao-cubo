@@ -142,53 +142,50 @@ class FinanceiroView:
         btn_frame.pack(fill="x", padx=10, pady=10)
 
         def _refresh_contas():
+            from services.financeiro_service import FinanceiroService
+
             for i in tree.get_children():
                 tree.delete(i)
-            filtro = filtro_var.get()
-            status = filtro if filtro != "Todos" else None
-            df = self.db.listar_contas_pagar(status=status)
-            total_pend = 0
-            for _, row in df.iterrows():
-                parc_txt = f"{int(row.get('parcela_atual', 1))}/{int(row.get('total_parcelas', 1))}"
-                venc = str(row.get("data_vencimento", ""))
-                valor = row.get("valor", 0)
-                st = row.get("status", "Pendente")
-                if st == "Pendente":
-                    total_pend += valor
+            res = FinanceiroService(self.db).listar_contas_pagar(status=filtro_var.get())
+            for row in res["contas"]:
                 tree.insert(
                     "",
                     "end",
                     values=(
                         row["id"],
-                        row.get("descricao", ""),
-                        f"R$ {valor:.2f}",
-                        venc,
-                        row.get("fornecedor_nome", ""),
-                        st,
-                        parc_txt,
+                        row["descricao"],
+                        f"R$ {row['valor']:.2f}",
+                        row["data_vencimento"],
+                        row["fornecedor_nome"],
+                        row["status"],
+                        row["parcela_texto"],
                     ),
                 )
-            total_label.configure(text=f"Total Pendente: R$ {total_pend:.2f}")
+            total_label.configure(text=f"Total Pendente: R$ {res['total_pendente']:.2f}")
 
         def _pagar_selecionada():
+            from services.financeiro_service import FinanceiroService
+
             sel = tree.selection()
             if not sel:
                 messagebox.showwarning("Alerta", "Selecione uma conta.", parent=window)
                 return
             conta_id = tree.item(sel[0])["values"][0]
             if messagebox.askyesno("Confirmar", "Marcar esta conta como PAGA?", parent=window):
-                self.db.pagar_conta(conta_id)
+                FinanceiroService(self.db).pagar_conta(conta_id)
                 _refresh_contas()
                 if self.notifier:
                     self.notifier.notify("Conta Paga", "Conta quitada com sucesso!", tipo="success")
 
         def _cancelar_selecionada():
+            from services.financeiro_service import FinanceiroService
+
             sel = tree.selection()
             if not sel:
                 return
             conta_id = tree.item(sel[0])["values"][0]
             if messagebox.askyesno("Confirmar", "Cancelar esta conta?", parent=window):
-                self.db.cancelar_conta_pagar(conta_id)
+                FinanceiroService(self.db).cancelar_conta_pagar(conta_id)
                 _refresh_contas()
 
         ctk.CTkButton(
@@ -298,42 +295,43 @@ class FinanceiroView:
         entries["obs"].grid(row=5, column=1, sticky="ew", padx=5, pady=5)
 
         ctk.CTkLabel(fields_frame, text="Fornecedor:", font=("Aileron", 11)).grid(row=6, column=0, sticky="w", padx=5, pady=5)
-        df_forn = self.db.listar_fornecedores()
-        forn_list = ["Nenhum"] + df_forn["nome"].tolist() if not df_forn.empty else ["Nenhum"]
+        from services.financeiro_service import FinanceiroService
+
+        fornecedores = FinanceiroService(self.db).listar_fornecedores()
+        forn_list = ["Nenhum"] + [f["nome"] for f in fornecedores]
         forn_var = ctk.StringVar(value="Nenhum")
         ctk.CTkOptionMenu(fields_frame, values=forn_list, variable=forn_var, height=35).grid(
             row=6, column=1, sticky="ew", padx=5, pady=5
         )
 
         def _salvar_conta():
-            desc = entries["desc"].get().strip()
-            try:
-                valor = float(entries["valor"].get().replace(",", "."))
-            except ValueError:
-                messagebox.showerror("Erro", "Valor inválido.", parent=window)
-                return
             try:
                 venc = date_entry.get_date().isoformat()
             except ValueError:
                 messagebox.showerror("Erro", "Data de vencimento inválida (use AAAA-MM-DD).", parent=window)
                 return
-            if not desc:
-                messagebox.showerror("Erro", "Preencha a descrição.", parent=window)
-                return
-            cat = entries["cat"].get().strip() or "Outro"
-            try:
-                parcelas = int(entries["parcelas"].get())
-            except ValueError:
-                parcelas = 1
-            obs = entries["obs"].get().strip()
 
             forn_id = None
-            if forn_var.get() != "Nenhum" and not df_forn.empty:
-                forn_match = df_forn[df_forn["nome"] == forn_var.get()]
-                if not forn_match.empty:
-                    forn_id = int(forn_match.iloc[0]["id"])
+            if forn_var.get() != "Nenhum":
+                for f in fornecedores:
+                    if f["nome"] == forn_var.get():
+                        forn_id = int(f["id"])
+                        break
 
-            self.db.adicionar_conta_pagar(desc, valor, venc, forn_id, cat, total_parcelas=parcelas, observacao=obs)
+            try:
+                FinanceiroService(self.db).adicionar_conta_pagar(
+                    descricao=entries["desc"].get(),
+                    valor=entries["valor"].get(),
+                    data_vencimento=venc,
+                    fornecedor_id=forn_id,
+                    categoria=entries["cat"].get(),
+                    total_parcelas=entries["parcelas"].get(),
+                    observacao=entries["obs"].get(),
+                )
+            except ValueError as exc:
+                messagebox.showerror("Erro", str(exc), parent=window)
+                return
+
             messagebox.showinfo("Sucesso", "Conta registrada!", parent=window)
             entries["desc"].delete(0, "end")
             entries["valor"].delete(0, "end")
@@ -396,10 +394,12 @@ class FinanceiroView:
         dre_container.pack(fill="x", padx=5, pady=5)
 
         def _render_dre():
+            from services.financeiro_service import FinanceiroService
+
             for w in dre_container.winfo_children():
                 w.destroy()
 
-            dre = self.db.gerar_dre(periodo_var.get())
+            dre = FinanceiroService(self.db).gerar_dre(periodo_var.get())
 
             periodo_label = {"mes": "Mês Atual", "trimestre": "Trimestre Atual", "ano": "Ano Atual"}.get(
                 dre["periodo"], "Período"
@@ -543,10 +543,12 @@ class FinanceiroView:
         tree.pack(fill="both", expand=True, padx=5, pady=5)
 
         def _render_fluxo():
+            from services.financeiro_service import FinanceiroService
+
             for i in tree.get_children():
                 tree.delete(i)
             dias = int(dias_var.get())
-            dados = self.db.projetar_fluxo_caixa(dias)
+            dados = FinanceiroService(self.db).projetar_fluxo(dias)
             saldo_label.configure(
                 text=f"Saldo Atual: R$ {dados['saldo_atual']:,.2f}  |  "
                 f"Média Diária Vendas: R$ {dados['media_diaria_vendas']:,.2f}"
@@ -627,14 +629,13 @@ class FinanceiroView:
         tree.pack(fill="both", expand=True, padx=5, pady=5)
 
         def _render_comissoes():
+            from services.financeiro_service import FinanceiroService
+
             for i in tree.get_children():
                 tree.delete(i)
-            dados = self.db.calcular_comissoes(periodo_var.get())
-            df = dados["vendas"]
-            total_com = 0
-            for _, row in df.iterrows():
+            dados = FinanceiroService(self.db).calcular_comissoes(periodo_var.get())
+            for row in dados["vendas"]:
                 com = row.get("comissao_vendas", 0) or 0
-                total_com += com
                 tree.insert(
                     "",
                     "end",
@@ -647,7 +648,7 @@ class FinanceiroView:
                         f"R$ {com:,.2f}",
                     ),
                 )
-            total_label.configure(text=f"Total Comissões a Pagar: R$ {total_com:,.2f}")
+            total_label.configure(text=f"Total Comissões a Pagar: R$ {dados['total_comissoes_vendas']:,.2f}")
 
         _render_comissoes()
         return window

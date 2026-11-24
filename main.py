@@ -1406,28 +1406,18 @@ class App(ctk.CTk):
     def create_charts_content(self):
         from matplotlib.figure import Figure
         from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+        from services.relatorio_service import RelatorioService
 
-        df_produtos = self.db.listar_produtos()
-        
+        dash_data = RelatorioService(self.db, ai_predictor=self.ai).dados_dashboard()
+        labels = dash_data["estoque_pizza"]["labels"]
+        sizes = dash_data["estoque_pizza"]["sizes"]
+        cats = dash_data["gastos_barras"]["categorias"]
+        vals = dash_data["gastos_barras"]["valores"]
+
         # Definir cores baseadas no tema atual
         is_dark = ctk.get_appearance_mode() == "Dark"
         bg_color = "#2B2B2B" if is_dark else "#F0F0F5"
         text_color = "white" if is_dark else "black"
-        
-        if not df_produtos.empty:
-            # Pegar os 5 produtos com maior quantidade para não poluir o gráfico
-            df_top = df_produtos.nlargest(5, 'quantidade')
-            labels = df_top['nome'].tolist()
-            sizes = df_top['quantidade'].tolist()
-            
-            # Se houver muitos outros, agrupar em "Outros"
-            outros = df_produtos['quantidade'].sum() - df_top['quantidade'].sum()
-            if outros > 0:
-                labels.append("Outros")
-                sizes.append(outros)
-        else:
-            labels = ['Sem Dados']
-            sizes = [1]
 
         # Alterado facecolor para combinar com o fundo
         fig_pie = Figure(figsize=(4.5, 3), dpi=100, facecolor=bg_color)
@@ -1479,17 +1469,6 @@ class App(ctk.CTk):
         canvas_pie.get_tk_widget().pack(fill="both", expand=True, padx=5, pady=5)
 
         # --- Gráfico de Barras: Gastos por Categoria ---
-        df_gastos = self.db.listar_gastos()
-        
-        if not df_gastos.empty:
-            # Agrupar por categoria e somar valores
-            gastos_por_cat = df_gastos.groupby('categoria')['valor'].sum()
-            cats = gastos_por_cat.index.tolist()
-            vals = gastos_por_cat.values.tolist()
-        else:
-            cats = ['Sem Gastos']
-            vals = [0]
-
         fig_bar = Figure(figsize=(4.5, 2.8), dpi=100, facecolor=bg_color)
         ax_bar = fig_bar.add_subplot(111)
         ax_bar.set_facecolor(bg_color) # Fundo do plot também
@@ -1535,9 +1514,11 @@ class App(ctk.CTk):
         self.update_prediction_display()
 
     def update_prediction_display(self):
-        # Treinar IA (se houver dados)
-        trained = self.ai.train()
-        prediction = self.ai.predict_next_month()
+        from services.relatorio_service import RelatorioService
+
+        prev = RelatorioService(self.db, ai_predictor=self.ai).previsao_vendas(treinar=True)
+        trained = prev["treinado"]
+        prediction = prev["valor"]
         
         # Frame de Previsão com design profissional - ABAIXO DOS GRÁFICOS (row=1)
         # Frame com estilo mais leve e luminoso
@@ -2816,7 +2797,10 @@ class App(ctk.CTk):
         refresh_list()
 
     def open_saldo_dialog(self):
-        saldo_atual = self.db.get_saldo_atual()
+        from services.financeiro_service import FinanceiroService
+
+        fin_svc = FinanceiroService(self.db)
+        saldo_atual = fin_svc.saldo()
         
         dialog = ctk.CTkToplevel(self)
         dialog.title("Gestão de Saldo")
@@ -2854,19 +2838,12 @@ class App(ctk.CTk):
         def adicionar():
             if self.check_trial_limits('transacao', dialog):
                 return
-            valor = entry_valor.get().strip()
-            desc = entry_desc.get().strip()
-            if valor:
-                try:
-                    valor_str = valor.replace(',', '.')
-                    valor_float = float(valor_str)
-                    self.db.adicionar_entrada(valor_float, desc or "Entrada Manual")
-                    messagebox.showinfo("Sucesso", "Saldo adicionado!", parent=dialog)
-                    dialog.destroy()
-                except ValueError:
-                    messagebox.showerror("Erro", "Valor inválido. Use vírgula ou ponto como separador decimal.", parent=dialog)
-            else:
-                messagebox.showerror("Erro", "Digite um valor.", parent=dialog)
+            try:
+                fin_svc.adicionar_entrada(entry_valor.get(), entry_desc.get())
+                messagebox.showinfo("Sucesso", "Saldo adicionado!", parent=dialog)
+                dialog.destroy()
+            except ValueError as exc:
+                messagebox.showerror("Erro", str(exc), parent=dialog)
         
         def limpar():
             entry_valor.delete(0, "end")
@@ -3817,8 +3794,11 @@ class App(ctk.CTk):
         entry_date.grid(row=1, column=1, padx=5)
         
         ctk.CTkLabel(grid, text="Categoria:", text_color=("#001D39", "white")).grid(row=0, column=2, ipady=5, sticky="w")
+        from services.financeiro_service import FinanceiroService
+
+        fin_svc = FinanceiroService(self.db)
         cat_var = ctk.StringVar(value="Material")
-        gasto_cats = self.db.listar_categorias('gasto') or ["Material", "Transporte", "Serviços", "Aluguel", "Outro"]
+        gasto_cats = fin_svc.listar_categorias_gasto()
         cat_menu = ctk.CTkComboBox(grid, values=gasto_cats, variable=cat_var, width=120)
         cat_menu.grid(row=1, column=2, padx=5)
 
@@ -3830,26 +3810,19 @@ class App(ctk.CTk):
             if self.check_trial_limits('transacao', window):
                 return
             try:
-                val = float(entry_val.get().replace(",", "."))
-                date = entry_date.get().strip()
-                
-                # Validação de data
-                try:
-                    datetime.date.fromisoformat(date)
-                except ValueError:
-                    messagebox.showerror("Erro", "Data inválida. Use o formato YYYY-MM-DD (ex: 2026-02-28).", parent=window)
-                    return
-                
-                cat = cat_var.get()
-                desc = entry_desc.get().strip()
-                self.db.adicionar_gasto(date, val, cat, desc)
+                fin_svc.adicionar_gasto(
+                    data=entry_date.get(),
+                    valor=entry_val.get(),
+                    categoria=cat_var.get(),
+                    descricao=entry_desc.get(),
+                )
                 messagebox.showinfo("Sucesso", "Gasto registrado!", parent=window)
                 entry_val.delete(0, "end")
                 entry_desc.delete(0, "end")
                 refresh_gastos()
                 self.refresh_dashboard()
-            except ValueError:
-                messagebox.showerror("Erro", "Valor inválido.", parent=window)
+            except ValueError as exc:
+                messagebox.showerror("Erro", str(exc), parent=window)
 
         ctk.CTkButton(add_frame, text="Adicionar Gasto", command=add_gasto, fg_color="#7BBDE8", text_color="#001D39", hover_color="#49769F").pack(pady=10, padx=15, fill="x")
 
@@ -3859,13 +3832,11 @@ class App(ctk.CTk):
 
         def refresh_gastos():
             for w in list_frame.winfo_children(): w.destroy()
-            df = self.db.listar_gastos()
-            if df.empty:
+            gastos = fin_svc.listar_gastos(invertido=True)
+            if not gastos:
                 ctk.CTkLabel(list_frame, text="Nenhum gasto registrado.", text_color=("#999999", "#AAAAAA")).pack(pady=20)
             else:
-                # Mostrar últimos primeiro
-                df = df.iloc[::-1]
-                for idx, row in df.iterrows():
+                for row in gastos:
                     f = ctk.CTkFrame(list_frame, fg_color=("white", "#404040"))
                     f.pack(fill="x", pady=2, padx=5)
                     txt = f"{row['data']} - {row['categoria']}: R$ {row['valor']:.2f} ({row['descricao']})"
@@ -3873,7 +3844,7 @@ class App(ctk.CTk):
                     
                     def del_g(gasto_id=row['id']):
                         if messagebox.askyesno("Confirmar", "Deletar gasto?", parent=window):
-                            self.db.remover_gasto(gasto_id)
+                            fin_svc.remover_gasto(gasto_id)
                             refresh_gastos()
                             self.refresh_dashboard()
 
@@ -5700,35 +5671,18 @@ class App(ctk.CTk):
         # =======================
         # TAB 1: DASHBOARD
         # =======================
-        
-        # Helpers for fetching data
-        today_str = datetime.date.today().isoformat()
-        
-        # 1. Total Sales Today
-        try:
-            cursor = self.db.conn.cursor()
-            cursor.execute("SELECT SUM(valor) FROM entradas WHERE data = ?", (today_str,))
-            res = cursor.fetchone()[0]
-            sales_today = res if res else 0.0
-        except Exception: sales_today = 0.0
+        from services.relatorio_service import RelatorioService
 
-        # 2. Count Sales Today
-        try:
-            # Looking for "Venda" actions in historico for today. 
-            # Note: historico uses datetime string "YYYY-MM-DD HH:MM:SS"
-            cursor.execute("SELECT COUNT(*) FROM historico WHERE acao LIKE 'Venda%' AND data_hora LIKE ?", (f"{today_str}%",))
-            count_sales_today = cursor.fetchone()[0]
-        except Exception: count_sales_today = 0
-        
-        # 3. AI Prediction (Next Month Expenses)
-        try:
-            predictor = ai_module.ExpensePredictor(self.db)
-            prediction = predictor.predict_next_month()
-            pred_text = f"R$ {prediction:.2f}"
-            pred_details = "Baseado no histórico de gastos (IA)"
-        except Exception as e:
-            pred_text = "R$ 0.00"
-            pred_details = "Dados insuficientes para previsão."
+        rel_svc = RelatorioService(
+            self.db,
+            outbox_service=getattr(self, "outbox_service", None),
+        )
+        dash = rel_svc.dados_dashboard()
+        prev_rep = rel_svc.previsao_vendas(treinar=False)
+        sales_today = dash["faturamento_hoje"]
+        count_sales_today = dash["qtd_vendas_hoje"]
+        pred_text = prev_rep["texto"]
+        pred_details = prev_rep["detalhes"]
 
         # UI Layout for Dashboard
         dash_frame = ctk.CTkScrollableFrame(tab_dashboard, fg_color="transparent")
@@ -5768,7 +5722,7 @@ class App(ctk.CTk):
             lbl_zip_status.configure(text="Exportando em segundo plano...")
 
             def _worker():
-                ok_z, res_z = self.db.exportar_pacote_contador(mes_ano=comp, destino_zip_path=dest)
+                ok_z, res_z = rel_svc.gerar_pacote_contador(mes_ano=comp, destino_zip_path=dest)
                 def _done():
                     if not window.winfo_exists():
                         return
@@ -5818,30 +5772,20 @@ class App(ctk.CTk):
         create_card(kpi_row, "Faturamento Hoje", f"R$ {sales_today:.2f}", f"{count_sales_today} vendas realizadas", "#28a745")
         create_card(kpi_row, "Previsão Gastos (Próx. Mês)", pred_text, pred_details, "#0A4174")
 
-        # Lucro e Fiado KPI
-        try:
-            lucro_mes, fat_mes = self.db.lucro_por_periodo("mes")
-            fiado_pend = self.db.total_fiado_pendente()
-        except Exception:
-            lucro_mes, fat_mes, fiado_pend = 0, 0, 0
+        lucro_mes = dash["lucro_mes"]
+        fat_mes = dash["faturamento_mes"]
+        fiado_pend = dash["fiado_pendente"]
 
         kpi_row2 = ctk.CTkFrame(dash_frame, fg_color="transparent")
         kpi_row2.pack(fill="x", pady=5)
         create_card(kpi_row2, "Lucro do Mês", f"R$ {lucro_mes:.2f}", f"Faturamento: R$ {fat_mes:.2f}", "#6C3483")
         create_card(kpi_row2, "Fiados Pendentes", f"R$ {fiado_pend:.2f}", "Contas a receber", "#E67E22" if fiado_pend > 0 else "#28a745")
 
-        # Comparativo Mensal
-        try:
-            comp = self.db.comparativo_mensal()
-            fat_atual = comp['atual']['faturamento']
-            fat_ant = comp['anterior']['faturamento']
-            variacao = ((fat_atual - fat_ant) / fat_ant * 100) if fat_ant > 0 else 0
-            seta = "▲" if variacao >= 0 else "▼"
-            cor_var = "#28a745" if variacao >= 0 else "#FF6B6B"
-        except Exception:
-            fat_atual = fat_ant = variacao = 0
-            seta = "—"
-            cor_var = "gray"
+        fat_atual = dash["faturamento_mes_atual"]
+        fat_ant = dash["faturamento_mes_anterior"]
+        variacao = dash["variacao_mensal_pct"]
+        seta = "▲" if variacao >= 0 else "▼"
+        cor_var = "#28a745" if variacao >= 0 else "#FF6B6B"
 
         kpi_row3 = ctk.CTkFrame(dash_frame, fg_color="transparent")
         kpi_row3.pack(fill="x", pady=5)
@@ -5854,34 +5798,26 @@ class App(ctk.CTk):
         alert_frame = ctk.CTkFrame(dash_frame, fg_color=("white", "#2B2B2B"))
         alert_frame.pack(fill="x")
         
-        # Check for low stock (usa estoque mínimo configurável por produto)
-        try:
-            df_prods = self.db.produtos_abaixo_estoque_minimo()
-            if df_prods.empty:
-                ctk.CTkLabel(alert_frame, text="Nenhum produto com estoque crítico.", text_color="gray").pack(pady=20)
-            else:
-                for _, row in df_prods.iterrows():
-                    ctk.CTkLabel(alert_frame, text=f"• {row['nome']} (Restam: {row['quantidade']})", 
-                                font=("Aileron", 12, "bold"), text_color="#FF6B6B", anchor="w").pack(fill="x", padx=15, pady=2)
-        except Exception: pass
+        if not dash["alertas_estoque"]:
+            ctk.CTkLabel(alert_frame, text="Nenhum produto com estoque crítico.", text_color="gray").pack(pady=20)
+        else:
+            for row in dash["alertas_estoque"]:
+                ctk.CTkLabel(alert_frame, text=f"• {row['nome']} (Restam: {row['quantidade']})",
+                            font=("Aileron", 12, "bold"), text_color="#FF6B6B", anchor="w").pack(fill="x", padx=15, pady=2)
 
         # Alerta de Validade
         ctk.CTkLabel(dash_frame, text="Produtos com Validade Próxima", font=("Aileron", 16, "bold"), text_color="#E67E22").pack(pady=(20, 5), anchor="w")
         val_frame = ctk.CTkFrame(dash_frame, fg_color=("white", "#2B2B2B"))
         val_frame.pack(fill="x")
-        try:
-            df_venc = self.db.verificar_produtos_vencendo(dias_alerta=7)
-            if df_venc.empty:
-                ctk.CTkLabel(val_frame, text="Nenhum produto vencendo nos próximos 7 dias.", text_color="gray").pack(pady=20)
-            else:
-                for _, row in df_venc.iterrows():
-                    venc_date = row['data_validade']
-                    is_vencido = venc_date < datetime.date.today().isoformat()
-                    status_txt = "VENCIDO!" if is_vencido else f"Vence: {venc_date}"
-                    cor = "#FF0000" if is_vencido else "#E67E22"
-                    ctk.CTkLabel(val_frame, text=f"• {row['nome']} (Qtd: {row['quantidade']}) - {status_txt}",
-                                font=("Aileron", 12, "bold"), text_color=cor, anchor="w").pack(fill="x", padx=15, pady=2)
-        except Exception: pass
+        if not dash["alertas_validade"]:
+            ctk.CTkLabel(val_frame, text="Nenhum produto vencendo nos próximos 7 dias.", text_color="gray").pack(pady=20)
+        else:
+            for row in dash["alertas_validade"]:
+                venc_date = row['data_validade']
+                status_txt = "VENCIDO!" if row['vencido'] else f"Vence: {venc_date}"
+                cor = "#FF0000" if row['vencido'] else "#E67E22"
+                ctk.CTkLabel(val_frame, text=f"• {row['nome']} (Qtd: {row['quantidade']}) - {status_txt}",
+                            font=("Aileron", 12, "bold"), text_color=cor, anchor="w").pack(fill="x", padx=15, pady=2)
 
         # =======================
         # TAB 2: VENDAS
@@ -5917,18 +5853,11 @@ class App(ctk.CTk):
             periodo_map = {"Hoje": "hoje", "Semana": "semana", "Mês": "mes", "Ano": "ano", "Todos": "todos"}
             per = periodo_map.get(combo_venda_periodo.get(), "todos")
             try:
-                df_v = self.db.listar_vendas(per)
-                if df_v.empty: return
-                # Buscar nomes de produtos
-                df_p = self.db.listar_produtos()
-                prod_names = dict(zip(df_p['id'], df_p['nome'])) if not df_p.empty else {}
-                for _, r in df_v.iterrows():
-                    p_nome = prod_names.get(r.get('produto_id'), 'Kit/Outro')
-                    data_fmt = str(r.get('data_venda', ''))[:16]
+                for r in rel_svc.listar_vendas_relatorio(per):
                     tree_vendas.insert("", "end", values=(
-                        r.get('id'), data_fmt, p_nome, r.get('quantidade'),
-                        f"R$ {r.get('valor_total', 0):.2f}", f"R$ {r.get('lucro', 0):.2f}",
-                        r.get('forma_pagamento', 'N/A'), r.get('cliente', 'N/A'), r.get('status', 'N/A')
+                        r['id'], r['data_venda'], r['produto_nome'], r['quantidade'],
+                        f"R$ {r['valor_total']:.2f}", f"R$ {r['lucro']:.2f}",
+                        r['forma_pagamento'], r['cliente'], r['status']
                     ))
             except Exception as e:
                 logger.warning("Erro ao listar vendas: %s", e)
@@ -5971,11 +5900,11 @@ class App(ctk.CTk):
         # Vendas por forma de pagamento
         ctk.CTkLabel(vendas_scroll, text="Vendas por Forma de Pagamento (Mês)", font=("Aileron", 14, "bold"), text_color=("#001D39", "white")).pack(pady=(15, 5), anchor="w")
         try:
-            df_pgto = self.db.vendas_por_forma_pagamento("mes")
-            if not df_pgto.empty:
+            pgto_rows = rel_svc.vendas_por_forma_pagamento("mes")
+            if pgto_rows:
                 pgto_frame_r = ctk.CTkFrame(vendas_scroll, fg_color=("white", "#2B2B2B"), corner_radius=10)
                 pgto_frame_r.pack(fill="x", pady=5)
-                for _, r in df_pgto.iterrows():
+                for r in pgto_rows:
                     ctk.CTkLabel(pgto_frame_r, text=f"  {r['forma']}: R$ {r['total']:.2f} ({int(r['qtd'])} vendas)",
                                 font=("Aileron", 12), text_color=("#333", "white"), anchor="w").pack(fill="x", padx=15, pady=3)
             else:
@@ -5992,21 +5921,20 @@ class App(ctk.CTk):
 
         ctk.CTkLabel(lucro_scroll, text="Análise de Lucro & Ranking", font=("Aileron", 18, "bold"), text_color=("#001D39", "white")).pack(pady=10, anchor="w")
 
+        dados_lr = rel_svc.dados_lucro_e_ranking(dias_grafico=30, limite_top=10)
+
         # Lucro por período
         lucro_cards = ctk.CTkFrame(lucro_scroll, fg_color="transparent")
         lucro_cards.pack(fill="x", pady=5)
         for label, per in [("Hoje", "hoje"), ("Semana", "semana"), ("Mês", "mes"), ("Ano", "ano")]:
-            try:
-                l, f = self.db.lucro_por_periodo(per)
-            except Exception:
-                l, f = 0, 0
-            create_card(lucro_cards, f"Lucro {label}", f"R$ {l:.2f}", f"Fat: R$ {f:.2f}", "#6C3483")
+            lp = dados_lr["lucros_periodo"].get(per, {"lucro": 0.0, "faturamento": 0.0})
+            create_card(lucro_cards, f"Lucro {label}", f"R$ {lp['lucro']:.2f}", f"Fat: R$ {lp['faturamento']:.2f}", "#6C3483")
 
         # Ranking de Produtos
         ctk.CTkLabel(lucro_scroll, text="Top 10 Produtos Mais Vendidos (Mês)", font=("Aileron", 14, "bold"), text_color=("#001D39", "white")).pack(pady=(15, 5), anchor="w")
         try:
-            df_rank = self.db.ranking_produtos_vendidos("mes", 10)
-            if not df_rank.empty:
+            rank_rows = dados_lr["ranking_vendidos"]
+            if rank_rows:
                 rank_frame = ctk.CTkFrame(lucro_scroll, fg_color="transparent", height=200)
                 rank_frame.pack(fill="both", expand=True, pady=5)
                 rank_frame.pack_propagate(False)
@@ -6016,7 +5944,7 @@ class App(ctk.CTk):
                     tree_rank.heading(c, text=h)
                     tree_rank.column(c, width=w, anchor="center" if c in ("pos", "qtd") else "w")
                 tree_rank.pack(fill="both", expand=True)
-                for i, (_, r) in enumerate(df_rank.iterrows(), 1):
+                for i, r in enumerate(rank_rows, 1):
                     tree_rank.insert("", "end", values=(i, r['nome'] or 'N/A', int(r['total_vendido']), f"R$ {r['faturamento']:.2f}", f"R$ {r['lucro_total']:.2f}"))
             else:
                 ctk.CTkLabel(lucro_scroll, text="Sem dados de vendas para ranking.", text_color="gray").pack()
@@ -6026,8 +5954,8 @@ class App(ctk.CTk):
         # Ranking de Lucro por Produto/Tamanho
         ctk.CTkLabel(lucro_scroll, text="Top 10 Lucro por Produto / Tamanho (Mês)", font=("Aileron", 14, "bold"), text_color=("#001D39", "white")).pack(pady=(15, 5), anchor="w")
         try:
-            df_lucro_tam = self.db.ranking_produtos_por_lucro("mes", 10)
-            if not df_lucro_tam.empty:
+            lt_rows = dados_lr["ranking_lucro_tamanho"]
+            if lt_rows:
                 lt_frame = ctk.CTkFrame(lucro_scroll, fg_color="transparent", height=200)
                 lt_frame.pack(fill="both", expand=True, pady=5)
                 lt_frame.pack_propagate(False)
@@ -6037,7 +5965,7 @@ class App(ctk.CTk):
                     tree_lt.heading(c, text=h)
                     tree_lt.column(c, width=w, anchor="center" if c in ("pos", "qtd", "tamanho") else "w")
                 tree_lt.pack(fill="both", expand=True)
-                for i, (_, r) in enumerate(df_lucro_tam.iterrows(), 1):
+                for i, r in enumerate(lt_rows, 1):
                     tam = r.get('tamanho', '') or 'Único'
                     tree_lt.insert("", "end", values=(i, r['nome'] or 'N/A', tam, int(r['total_vendido']), f"R$ {r['faturamento']:.2f}", f"R$ {r['lucro_total']:.2f}"))
             else:
@@ -6048,8 +5976,9 @@ class App(ctk.CTk):
         # Curva ABC (Análise de Pareto)
         ctk.CTkLabel(lucro_scroll, text="📊 Curva ABC (Pareto) — Mês", font=("Aileron", 14, "bold"), text_color=("#001D39", "white")).pack(pady=(15, 5), anchor="w")
         try:
-            df_abc = self.db.curva_abc("mes")
-            if not df_abc.empty:
+            abc_itens = dados_lr["curva_abc"]["itens"]
+            abc_contagem = dados_lr["curva_abc"]["contagem"]
+            if abc_itens:
                 abc_frame = ctk.CTkFrame(lucro_scroll, fg_color="transparent", height=220)
                 abc_frame.pack(fill="both", expand=True, pady=5)
                 abc_frame.pack_propagate(False)
@@ -6062,7 +5991,7 @@ class App(ctk.CTk):
                 tree_abc.tag_configure("B", background="#FFF3CD")
                 tree_abc.tag_configure("C", background="#F8D7DA")
                 tree_abc.pack(fill="both", expand=True)
-                for _, r in df_abc.iterrows():
+                for r in abc_itens:
                     tree_abc.insert("", "end", values=(
                         r['classe'], r['nome'] or 'N/A',
                         f"R$ {r['faturamento']:.2f}", f"{r['pct']:.1f}%", f"{r['pct_acum']:.1f}%"
@@ -6071,7 +6000,7 @@ class App(ctk.CTk):
                 resumo_f = ctk.CTkFrame(lucro_scroll, fg_color="transparent")
                 resumo_f.pack(fill="x", pady=5)
                 for cls, cor, desc in [("A", "#28a745", "80% do faturamento"), ("B", "#ffc107", "15% do faturamento"), ("C", "#dc3545", "5% do faturamento")]:
-                    n = len(df_abc[df_abc['classe'] == cls])
+                    n = abc_contagem.get(cls, 0)
                     ctk.CTkLabel(resumo_f, text=f"  {cls}: {n} produtos ({desc})  ", font=("Aileron", 11, "bold"),
                                 fg_color=cor, text_color="white" if cls != "B" else "#333", corner_radius=5).pack(side="left", padx=3)
             else:
@@ -6085,15 +6014,18 @@ class App(ctk.CTk):
             from matplotlib.figure import Figure
             from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
-            df_dias = self.db.vendas_por_dia(30)
-            if not df_dias.empty:
+            serie_dias = dados_lr["serie_diaria"]
+            dias_lista = serie_dias["dias"]
+            if dias_lista:
                 fig = Figure(figsize=(9, 3), dpi=80)
                 ax = fig.add_subplot(111)
-                ax.fill_between(range(len(df_dias)), df_dias['faturamento'], alpha=0.3, color='#28a745')
-                ax.plot(range(len(df_dias)), df_dias['faturamento'], color='#28a745', linewidth=2, marker='o', markersize=3)
-                ax.plot(range(len(df_dias)), df_dias['lucro'], color='#6C3483', linewidth=2, linestyle='--', marker='s', markersize=3)
-                ax.set_xticks(range(0, len(df_dias), max(1, len(df_dias) // 7)))
-                ax.set_xticklabels([str(d)[-5:] for d in df_dias['dia'].iloc[::max(1, len(df_dias) // 7)]], rotation=45, fontsize=7)
+                n_pts = len(dias_lista)
+                ax.fill_between(range(n_pts), serie_dias['faturamento'], alpha=0.3, color='#28a745')
+                ax.plot(range(n_pts), serie_dias['faturamento'], color='#28a745', linewidth=2, marker='o', markersize=3)
+                ax.plot(range(n_pts), serie_dias['lucro'], color='#6C3483', linewidth=2, linestyle='--', marker='s', markersize=3)
+                passo = max(1, n_pts // 7)
+                ax.set_xticks(range(0, n_pts, passo))
+                ax.set_xticklabels([str(d)[-5:] for d in dias_lista[::passo]], rotation=45, fontsize=7)
                 ax.set_ylabel("R$", fontsize=9)
                 ax.legend(["Faturamento", "Lucro"], fontsize=8)
                 ax.grid(True, alpha=0.3)
@@ -6126,11 +6058,7 @@ class App(ctk.CTk):
 
         ctk.CTkLabel(fiado_scroll, text="Contas a Receber (Fiado)", font=("Aileron", 18, "bold"), text_color=("#001D39", "white")).pack(pady=10, anchor="w")
 
-        # Total pendente
-        try:
-            total_fiado = self.db.total_fiado_pendente()
-        except Exception:
-            total_fiado = 0
+        total_fiado = dash["fiado_pendente"]
         ctk.CTkLabel(fiado_scroll, text=f"Total Pendente: R$ {total_fiado:.2f}", font=("Aileron", 16, "bold"),
                     text_color="#E67E22" if total_fiado > 0 else "#28a745").pack(pady=5, anchor="w")
 
@@ -6156,11 +6084,9 @@ class App(ctk.CTk):
 
         def carregar_fiados():
             for i in tree_fiado.get_children(): tree_fiado.delete(i)
-            status = combo_fiado_status.get()
-            status_param = None if status == "Todos" else status
             try:
-                df_f = self.db.listar_fiados(status=status_param)
-                for _, r in df_f.iterrows():
+                res_f = rel_svc.listar_fiados(status=combo_fiado_status.get())
+                for r in res_f["itens"]:
                     tree_fiado.insert("", "end", values=(
                         r['id'], r.get('cliente_nome', 'N/A'), f"R$ {r['valor']:.2f}",
                         r['data_venda'], r.get('data_vencimento', 'N/A'), r['status']
@@ -6177,7 +6103,7 @@ class App(ctk.CTk):
                 return
             conta_id = tree_fiado.item(sel[0])['values'][0]
             if messagebox.askyesno("Confirmar", f"Marcar conta #{conta_id} como paga?", parent=window):
-                self.db.quitar_fiado(conta_id)
+                rel_svc.quitar_fiado(conta_id)
                 messagebox.showinfo("Sucesso", "Conta quitada!", parent=window)
                 carregar_fiados()
 
@@ -6187,25 +6113,12 @@ class App(ctk.CTk):
                 messagebox.showwarning("Aviso", "Selecione uma conta na lista para cobrar via WhatsApp.", parent=window)
                 return
             vals = tree_fiado.item(sel[0])['values']
-            conta_id, cli_nome, val_str, dt_venda, dt_venc, st_conta = vals[0], vals[1], str(vals[2]), vals[3], vals[4], vals[5]
+            conta_id, cli_nome, st_conta = vals[0], vals[1], vals[5]
             if st_conta == "Pago":
                 messagebox.showinfo("Já Quitada", "Esta conta já consta como paga.", parent=window)
                 return
-            try:
-                valor_num = float(val_str.replace("R$", "").replace(",", ".").strip())
-            except ValueError:
-                valor_num = 0.0
 
-            # Buscar telefone do cliente
-            contato = ""
-            try:
-                df_cli = self.db.listar_clientes()
-                m_cli = df_cli[df_cli['nome'] == cli_nome]
-                if not m_cli.empty:
-                    contato = str(m_cli.iloc[0].get('contato', '') or '').strip()
-            except Exception:
-                pass
-
+            contato = rel_svc.obter_telefone_cliente(cli_nome)
             if not contato:
                 from tkinter import simpledialog
                 contato = simpledialog.askstring(
@@ -6216,35 +6129,22 @@ class App(ctk.CTk):
                 if not contato.strip():
                     return
 
-            config_nota = self.db.get_config_nota()
-            nome_emp = config_nota.get("empresa_nome") or "Nossa Loja"
-            chave_pix = (config_nota.get("chave_pix") or "").strip()
-
-            msg_cobranca = (
-                f"Olá, *{cli_nome}*! Tudo bem? 😊\n\n"
-                f"Passando para lembrar do lançamento em aberto na *{nome_emp}*:\n"
-                f"• *Referência:* Conta #{conta_id} (Data: {dt_venda})\n"
-                f"• *Vencimento:* {dt_venc}\n"
-                f"• *Valor:* R$ {valor_num:.2f}\n"
-            )
-            if chave_pix:
-                try:
-                    from printer import gerar_payload_pix
-                    payload_pix = gerar_payload_pix(chave_pix, nome_emp, "BRASIL", valor=valor_num)
-                    msg_cobranca += (
-                        f"\n💠 *Chave PIX:* {chave_pix}\n"
-                        f"📋 *PIX Copia e Cola:*\n{payload_pix}\n"
-                    )
-                except Exception:
-                    msg_cobranca += f"\n💠 *Chave PIX:* {chave_pix}\n"
-
-            msg_cobranca += "\nQualquer dúvida ou se já tiver realizado o pagamento, é só nos responder por aqui. Muito obrigado!"
+            try:
+                cobr = rel_svc.gerar_cobranca_fiado_pix(
+                    conta_id=int(conta_id),
+                    telefone=contato,
+                    usar_mercadopago=False,
+                    enfileirar_whatsapp=False,
+                )
+            except ValueError as exc:
+                messagebox.showwarning("Erro WhatsApp", str(exc), parent=window)
+                return
 
             ok_q, info_q = self._enviar_whatsapp_resiliente(
-                contato, msg_cobranca, metadata={"origem": "cobranca_fiado"}
+                cobr["telefone"], cobr["mensagem"], metadata={"origem": "cobranca_fiado"}
             )
             if ok_q:
-                messagebox.showinfo("WhatsApp (Outbox)", f"Cobrança para {cli_nome} ({contato}) adicionada à fila Outbox.", parent=window)
+                messagebox.showinfo("WhatsApp (Outbox)", f"Cobrança para {cli_nome} ({cobr['telefone']}) adicionada à fila Outbox.", parent=window)
             else:
                 messagebox.showwarning("Erro WhatsApp", f"Não foi possível enfileirar: {info_q}", parent=window)
 
@@ -6299,55 +6199,9 @@ class App(ctk.CTk):
         tree.configure(yscrollcommand=scrollbar.set)
         
         def aplicar_filtro():
-            # Limpar
             for i in tree.get_children(): tree.delete(i)
-            
-            tipo = combo_tipo.get()
-            periodo = combo_periodo.get()
-            
-            # Construir query base
-            # Note: SQLite date comparisons on strings work if format is ISO YYYY-MM-DD
-            query = "SELECT * FROM historico"
-            params = []
-            conditions = []
-            
-            # Filtro Data (Naive implementation assuming YYYY-MM-DD starts)
-            today = datetime.date.today()
-            if periodo == "Hoje":
-                conditions.append("data_hora LIKE ?")
-                params.append(f"{today.isoformat()}%")
-            elif periodo == "Últimos 7 dias":
-                limit_date = today - datetime.timedelta(days=7)
-                conditions.append("data_hora >= ?")
-                params.append(limit_date.isoformat())
-            elif periodo == "Últimos 30 dias":
-                limit_date = today - datetime.timedelta(days=30)
-                conditions.append("data_hora >= ?")
-                params.append(limit_date.isoformat())
-                
-            # Combinar SQL
-            if conditions:
-                query += " WHERE " + " AND ".join(conditions)
-            
-            query += " ORDER BY id DESC"
-            
             try:
-                df = pd.read_sql_query(query, self.db.conn, params=params)
-                
-                if df.empty: return
-                
-                for _, row in df.iterrows():
-                    # Filtro "Tipo" em memória (mais fácil que SQL complexo para texto vago)
-                    if tipo != "Tudo":
-                        matches = False
-                        acao_lower = row['acao'].lower()
-                        if tipo == "Venda" and ("venda" in acao_lower or "saída" in acao_lower): matches = True
-                        elif tipo == "Estoque" and ("produto" in acao_lower or "estoque" in acao_lower or "kit" in acao_lower): matches = True
-                        elif tipo == "Financeiro" and ("gasto" in acao_lower or "saldo" in acao_lower or "pagamento" in acao_lower): matches = True
-                        elif tipo == "Sistema" and ("login" in acao_lower or "config" in acao_lower): matches = True
-                        
-                        if not matches: continue
-                    
+                for row in rel_svc.listar_historico(periodo=combo_periodo.get(), tipo=combo_tipo.get()):
                     tree.insert("", "end", values=(row['id'], row['data_hora'], row['acao'], row['detalhe']))
             except Exception as e:
                 logger.warning("Erro filtro: %s", e)
@@ -6357,8 +6211,7 @@ class App(ctk.CTk):
         def exportar_csv():
             filename = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV Files", "*.csv")])
             if filename:
-                df = pd.read_sql_query("SELECT * FROM historico", self.db.conn)
-                df.to_csv(filename, index=False)
+                rel_svc.exportar_historico_csv(filename)
                 messagebox.showinfo("Sucesso", "Relatório exportado!", parent=window)
         
         ctk.CTkButton(filter_frame, text="Exportar Dados (CSV)", command=exportar_csv, width=150, fg_color="#0A4174", hover_color="#062F56").pack(side="right", padx=15)
@@ -6998,13 +6851,16 @@ class App(ctk.CTk):
         tab_historico = tabview.add("Histórico")
 
         # --- CONTEXTO OPERADOR ---
+        from services.caixa_service import CaixaService
+
+        caixa_svc = CaixaService(self.db, operador=self.current_user)
         user_id = self.current_user.get("id") if self.current_user else 1
         loja_id = self.current_user.get("loja_id") if self.current_user else 1
         nome_operador = self.current_user.get("nome") if self.current_user else "Operador"
 
         # --- TAB CAIXA ---
-        caixa_aberto = self.db.caixa_aberto(user_id)
-        resumo_caixa = self.db.resumo_caixa_atual(usuario_id=user_id) if caixa_aberto else None
+        caixa_aberto = caixa_svc.caixa_aberto(user_id)
+        resumo_caixa = caixa_svc.resumo_caixa(usuario_id=user_id) if caixa_aberto else None
 
         status_frame = ctk.CTkFrame(tab_caixa, fg_color=("white", "#2B2B2B"), corner_radius=15)
         status_frame.pack(fill="x", padx=10, pady=10)
@@ -7064,7 +6920,7 @@ class App(ctk.CTk):
                     return
 
                 obs = entry_obs_fecha.get().strip()
-                ok, resultado = self.db.fechar_caixa(
+                ok, resultado = caixa_svc.fechar_caixa(
                     valor,
                     obs,
                     usuario_id=user_id,
@@ -7072,14 +6928,7 @@ class App(ctk.CTk):
                     conferido_cartao=val_cartao,
                 )
                 if ok:
-                    resumo = (
-                        f"Caixa fechado com sucesso!\n\n"
-                        f"Vendas no período: R$ {resultado['total_vendas']:.2f}\n"
-                        f"Abertura: R$ {resultado['valor_abertura']:.2f} | Suprimentos: R$ {resultado.get('total_suprimentos', 0.0):.2f} | Sangrias: R$ {resultado['total_sangrias']:.2f}\n\n"
-                        f"• Dinheiro — Esperado: R$ {resultado['esperado']:.2f} | Informado: R$ {resultado['informado']:.2f} | Dif.: R$ {resultado['diferenca']:.2f}\n"
-                        f"• PIX      — Esperado: R$ {resultado['total_pix']:.2f} | Informado: R$ {resultado.get('conferido_pix', 0.0):.2f} | Dif.: R$ {resultado.get('diferenca_pix', 0.0):.2f}\n"
-                        f"• Cartão   — Esperado: R$ {resultado['total_cartao']:.2f} | Informado: R$ {resultado.get('conferido_cartao', 0.0):.2f} | Dif.: R$ {resultado.get('diferenca_cartao', 0.0):.2f}"
-                    )
+                    resumo = caixa_svc.formatar_resumo_fechamento(resultado)
                     messagebox.showinfo("Caixa Fechado — Resultado da Conferência", resumo, parent=dialog)
                     
                     # Propor a exportação em PDF do Relatório
@@ -7096,13 +6945,7 @@ class App(ctk.CTk):
                                 from services.relatorio_caixa import gerar_pdf_fechamento
                                 resultado['usuario_id'] = user_id
                                 resultado['loja_id'] = loja_id
-                                # buscar fiado para o pdf
-                                cursor_temp = self.db.conn.cursor()
-                                cursor_temp.execute(
-                                    "SELECT COALESCE(SUM(valor_fiado), 0) FROM vendas WHERE caixa_id = ? AND status = 'Concluída'",
-                                    (resultado['id'],)
-                                )
-                                resultado['total_fiado'] = cursor_temp.fetchone()[0]
+                                resultado['total_fiado'] = caixa_svc.obter_total_fiado_caixa(resultado['id'])
                                 gerar_pdf_fechamento(resultado, filepath)
                                 messagebox.showinfo("Sucesso", f"Relatório salvo com sucesso em:\n{filepath}", parent=dialog)
                                 # Abrir PDF automaticamente no Windows
@@ -7170,7 +7013,7 @@ class App(ctk.CTk):
                 except ValueError:
                     valor = 0.0
                 obs = entry_obs_abre.get().strip()
-                ok, msg = self.db.abrir_caixa(valor, obs, usuario_id=user_id, loja_id=loja_id)
+                ok, msg = caixa_svc.abrir_caixa(valor, obs, usuario_id=user_id, loja_id=loja_id)
                 if ok:
                     messagebox.showinfo("Sucesso", msg, parent=dialog)
                     dialog.grab_release()
@@ -7233,23 +7076,22 @@ class App(ctk.CTk):
             def _atualizar_lista_sangrias():
                 for widget in list_frame.winfo_children():
                     widget.destroy()
-                df_s = self.db.listar_sangrias(caixa_aberto['id'])
-                df_sup = self.db.listar_suprimentos(caixa_aberto['id']) if hasattr(self.db, 'listar_suprimentos') else pd.DataFrame()
-                if df_s.empty and df_sup.empty:
+                movs = caixa_svc.listar_movimentacoes_turno(caixa_aberto['id'])
+                sangrias = movs["sangrias"]
+                suprimentos = movs["suprimentos"]
+                if not sangrias and not suprimentos:
                     ctk.CTkLabel(list_frame, text="Nenhuma sangria ou suprimento no turno.", font=("Aileron", 11), text_color=("#555", "#CCC")).pack(pady=15)
                 else:
-                    if not df_sup.empty:
-                        for _, sup_row in df_sup.iterrows():
-                            s_card = ctk.CTkFrame(list_frame, fg_color=("#E8F5E9", "#1E3A2B"), corner_radius=8)
-                            s_card.pack(fill="x", pady=2, padx=2)
-                            lbl_info = f"[SUPRIMENTO] +R$ {sup_row['valor']:.2f} - {sup_row['motivo']}\nObs: {sup_row['observacao'] or ''}"
-                            ctk.CTkLabel(s_card, text=lbl_info, font=("Aileron", 11), justify="left", anchor="w").pack(padx=8, pady=4, fill="x")
-                    if not df_s.empty:
-                        for _, s_row in df_s.iterrows():
-                            s_card = ctk.CTkFrame(list_frame, fg_color=("gray95", "#3A3A3A"), corner_radius=8)
-                            s_card.pack(fill="x", pady=2, padx=2)
-                            lbl_info = f"[SANGRIA] -R$ {s_row['valor']:.2f} - {s_row['motivo']}\nObs: {s_row['observacao'] or ''}"
-                            ctk.CTkLabel(s_card, text=lbl_info, font=("Aileron", 11), justify="left", anchor="w").pack(padx=8, pady=4, fill="x")
+                    for sup_row in suprimentos:
+                        s_card = ctk.CTkFrame(list_frame, fg_color=("#E8F5E9", "#1E3A2B"), corner_radius=8)
+                        s_card.pack(fill="x", pady=2, padx=2)
+                        lbl_info = f"[SUPRIMENTO] +R$ {sup_row['valor']:.2f} - {sup_row['motivo']}\nObs: {sup_row['observacao'] or ''}"
+                        ctk.CTkLabel(s_card, text=lbl_info, font=("Aileron", 11), justify="left", anchor="w").pack(padx=8, pady=4, fill="x")
+                    for s_row in sangrias:
+                        s_card = ctk.CTkFrame(list_frame, fg_color=("gray95", "#3A3A3A"), corner_radius=8)
+                        s_card.pack(fill="x", pady=2, padx=2)
+                        lbl_info = f"[SANGRIA] -R$ {s_row['valor']:.2f} - {s_row['motivo']}\nObs: {s_row['observacao'] or ''}"
+                        ctk.CTkLabel(s_card, text=lbl_info, font=("Aileron", 11), justify="left", anchor="w").pack(padx=8, pady=4, fill="x")
 
             def _salvar_sangria():
                 try:
@@ -7263,12 +7105,33 @@ class App(ctk.CTk):
                 tipo_op = combo_tipo_mov.get()
 
                 if "Suprimento" in tipo_op:
-                    ok, msg = self.db.registrar_suprimento(caixa_aberto['id'], user_id, val, motivo, obs)
+                    ok, msg = caixa_svc.registrar_suprimento(
+                        val, motivo, caixa_id=caixa_aberto['id'], usuario_id=user_id, observacao=obs
+                    )
                     titulo_ok = "Suprimento registrado!"
                 else:
-                    if not self._exigir_supervisor(f"Sangria de R$ {val:.2f} ({motivo})", parent=dialog):
+                    from views.supervisor_dialog import solicitar_autorizacao_supervisor
+
+                    ok_sup, sup_info = solicitar_autorizacao_supervisor(
+                        self,
+                        acao=f"Sangria de R$ {val:.2f} ({motivo})",
+                        exigir_motivo=False,
+                        parent=dialog,
+                    )
+                    if not ok_sup:
                         return
-                    ok, msg = self.db.registrar_sangria(caixa_aberto['id'], user_id, val, motivo, obs)
+                    try:
+                        ok, msg = caixa_svc.registrar_sangria(
+                            val,
+                            motivo,
+                            autorizacao=sup_info,
+                            caixa_id=caixa_aberto['id'],
+                            usuario_id=user_id,
+                            observacao=obs,
+                        )
+                    except PermissionError as perm_err:
+                        messagebox.showerror("Acesso Negado", str(perm_err), parent=dialog)
+                        return
                     titulo_ok = "Sangria registrada!"
 
                 if ok:
@@ -7307,14 +7170,14 @@ class App(ctk.CTk):
             _atualizar_lista_sangrias()
 
         # --- TAB HISTÓRICO ---
-        df_hist = self.db.historico_caixa(60)
-        if df_hist.empty:
+        hist_rows = caixa_svc.historico_caixa(60)
+        if not hist_rows:
             ctk.CTkLabel(tab_historico, text="Nenhum registro de caixa encontrado.",
                         font=("Aileron", 12), text_color=("#555", "#CCC")).pack(pady=30)
         else:
             hist_scroll = ctk.CTkScrollableFrame(tab_historico, fg_color="transparent")
             hist_scroll.pack(fill="both", expand=True, padx=5, pady=5)
-            for _, row in df_hist.iterrows():
+            for row in hist_rows:
                 card = ctk.CTkFrame(hist_scroll, fg_color=("white", "#2B2B2B"), corner_radius=10)
                 card.pack(fill="x", padx=5, pady=3)
                 data_ab = str(row.get('data_abertura', ''))[:16].replace('T', ' ')
@@ -8407,14 +8270,24 @@ class App(ctk.CTk):
         e_pessoas.insert(0, "2")
         e_pessoas.pack()
 
-        lbl_result = ctk.CTkLabel(frame, text="", font=("Aileron", 18, "bold"), text_color="#28a745")
+        lbl_result = ctk.CTkLabel(frame, text="", font=("Aileron", 15, "bold"), text_color="#28a745", wraplength=300)
         lbl_result.pack(pady=15)
 
         def _calc(*_):
+            from collections import Counter
             from services.servico_service import ServicoService
             try:
                 resultado = ServicoService(self.db).dividir_conta(comanda_id, e_pessoas.get())
-                lbl_result.configure(text=f"R$ {resultado['valor_por_pessoa']:.2f} por pessoa")
+                partes = resultado.get("partes") or []
+                if partes:
+                    contagem = Counter(partes)
+                    texto = " + ".join(
+                        f"{qtd} × R$ {val:.2f}".replace(".", ",")
+                        for val, qtd in contagem.items()
+                    )
+                    lbl_result.configure(text=texto)
+                else:
+                    lbl_result.configure(text=f"R$ {resultado['valor_por_pessoa']:.2f} por pessoa")
             except ValueError:
                 pass
 

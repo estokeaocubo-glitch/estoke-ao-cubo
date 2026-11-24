@@ -728,3 +728,83 @@ class TestCancelamentoFiscalAssincrono:
 
         assert dt_prox < dt_limite, f"proximo_envio ({dt_prox}) ultrapassou o prazo de 30 min ({dt_limite})"
         assert dt_prox == t_28m + dt.timedelta(seconds=110)  # min(300s, 120s - 10s) = 110s -> 29m50s!
+
+    def test_21_migracao_aditiva_autorizado_em_em_banco_v9_idempotente(self, tmp_path):
+        """
+        21. Banco já no schema v9 sem a coluna nfce_documentos.autorizado_em:
+            - 1ª execução de run_migrations cria a coluna;
+            - 2ª execução de run_migrations não lança erro (idempotente);
+            - registros preexistentes permanecem com autorizado_em NULL.
+        """
+        import sqlite3
+        import migrations
+
+        db_file = tmp_path / "legado_v9_sem_autorizado_em.db"
+        conn = sqlite3.connect(str(db_file))
+        try:
+            conn.execute(
+                """
+                CREATE TABLE db_version (
+                    versao TEXT PRIMARY KEY,
+                    data_migr TEXT DEFAULT CURRENT_TIMESTAMP,
+                    descricao TEXT
+                )
+                """
+            )
+            conn.execute(
+                "INSERT INTO db_version (versao, descricao) VALUES ('schema_v9', '4.6-fiscal legado')"
+            )
+            conn.execute(
+                """
+                CREATE TABLE nfce_documentos (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    transacao_id TEXT NOT NULL UNIQUE,
+                    referencia_focus TEXT NOT NULL UNIQUE,
+                    ambiente TEXT NOT NULL DEFAULT 'homologacao',
+                    serie INTEGER DEFAULT 1,
+                    numero INTEGER,
+                    chave_nfe TEXT,
+                    protocolo TEXT,
+                    status TEXT NOT NULL DEFAULT 'pendente_emissao',
+                    status_sefaz TEXT,
+                    mensagem_sefaz TEXT,
+                    xml_path TEXT,
+                    danfe_url TEXT,
+                    qrcode_url TEXT,
+                    url_consulta_nf TEXT,
+                    justificativa_cancelamento TEXT,
+                    payload_json TEXT DEFAULT '{}',
+                    criado_em TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+                    atualizado_em TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+                )
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO nfce_documentos (transacao_id, referencia_focus, status, numero, chave_nfe)
+                VALUES ('tx_legado_v9', 'estoke_tx_legado_v9', 'autorizado', 101, '35261100000000000191650010000001011000001010')
+                """
+            )
+            migrations.set_user_version(conn, 9)
+            conn.commit()
+
+            cols_antes = [r[1] for r in conn.execute("PRAGMA table_info(nfce_documentos)").fetchall()]
+            assert "autorizado_em" not in cols_antes
+
+            # 1ª execução: deve adicionar autorizado_em em banco já na v9
+            v1 = migrations.run_migrations(conn)
+            assert v1 == 9
+            cols_depois = [r[1] for r in conn.execute("PRAGMA table_info(nfce_documentos)").fetchall()]
+            assert "autorizado_em" in cols_depois
+
+            # 2ª execução: idempotente, sem erro
+            v2 = migrations.run_migrations(conn)
+            assert v2 == 9
+
+            # Registro antigo deve permanecer com autorizado_em NULL (None)
+            row = conn.execute(
+                "SELECT transacao_id, status, autorizado_em FROM nfce_documentos WHERE transacao_id = 'tx_legado_v9'"
+            ).fetchone()
+            assert row == ("tx_legado_v9", "autorizado", None)
+        finally:
+            conn.close()
