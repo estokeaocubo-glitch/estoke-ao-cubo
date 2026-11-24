@@ -12,6 +12,7 @@ import base64
 import datetime as dt
 import json
 import logging
+import os
 import re
 import socket
 import urllib.error
@@ -29,9 +30,88 @@ FiscalStatus = Literal[
     "rejeitado",
     "pendente_emissao",
     "cancelado",
+    "cancelamento_pendente",
     "cancelamento_recusado",
     "erro_comunicacao",
 ]
+
+NFCE_PRAZO_CANCELAMENTO_MIN_DEFAULT = 30
+
+
+def obter_prazo_cancelamento_min(config_nota: dict[str, Any] | None = None) -> int:
+    """Retorna o prazo legal de cancelamento da NFC-e em minutos (padrão 30 min)."""
+    env_val = os.environ.get("NFCE_PRAZO_CANCELAMENTO_MIN", "").strip()
+    if env_val:
+        try:
+            return max(1, int(env_val))
+        except ValueError:
+            pass
+    if isinstance(config_nota, dict) and config_nota.get("nfce_prazo_cancelamento_min"):
+        try:
+            return max(1, int(config_nota["nfce_prazo_cancelamento_min"]))
+        except (TypeError, ValueError):
+            pass
+    return NFCE_PRAZO_CANCELAMENTO_MIN_DEFAULT
+
+
+def classificar_resposta_cancelamento(
+    code: int | None,
+    resp: dict[str, Any] | None = None,
+    exc: Exception | None = None,
+) -> tuple[str, str, bool]:
+    """
+    Classifica resposta HTTP/exceção de cancelamento da Focus NFe.
+    Retorna (status_fiscal, mensagem, permanente):
+    - ('cancelado', msg, True) para sucesso ou 'já cancelada' (idempotência)
+    - ('cancelamento_pendente', msg, False) para timeout, rede, HTTP 5xx ou 429
+    - ('cancelamento_recusado', msg, True) para rejeição SEFAZ, HTTP 4xx ou prazo expirado
+    """
+    if exc is not None:
+        return "cancelamento_pendente", f"Sem conexão ao tentar cancelar NFC-e: {exc}", False
+
+    raw = sanitizar_payload_fiscal(resp if isinstance(resp, dict) else {})
+    status_api = str(raw.get("status") or "").strip().lower()
+    codigo_api = str(raw.get("codigo") or "").strip().lower()
+    status_sefaz = str(raw.get("status_sefaz") or "").strip()
+    msg_sefaz = str(
+        raw.get("mensagem_sefaz")
+        or raw.get("mensagem")
+        or f"HTTP {code}"
+    ).strip()
+    msg_lower = msg_sefaz.lower()
+
+    # 1. Erros transitórios de infraestrutura/limite -> retentativa
+    if code in (429, 500, 502, 503, 504):
+        return "cancelamento_pendente", msg_sefaz or f"HTTP {code} ao cancelar NFC-e", False
+
+    # 2. Idempotência: nota já cancelada na SEFAZ/Focus NFe
+    if (
+        status_api == "cancelado"
+        or codigo_api == "nfe_cancelada"
+        or status_sefaz in ("135", "155", "573")
+        or "já cancelada" in msg_lower
+        or "ja cancelada" in msg_lower
+        or "cancelamento ja registrado" in msg_lower
+        or "cancelamento já registrado" in msg_lower
+    ):
+        return "cancelado", msg_sefaz or "NFC-e cancelada na SEFAZ.", True
+
+    # 3. Sucesso HTTP 2xx sem status de erro
+    if code is not None and 200 <= code < 300 and status_api not in ("erro_cancelamento", "rejeitado"):
+        return "cancelado", msg_sefaz or "NFC-e cancelada na SEFAZ.", True
+
+    # 4. Prazo legal de cancelamento expirado (SEFAZ Rejeição 501/502 ou mensagem de prazo)
+    if (
+        status_sefaz in ("501", "502")
+        or "prazo" in msg_lower
+        or "superior ao previsto" in msg_lower
+        or "expirado" in msg_lower
+    ):
+        detalhe = msg_sefaz if "prazo expirado" in msg_lower else f"prazo expirado: {msg_sefaz}"
+        return "cancelamento_recusado", detalhe, True
+
+    # 5. Demais rejeições definitivas da SEFAZ / HTTP 4xx de validação
+    return "cancelamento_recusado", msg_sefaz or f"Cancelamento recusado pela SEFAZ (HTTP {code})", True
 
 _SECRET_KEYS = {"token_api", "token", "csc", "id_csc", "authorization", "access_token", "secret"}
 
@@ -425,24 +505,21 @@ class FocusNFeProvider(FiscalProvider):
         try:
             code, resp = self._request("DELETE", f"/v2/nfce/{ref_q}", body={"justificativa": just})
             raw_sanitized = sanitizar_payload_fiscal(resp if isinstance(resp, dict) else {})
-            if code in (429, 500, 502, 503, 504):
+            status_class, msg_class, _ = classificar_resposta_cancelamento(code, raw_sanitized)
+            if status_class == "cancelamento_pendente":
                 return FiscalEmitResult(
                     sucesso=False,
                     status="erro_comunicacao",
                     referencia=referencia,
-                    mensagem_sefaz=str(raw_sanitized.get("mensagem") or f"HTTP {code} ao cancelar NFC-e"),
+                    mensagem_sefaz=msg_class,
                     raw_response=raw_sanitized,
                 )
-            if code >= 400 or str(raw_sanitized.get("status") or "").lower() in ("erro_cancelamento", "rejeitado"):
+            if status_class == "cancelamento_recusado":
                 return FiscalEmitResult(
                     sucesso=False,
                     status="cancelamento_recusado",
                     referencia=referencia,
-                    mensagem_sefaz=str(
-                        raw_sanitized.get("mensagem_sefaz")
-                        or raw_sanitized.get("mensagem")
-                        or f"Cancelamento recusado pela SEFAZ (HTTP {code})"
-                    ),
+                    mensagem_sefaz=msg_class,
                     raw_response=raw_sanitized,
                 )
             return FiscalEmitResult(
@@ -450,15 +527,16 @@ class FocusNFeProvider(FiscalProvider):
                 status="cancelado",
                 referencia=referencia,
                 protocolo=str(raw_sanitized.get("protocolo") or ""),
-                mensagem_sefaz=str(raw_sanitized.get("mensagem_sefaz") or "NFC-e cancelada na SEFAZ."),
+                mensagem_sefaz=msg_class,
                 raw_response=raw_sanitized,
             )
         except (urllib.error.URLError, TimeoutError, socket.timeout, OSError) as exc:
+            _, msg_class, _ = classificar_resposta_cancelamento(None, None, exc=exc)
             return FiscalEmitResult(
                 sucesso=False,
                 status="erro_comunicacao",
                 referencia=referencia,
-                mensagem_sefaz=f"Sem conexão ao tentar cancelar NFC-e: {exc}",
+                mensagem_sefaz=msg_class,
             )
 
 
@@ -469,8 +547,8 @@ class FiscalService:
         self.db = db
         self._explicit_provider = provider
         self.outbox_service = outbox_service
-        if outbox_service is not None and hasattr(outbox_service, "register_handler"):
-            outbox_service.register_handler("nfce_pendente", self.processar_outbox_nfce)
+        if outbox_service is not None:
+            self.registrar_outbox(outbox_service)
 
     def _get_provider(self) -> FiscalProvider:
         if self._explicit_provider is not None:
@@ -483,8 +561,11 @@ class FiscalService:
 
     def registrar_outbox(self, outbox_service: Any) -> None:
         self.outbox_service = outbox_service
-        if outbox_service is not None:
+        if outbox_service is not None and hasattr(outbox_service, "register_handler"):
             outbox_service.register_handler("nfce_pendente", self.processar_outbox_nfce)
+            outbox_service.register_handler("nfce_cancelamento", self.processar_outbox_cancelamento)
+            if hasattr(outbox_service, "register_backoff_policy"):
+                outbox_service.register_backoff_policy("nfce_cancelamento", [15, 60, 180, 300])
 
     def construir_documento_da_venda(
         self,
@@ -825,51 +906,296 @@ class FiscalService:
 
         return False, res.mensagem_sefaz or "API fiscal temporariamente indisponível."
 
-    def cancelar_nfce_venda(self, transacao_id: str, justificativa: str) -> tuple[bool, str]:
-        """
-        Trata cancelamento fiscal integrado ao cancelar_venda():
-        - Se pendente_emissao: cancela localmente e remove pendência da outbox.
-        - Se autorizado: chama provider.cancelar_nfce() e trata recusa SEFAZ graciosamente.
-        """
-        atual = self.obter_documento(str(transacao_id))
-        if not atual:
-            return True, "Sem documento NFC-e vinculado."
+    def _obter_status_outbox_emissao(self, transacao_id: str) -> str | None:
+        """Consulta o status atual do job de emissão nfce:<tx> na outbox."""
+        with self.db._lock:
+            row = self.db.conn.execute(
+                """
+                SELECT status FROM outbox
+                WHERE chave_idempotencia = ?
+                ORDER BY id DESC LIMIT 1
+                """,
+                (f"nfce:{transacao_id}",),
+            ).fetchone()
+        return str(row[0]) if (row and row[0]) else None
 
-        st = atual.get("status")
+    def _atualizar_status_documento(
+        self,
+        transacao_id: str,
+        novo_status: str,
+        mensagem: str,
+        usuario_id: Any = None,
+        acao_auditoria: str = "Status Fiscal NFC-e",
+        agora_str: str | None = None,
+    ) -> None:
+        """Atualiza nfce_documentos e registra trilha de auditoria sob lock curto."""
+        ts = agora_str or dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with self.db._lock:
+            self.db.conn.execute(
+                "UPDATE nfce_documentos SET status = ?, mensagem_sefaz = ?, atualizado_em = ? WHERE transacao_id = ?",
+                (novo_status, str(mensagem or "")[:500], ts, str(transacao_id)),
+            )
+            self.db.conn.commit()
+        try:
+            self.db.registrar_alteracao(
+                acao_auditoria,
+                f"NFC-e venda #{transacao_id} -> {novo_status}: {str(mensagem or '')[:200]}",
+                usuario_id=usuario_id,
+                entidade="nfce_documentos",
+                entidade_id=str(transacao_id),
+                depois={"status_fiscal": novo_status, "detalhe": str(mensagem or "")[:300]},
+            )
+        except Exception:
+            pass
+
+    def agendar_cancelamento_nfce(
+        self,
+        transacao_id: str,
+        justificativa: str,
+        usuario_id: Any = None,
+    ) -> tuple[str, str]:
+        """
+        Fase local de cancelamento NFC-e (executada sob lock, ZERO HTTP):
+        - Marca nfce_documentos.status = 'cancelamento_pendente' (quando diferente de 'cancelado' e não 'processando').
+        - Enfileira job idempotente tipo='nfce_cancelamento' com chave 'nfce_cancel:<tx>'.
+        Retorna (modo_aviso, detalhe) onde modo_aviso in ('sem_nfce', 'ja_cancelado', 'local', 'sefaz').
+        """
+        tx_id = str(transacao_id)
+        atual = self.obter_documento(tx_id)
+        if not atual:
+            return "sem_nfce", ""
+
+        st_atual = str(atual.get("status") or "")
+        if st_atual == "cancelado":
+            return "ja_cancelado", "NFC-e já estava cancelada."
+
+        st_emissao_outbox = self._obter_status_outbox_emissao(tx_id)
+        em_processamento = (st_atual == "processando") or (st_emissao_outbox == "processando")
         agora = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        if st in ("pendente_emissao", "rejeitado", "cancelado"):
+
+        # Preserva 'processando' durante corrida emissão x cancelamento para o handler detectar ao reler
+        if not em_processamento and st_atual != "cancelamento_pendente":
             with self.db._lock:
                 self.db.conn.execute(
-                    "UPDATE nfce_documentos SET status = 'cancelado', mensagem_sefaz = ?, atualizado_em = ? WHERE transacao_id = ?",
-                    (f"Cancelado antes da autorização: {justificativa}", agora, str(transacao_id)),
-                )
-                self.db.conn.execute(
-                    "UPDATE outbox SET status = 'erro_permanente', erro_ultimo = 'Venda cancelada antes da emissão', atualizado_em = ? WHERE chave_idempotencia = ? AND status IN ('pendente', 'falha_temporaria')",
-                    (agora, f"nfce:{transacao_id}"),
+                    "UPDATE nfce_documentos SET status = 'cancelamento_pendente', atualizado_em = ? WHERE transacao_id = ?",
+                    (agora, tx_id),
                 )
                 self.db.conn.commit()
-            return True, "Pendência fiscal cancelada antes da transmissão."
 
-        if st in ("autorizado", "processando", "cancelamento_recusado"):
-            provider = self._get_provider()
-            res = provider.cancelar_nfce(str(transacao_id), justificativa)
-            if res.sucesso or res.status == "cancelado":
-                with self.db._lock:
-                    self.db.conn.execute(
-                        "UPDATE nfce_documentos SET status = 'cancelado', mensagem_sefaz = ?, atualizado_em = ? WHERE transacao_id = ?",
-                        (res.mensagem_sefaz or "Cancelada na SEFAZ", agora, str(transacao_id)),
+        payload_job = {
+            "transacao_id": tx_id,
+            "justificativa": str(justificativa or "").strip(),
+            "usuario_id": usuario_id,
+            "autorizado_em": atual.get("criado_em") or agora,
+        }
+        chave_idem = f"nfce_cancel:{tx_id}"
+
+        # Enfileirar de forma idempotente (cancelar 2x não gera 2 jobs)
+        if self.outbox_service is not None and hasattr(self.outbox_service, "enfileirar"):
+            self.outbox_service.enfileirar(
+                tipo="nfce_cancelamento",
+                payload=payload_job,
+                chave_idempotencia=chave_idem,
+                max_tentativas=20,
+            )
+        else:
+            with self.db._lock:
+                cur = self.db.conn.cursor()
+                cur.execute(
+                    """
+                    SELECT id FROM outbox
+                    WHERE chave_idempotencia = ? AND status IN ('pendente', 'processando', 'falha_temporaria', 'enviado')
+                    ORDER BY id DESC LIMIT 1
+                    """,
+                    (chave_idem,),
+                )
+                if not cur.fetchone():
+                    cur.execute(
+                        """
+                        INSERT INTO outbox (
+                            tipo, payload, tentativas, max_tentativas,
+                            proximo_envio, status, erro_ultimo, chave_idempotencia,
+                            criado_em, atualizado_em
+                        )
+                        VALUES ('nfce_cancelamento', ?, 0, 20, ?, 'pendente', '', ?, ?, ?)
+                        """,
+                        (json.dumps(payload_job, ensure_ascii=False, sort_keys=True), agora, chave_idem, agora, agora),
                     )
                     self.db.conn.commit()
-                return True, res.mensagem_sefaz or "NFC-e cancelada na SEFAZ."
 
-            # Recusa fiscal (ex.: prazo legal de 30 min expirado) ou falha de rede: não corrompe estorno local
-            msg_erro = res.mensagem_sefaz or "Não foi possível cancelar a NFC-e na SEFAZ."
+        try:
+            self.db.registrar_alteracao(
+                "Agendar Cancelamento NFC-e",
+                f"Cancelamento NFC-e da venda #{tx_id} agendado na Outbox (status anterior: {st_atual}).",
+                usuario_id=usuario_id,
+                entidade="nfce_documentos",
+                entidade_id=tx_id,
+                antes={"status_fiscal": st_atual},
+                depois={"status_fiscal": "processando" if em_processamento else "cancelamento_pendente"},
+            )
+        except Exception:
+            pass
+
+        if st_atual in ("pendente_emissao", "rejeitado") and not em_processamento:
+            return "local", "Cancelamento local agendado para NFC-e não transmitida."
+        return "sefaz", "Cancelamento da NFC-e enfileirado para transmissão à SEFAZ."
+
+    def processar_outbox_cancelamento(self, payload: dict[str, Any]) -> tuple[bool, str, bool]:
+        """
+        Handler assíncrono da Outbox (tipo='nfce_cancelamento', executa FORA de db._lock):
+        Relê sempre o status real da NFC-e no momento da execução.
+        """
+        tx_id = str(payload.get("transacao_id") or "").strip()
+        if not tx_id:
+            return False, "transacao_id ausente no job de cancelamento NFC-e.", True
+
+        justificativa = str(payload.get("justificativa") or "Cancelamento de venda PDV").strip()
+        usuario_id = payload.get("usuario_id")
+        tentativa = int(payload.get("_tentativa") or 1)
+        ref_dt_str = payload.get("_ref_dt")
+        try:
+            ref_dt = dt.datetime.strptime(str(ref_dt_str), "%Y-%m-%d %H:%M:%S") if ref_dt_str else dt.datetime.now()
+        except ValueError:
+            ref_dt = dt.datetime.now()
+        agora_str = ref_dt.strftime("%Y-%m-%d %H:%M:%S")
+
+        # 1. Reler estado REAL da NFC-e e do job de emissão no momento da execução
+        atual = self.obter_documento(tx_id)
+        if not atual:
+            return True, "Sem documento NFC-e vinculado.", True
+
+        st_atual = str(atual.get("status") or "")
+        if st_atual == "cancelado":
+            return True, "NFC-e já cancelada.", True
+
+        st_emissao_outbox = self._obter_status_outbox_emissao(tx_id)
+
+        # 2. Corrida emissão x cancelamento: se emissão está em processamento, reagenda sem HTTP
+        if st_atual == "processando" or st_emissao_outbox == "processando":
+            return False, "Emissão ainda em processamento; cancelamento reagendado.", False
+
+        # 3. Emissão ainda pendente (não enviada) ou rejeitada: cancelar localmente sem HTTP
+        possui_autorizacao = bool(atual.get("protocolo") or atual.get("chave_acesso"))
+        if st_atual in ("pendente_emissao", "rejeitado") or (
+            st_atual == "cancelamento_pendente" and not possui_autorizacao
+        ):
             with self.db._lock:
                 self.db.conn.execute(
-                    "UPDATE nfce_documentos SET status = 'cancelamento_recusado', mensagem_sefaz = ?, atualizado_em = ? WHERE transacao_id = ?",
-                    (str(msg_erro)[:500], agora, str(transacao_id)),
+                    """
+                    UPDATE outbox
+                    SET status = 'erro_permanente',
+                        erro_ultimo = 'Venda cancelada antes da emissão',
+                        atualizado_em = ?
+                    WHERE chave_idempotencia = ? AND status IN ('pendente', 'falha_temporaria')
+                    """,
+                    (agora_str, f"nfce:{tx_id}"),
                 )
                 self.db.conn.commit()
-            return False, msg_erro
+            self._atualizar_status_documento(
+                tx_id,
+                "cancelado",
+                f"Cancelado localmente antes da autorização: {justificativa}",
+                usuario_id=usuario_id,
+                acao_auditoria="Cancelamento Local NFC-e",
+                agora_str=agora_str,
+            )
+            return True, "NFC-e não havia sido transmitida — cancelada localmente.", True
 
-        return True, f"Status fiscal atual: {st}"
+        # 4. Verificar prazo legal configurável (NFCE_PRAZO_CANCELAMENTO_MIN, padrão 30 min)
+        cfg = self.db.get_config_nota() or {}
+        prazo_min = obter_prazo_cancelamento_min(cfg)
+        aut_ref_str = str(payload.get("autorizado_em") or atual.get("criado_em") or "").strip()
+        if aut_ref_str:
+            try:
+                dt_aut = dt.datetime.strptime(aut_ref_str[:19], "%Y-%m-%d %H:%M:%S")
+                if (ref_dt - dt_aut) > dt.timedelta(minutes=prazo_min):
+                    msg_prazo = "prazo expirado sem confirmação da SEFAZ"
+                    self._atualizar_status_documento(
+                        tx_id,
+                        "cancelamento_recusado",
+                        msg_prazo,
+                        usuario_id=usuario_id,
+                        acao_auditoria="Alerta Fiscal Cancelamento",
+                        agora_str=agora_str,
+                    )
+                    return False, msg_prazo, True
+            except ValueError:
+                pass
+
+        # 5. NFC-e autorizada (ou cancelamento_pendente já autorizada): chamadas HTTP FORA do lock
+        provider = self._get_provider()
+
+        # Em retentativas (tentativa > 1), consulta GET antes de enviar novo DELETE (idempotência)
+        if tentativa > 1:
+            cons = provider.consultar_nfce(tx_id)
+            if cons.status == "cancelado":
+                self._atualizar_status_documento(
+                    tx_id,
+                    "cancelado",
+                    cons.mensagem_sefaz or "NFC-e já cancelada na SEFAZ (confirmado via GET).",
+                    usuario_id=usuario_id,
+                    acao_auditoria="Cancelamento NFC-e Confirmado",
+                    agora_str=agora_str,
+                )
+                return True, cons.mensagem_sefaz or "NFC-e já cancelada na SEFAZ.", True
+            if cons.status == "erro_comunicacao":
+                self._atualizar_status_documento(
+                    tx_id,
+                    "cancelamento_pendente",
+                    cons.mensagem_sefaz or "Falha de comunicação ao consultar status da NFC-e.",
+                    usuario_id=usuario_id,
+                    acao_auditoria="Retentativa Cancelamento NFC-e",
+                    agora_str=agora_str,
+                )
+                return False, cons.mensagem_sefaz or "Falha de comunicação ao consultar NFC-e.", False
+
+        # Dispara DELETE na Focus NFe
+        res = provider.cancelar_nfce(tx_id, justificativa)
+        if res.sucesso or res.status == "cancelado":
+            self._atualizar_status_documento(
+                tx_id,
+                "cancelado",
+                res.mensagem_sefaz or "NFC-e cancelada na SEFAZ.",
+                usuario_id=usuario_id,
+                acao_auditoria="Cancelamento NFC-e SEFAZ",
+                agora_str=agora_str,
+            )
+            return True, res.mensagem_sefaz or "NFC-e cancelada na SEFAZ.", True
+
+        if res.status == "erro_comunicacao":
+            msg_tmp = res.mensagem_sefaz or "Falha temporária de comunicação com a SEFAZ."
+            self._atualizar_status_documento(
+                tx_id,
+                "cancelamento_pendente",
+                msg_tmp,
+                usuario_id=usuario_id,
+                acao_auditoria="Retentativa Cancelamento NFC-e",
+                agora_str=agora_str,
+            )
+            return False, msg_tmp, False
+
+        # Recusa definitiva da SEFAZ / 4xx / prazo expirado -> erro_permanente
+        msg_rec = res.mensagem_sefaz or "Cancelamento recusado pela SEFAZ."
+        self._atualizar_status_documento(
+            tx_id,
+            "cancelamento_recusado",
+            msg_rec,
+            usuario_id=usuario_id,
+            acao_auditoria="Alerta Fiscal Cancelamento",
+            agora_str=agora_str,
+        )
+        return False, msg_rec, True
+
+    def cancelar_nfce_venda(self, transacao_id: str, justificativa: str) -> tuple[bool, str]:
+        """
+        Agenda o cancelamento fiscal na Outbox sem bloquear com HTTP sob lock.
+        Mantida por retrocompatibilidade para chamadas diretas.
+        """
+        modo, detalhe = self.agendar_cancelamento_nfce(str(transacao_id), justificativa)
+        if self.outbox_service is not None and hasattr(self.outbox_service, "acordar_worker"):
+            self.outbox_service.acordar_worker()
+        if modo == "sem_nfce":
+            return True, "Sem documento NFC-e vinculado."
+        if modo == "ja_cancelado":
+            return True, detalhe
+        return True, detalhe

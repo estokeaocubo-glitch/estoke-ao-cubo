@@ -68,6 +68,12 @@ class OutboxService:
         if handlers:
             self._handlers.update(handlers)
 
+        # Políticas de retentativa específicas por tipo (em segundos)
+        self._backoff_policies: dict[str, list[int] | Callable[[int], int]] = {
+            # Agenda curta para cancelamento NFC-e dentro do prazo legal da UF: 15s, 60s, 3min, 5min, 5min...
+            "nfce_cancelamento": [15, 60, 180, 300],
+        }
+
         self._stop_event = threading.Event()
         self._wake_event = threading.Event()
         self._worker_thread: threading.Thread | None = None
@@ -77,10 +83,28 @@ class OutboxService:
         """Registra ou sobrescreve o handler de envio para um tipo da outbox."""
         self._handlers[str(tipo).strip().lower()] = fn
 
+    def register_backoff_policy(self, tipo: str, policy: list[int] | Callable[[int], int]) -> None:
+        """Registra agenda de retentativa customizada para um tipo específico da outbox."""
+        self._backoff_policies[str(tipo).strip().lower()] = policy
+
+    def acordar_worker(self) -> None:
+        """Acorda imediatamente o worker da outbox sem aguardar o próximo intervalo de polling."""
+        self._wake_event.set()
+
     def calcular_backoff_seconds(self, tentativa: int) -> int:
         """Calcula backoff exponencial em segundos: base * 2^(tentativa - 1), limitado ao máximo."""
         exp = max(0, int(tentativa) - 1)
         return min(self.max_backoff_seconds, int(self.base_backoff_seconds * (2 ** exp)))
+
+    def calcular_backoff_para_tipo(self, tipo: str, tentativa: int) -> int:
+        """Calcula o intervalo de retentativa respeitando política específica do tipo, se houver."""
+        policy = self._backoff_policies.get(str(tipo or "").strip().lower())
+        if callable(policy):
+            return max(1, int(policy(int(tentativa))))
+        if isinstance(policy, (list, tuple)) and policy:
+            idx = min(max(0, int(tentativa) - 1), len(policy) - 1)
+            return max(1, int(policy[idx]))
+        return self.calcular_backoff_seconds(tentativa)
 
     def enfileirar(
         self,
@@ -275,7 +299,12 @@ class OutboxService:
             detalhe = ""
             permanente = False
             try:
-                res = handler(payload)
+                # Metadados transitórios para handlers cientes de tentativa e relógio de referência
+                payload_exec = dict(payload) if isinstance(payload, dict) else payload
+                if isinstance(payload_exec, dict):
+                    payload_exec["_tentativa"] = tentativas_atuais
+                    payload_exec["_ref_dt"] = ref_str
+                res = handler(payload_exec)
                 if isinstance(res, tuple):
                     ok = bool(res[0])
                     detalhe = str(res[1]) if len(res) > 1 else ""
@@ -307,6 +336,7 @@ class OutboxService:
                     detalhe or "Falha desconhecida no envio",
                     ref_dt,
                     permanente=permanente,
+                    tipo=tipo,
                 )
                 if virou_permanente:
                     stats["erros_permanentes"] += 1
@@ -323,10 +353,11 @@ class OutboxService:
         erro: str,
         ref_dt: datetime,
         permanente: bool = False,
+        tipo: str = "",
     ) -> bool:
         esgotou = bool(permanente or tentativas >= max_tentativas)
         status_final = "erro_permanente" if esgotou else "falha_temporaria"
-        backoff = self.calcular_backoff_seconds(tentativas)
+        backoff = self.calcular_backoff_para_tipo(tipo, tentativas)
         prox_dt = ref_dt if esgotou else (ref_dt + timedelta(seconds=backoff))
         agora_str = ref_dt.strftime("%Y-%m-%d %H:%M:%S")
         prox_str = prox_dt.strftime("%Y-%m-%d %H:%M:%S")

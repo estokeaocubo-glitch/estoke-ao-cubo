@@ -625,20 +625,25 @@ class TestEtapa4FiscalNFCe:
                 }
             return 200, {}
 
+        outbox = OutboxService(db, connectivity_checker=lambda: True)
         fsrv = FiscalService(
             db,
             provider=FocusNFeProvider(token_api="TOK_CANC", ambiente="producao", http_requester=fake_http_sefaz),
+            outbox_service=outbox,
         )
         db._fiscal_service = fsrv
 
         res_em = fsrv.emitir_para_venda("tx_canc_30m")
         assert res_em.status == "autorizado"
 
-        # Cancelar a venda: estorno local deve concluir e recusa SEFAZ fica registrada
+        # Cancelar a venda: estorno local conclui sem HTTP sob lock e agenda cancelamento na Outbox
         ok_canc, msg_canc = db.cancelar_venda("tx_canc_30m", motivo="Cliente desistiu da compra", usuario_id=1)
         assert ok_canc is True
-        assert "Atenção fiscal" in msg_canc
-        assert "Rejeição 501" in msg_canc
+        assert "Monitor Outbox" in msg_canc
+        assert fsrv.obter_documento("tx_canc_30m")["status"] == "cancelamento_pendente"
+
+        # Worker da Outbox processa o cancelamento fora do lock e registra recusa SEFAZ
+        outbox.processar_pendentes()
 
         assert db.conn.execute("SELECT quantidade FROM produtos WHERE id = ?", (pid,)).fetchone()[0] == 10
         assert db.conn.execute("SELECT status FROM vendas WHERE transacao_id = 'tx_canc_30m'").fetchone()[0] == "Cancelada"

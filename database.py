@@ -3781,26 +3781,16 @@ class Database:
                     },
                 )
 
-                # Tratamento fiscal gracioso para NFC-e associada (se existir)
-                aviso_fiscal = ""
+                # Fase fiscal local (sob lock, ZERO HTTP): marca cancelamento_pendente e enfileira na Outbox
+                modo_fiscal = "sem_nfce"
+                outbox_ref = None
                 try:
                     from services.fiscal_service import FiscalService
                     fsrv = getattr(self, "_fiscal_service", None) or FiscalService(self)
-                    ok_f, msg_f = fsrv.cancelar_nfce_venda(str(tx_final), motivo_limpo)
-                    if not ok_f:
-                        aviso_fiscal = f" Atenção fiscal: {msg_f}"
-                        self.registrar_alteracao(
-                            "Alerta Fiscal Cancelamento",
-                            f"Venda #{tx_final} estornada localmente, mas SEFAZ recusou/falhou no cancelamento da NFC-e: {msg_f}",
-                            usuario_id=uid,
-                            entidade="nfce_documentos",
-                            entidade_id=str(tx_final),
-                            depois={"status_fiscal": "cancelamento_recusado", "detalhe": msg_f},
-                        )
+                    outbox_ref = getattr(fsrv, "outbox_service", None)
+                    modo_fiscal, _ = fsrv.agendar_cancelamento_nfce(str(tx_final), motivo_limpo, usuario_id=uid)
                 except Exception as f_exc:
-                    logger.warning("Aviso ao tentar cancelar NFC-e de %s: %s", tx_final, f_exc)
-
-                return True, f"Venda #{tx_final} cancelada e estornada com sucesso (R$ {total_liquido_estornado:.2f}).{aviso_fiscal}"
+                    logger.warning("Aviso ao agendar cancelamento NFC-e de %s: %s", tx_final, f_exc)
             except Exception as e:
                 try:
                     self.conn.rollback()
@@ -3808,6 +3798,22 @@ class Database:
                     pass
                 logger.error("Erro ao cancelar venda: %s", e)
                 return False, str(e)
+
+        # Fora do lock: acorda o worker da Outbox imediatamente (nenhum HTTP na thread chamadora)
+        if outbox_ref is not None and hasattr(outbox_ref, "acordar_worker"):
+            try:
+                outbox_ref.acordar_worker()
+            except Exception:
+                pass
+
+        if modo_fiscal == "local":
+            return True, f"Venda #{tx_final} cancelada. NFC-e não havia sido transmitida — cancelada localmente."
+        if modo_fiscal == "sefaz":
+            return True, (
+                f"Venda #{tx_final} cancelada no estoque e no caixa. "
+                f"Cancelamento da NFC-e enviado à SEFAZ — acompanhe no Monitor Outbox."
+            )
+        return True, f"Venda #{tx_final} cancelada e estornada com sucesso (R$ {total_liquido_estornado:.2f})."
 
     # ============================================================
     # ====== PERSISTÊNCIA DE CARRINHO (pdv_rascunho) E F6 =======
