@@ -280,6 +280,7 @@ class TestHomologacaoE2E:
         ok_canc, msg_canc = db.cancelar_venda("tx_nfce_hom_ok", motivo="Teste homologação cancelamento", usuario_id=1)
         assert ok_canc is True, msg_canc
         assert "Monitor Outbox" in msg_canc
+        assert chamadas_http == ["POST"]
         assert fsrv.obter_documento("tx_nfce_hom_ok")["status"] == "cancelamento_pendente"
         # Worker da Outbox executa o DELETE fora do lock
         outbox.processar_pendentes()

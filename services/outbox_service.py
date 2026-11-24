@@ -11,6 +11,7 @@ import json
 import logging
 import re
 import socket
+import sqlite3
 import threading
 import urllib.error
 import urllib.parse
@@ -298,20 +299,35 @@ class OutboxService:
             ok = False
             detalhe = ""
             permanente = False
+            max_backoff_override: int | None = None
+            consumir_tentativa = True
             try:
                 # Metadados transitórios para handlers cientes de tentativa e relógio de referência
                 payload_exec = dict(payload) if isinstance(payload, dict) else payload
                 if isinstance(payload_exec, dict):
                     payload_exec["_tentativa"] = tentativas_atuais
+                    payload_exec["_max_tentativas"] = max_tentativas
                     payload_exec["_ref_dt"] = ref_str
                 res = handler(payload_exec)
-                if isinstance(res, tuple):
+                if isinstance(res, dict):
+                    ok = bool(res.get("ok", False))
+                    detalhe = str(res.get("detalhe") or "")
+                    permanente = bool(res.get("permanente", False))
+                    if res.get("max_backoff_seconds") is not None:
+                        max_backoff_override = int(res["max_backoff_seconds"])
+                    consumir_tentativa = bool(res.get("consumir_tentativa", True))
+                elif isinstance(res, tuple):
                     ok = bool(res[0])
                     detalhe = str(res[1]) if len(res) > 1 else ""
                     if len(res) > 2:
                         permanente = bool(res[2])
                 else:
                     ok = bool(res)
+            except (RuntimeError, sqlite3.ProgrammingError) as db_closed_exc:
+                if "fechada" in str(db_closed_exc).lower() or "closed" in str(db_closed_exc).lower():
+                    raise
+                ok = False
+                detalhe = str(db_closed_exc)
             except Exception as exc:
                 ok = False
                 detalhe = str(exc)
@@ -329,14 +345,16 @@ class OutboxService:
                     self.db.conn.commit()
                 stats["enviados"] += 1
             else:
+                tentativas_gravar = tentativas_atuais if consumir_tentativa else max(0, tentativas_atuais - 1)
                 virou_permanente = self._marcar_falha(
                     item_id,
-                    tentativas_atuais,
+                    tentativas_gravar,
                     max_tentativas,
                     detalhe or "Falha desconhecida no envio",
                     ref_dt,
                     permanente=permanente,
                     tipo=tipo,
+                    max_backoff_override=max_backoff_override,
                 )
                 if virou_permanente:
                     stats["erros_permanentes"] += 1
@@ -354,10 +372,13 @@ class OutboxService:
         ref_dt: datetime,
         permanente: bool = False,
         tipo: str = "",
+        max_backoff_override: int | None = None,
     ) -> bool:
         esgotou = bool(permanente or tentativas >= max_tentativas)
         status_final = "erro_permanente" if esgotou else "falha_temporaria"
-        backoff = self.calcular_backoff_para_tipo(tipo, tentativas)
+        backoff = self.calcular_backoff_para_tipo(tipo, max(1, tentativas))
+        if max_backoff_override is not None:
+            backoff = max(1, min(backoff, int(max_backoff_override)))
         prox_dt = ref_dt if esgotou else (ref_dt + timedelta(seconds=backoff))
         agora_str = ref_dt.strftime("%Y-%m-%d %H:%M:%S")
         prox_str = prox_dt.strftime("%Y-%m-%d %H:%M:%S")
@@ -453,11 +474,44 @@ class OutboxService:
         except Exception as exc:
             return False, f"Erro de rede: {exc}"
 
+    def recuperar_orfaos_processando(self, now_dt: datetime | None = None) -> int:
+        """
+        Reverte para 'falha_temporaria' jobs presos em 'processando' há mais de 60s
+        (margem de segurança contra segunda instância concorrente).
+        """
+        ref_dt = now_dt or datetime.now()
+        limite_str = (ref_dt - timedelta(seconds=60)).strftime("%Y-%m-%d %H:%M:%S")
+        agora_str = ref_dt.strftime("%Y-%m-%d %H:%M:%S")
+        with self.db._lock:
+            if getattr(self.db, "_closed", False):
+                return 0
+            cur = self.db.conn.cursor()
+            cur.execute(
+                """
+                UPDATE outbox
+                SET status = 'falha_temporaria',
+                    proximo_envio = ?,
+                    atualizado_em = ?
+                WHERE status = 'processando' AND atualizado_em < ?
+                """,
+                (agora_str, agora_str, limite_str),
+            )
+            recuperados = int(cur.rowcount or 0)
+            if recuperados > 0:
+                self.db.conn.commit()
+        logger.info("Outbox: %d job(s) órfão(s) em 'processando' recuperado(s).", recuperados)
+        return recuperados
+
     def start_worker(self) -> threading.Thread:
         """Inicia thread daemon responsável por drenar a fila outbox em background."""
         with self._worker_lock:
             if self._worker_thread and self._worker_thread.is_alive():
                 return self._worker_thread
+
+            try:
+                self.recuperar_orfaos_processando()
+            except Exception as exc:
+                logger.debug("Aviso ao recuperar jobs órfãos na Outbox: %s", exc)
 
             self._stop_event.clear()
 
@@ -466,6 +520,11 @@ class OutboxService:
                 while not self._stop_event.is_set():
                     try:
                         self.processar_pendentes()
+                    except (RuntimeError, sqlite3.ProgrammingError) as closed_exc:
+                        if "fechada" in str(closed_exc).lower() or "closed" in str(closed_exc).lower():
+                            logger.debug("Banco fechado durante ciclo da Outbox — encerrando worker de forma limpa.")
+                            break
+                        logger.warning("Falha no ciclo do worker Outbox: %s", closed_exc)
                     except Exception as exc:
                         logger.warning("Falha no ciclo do worker Outbox: %s", exc)
                     self._wake_event.wait(timeout=self.poll_interval_seconds)

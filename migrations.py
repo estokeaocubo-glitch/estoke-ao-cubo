@@ -539,10 +539,12 @@ def migration_009_fiscal_nfce(conn: sqlite3.Connection) -> None:
             mensagem_sefaz TEXT DEFAULT '',
             payload_json TEXT DEFAULT '{}',
             criado_em TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
-            atualizado_em TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+            atualizado_em TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+            autorizado_em TEXT DEFAULT NULL
         )
         """
     )
+    _add_column_if_missing(conn, "nfce_documentos", "autorizado_em", "TEXT DEFAULT NULL")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_nfce_status ON nfce_documentos(status)")
 
 
@@ -604,6 +606,11 @@ def run_migrations(conn, migrations=None) -> int:
                 pass
             logger.exception("Falha ao aplicar migração v%s. Rollback executado.", version)
             raise
+
+    # Garantir coluna aditiva idempotente autorizado_em em bancos que já estavam na v9
+    if _table_exists(cursor, "nfce_documentos"):
+        if _add_column_if_missing(cursor, "nfce_documentos", "autorizado_em", "TEXT DEFAULT NULL"):
+            conn.commit()
 
     # Garantir registro legado '4.3' se a tabela estiver vazia
     if cursor.execute("SELECT COUNT(*) FROM db_version").fetchone()[0] == 0:

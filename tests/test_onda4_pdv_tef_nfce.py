@@ -640,7 +640,10 @@ class TestEtapa4FiscalNFCe:
         ok_canc, msg_canc = db.cancelar_venda("tx_canc_30m", motivo="Cliente desistiu da compra", usuario_id=1)
         assert ok_canc is True
         assert "Monitor Outbox" in msg_canc
-        assert fsrv.obter_documento("tx_canc_30m")["status"] == "cancelamento_pendente"
+        doc_pre_drain = fsrv.obter_documento("tx_canc_30m")
+        assert doc_pre_drain["status"] == "cancelamento_pendente"
+        assert "501" not in (doc_pre_drain["mensagem_sefaz"] or "")
+        assert [i for i in outbox.listar_itens() if i["chave_idempotencia"] == "nfce_cancel:tx_canc_30m"][0]["tentativas"] == 0
 
         # Worker da Outbox processa o cancelamento fora do lock e registra recusa SEFAZ
         outbox.processar_pendentes()
