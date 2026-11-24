@@ -51,6 +51,14 @@ def get_resource_path(*parts: str) -> str:
     return os.path.join(candidates[0], *parts)
 
 
+def get_web_path(*parts: str) -> str:
+    """
+    Resolve caminho somente-leitura para assets da UI embarcada em web/
+    (compatível com desenvolvimento e PyInstaller _MEIPASS), sem criar diretórios.
+    """
+    return get_resource_path("web", *parts)
+
+
 def get_app_data_path(*parts: str) -> str:
     """
     Retorna a pasta gravável de dados do usuário:

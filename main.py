@@ -529,31 +529,21 @@ class App(ctk.CTk):
         # Confirmação ao fechar
         self.protocol("WM_DELETE_WINDOW", self._on_closing)
 
-    # --- Mapeamento de botões para chaves de permissão ---
-    _PERMISSAO_MAP = {
-        "SALDO": "gastos", "GASTOS": "gastos", "CAIXA": "caixa", "KITS": "kits",
-        "CATEGORIAS": "categorias", "FORNECEDORES": "fornecedores", "CLIENTES": "clientes",
-        "ANOTA TUDO": "vender",
-        "VENDEDORES": "vendedores", "CONFIG": "ver_config", "CHAT IA": "chat_ia",
-        "INSUMOS": "insumos", "PRODUÇÃO": "producao", "TROCAS": "vender",
-        "REPOSIÇÃO": "adicionar", "INVENTÁRIO": "editar", "COMPRAS": "adicionar",
-        "MESAS": "mesas", "COMANDAS": "mesas",
-        "COZINHA": "mesas", "CONTAS PAGAR": "contas_pagar", "ETIQUETAS": "etiquetas",
-        "ADICIONAR": "adicionar", "VENDER": "vender", "SERVIÇO": "vender",
-        "LISTA": "editar", "RELATORIO": "ver_relatorio", "DRE": "ver_relatorio",
-    }
+    # --- Delegação de autenticação e RBAC para AuthService ---
+    def _get_auth_service(self):
+        """Retorna instância lazy do AuthService vinculada ao banco atual (seguro para stubs Tk)."""
+        d = self.__dict__
+        svc = d.get("_auth_service")
+        db_ref = d.get("db")
+        if svc is None or svc.db is not db_ref:
+            from services.auth_service import AuthService
+            svc = AuthService(db_ref)
+            d["_auth_service"] = svc
+        return svc
 
     def _tem_permissao(self, acao_btn):
         """Verifica se o usuário logado tem permissão para a ação (fail-closed)."""
-        if not self.current_user or not isinstance(self.current_user, dict):
-            return False
-        perfil = self.current_user.get("perfil")
-        if not perfil:
-            return False
-        chave = self._PERMISSAO_MAP.get(acao_btn, "")
-        if not chave:
-            return perfil == "admin"
-        return bool(self.db.usuario_tem_permissao(perfil, chave))
+        return self._get_auth_service().tem_permissao(self.__dict__.get("current_user"), acao_btn)
 
     def report_callback_exception(self, exc, val, tb):
         """Captura exceções em callbacks do Tkinter/CustomTkinter com log e diálogo de diagnóstico."""
@@ -655,10 +645,12 @@ class App(ctk.CTk):
         def _fazer_login():
             login_val = entry_user.get().strip()
             senha_val = entry_pass.get()
-            if not login_val or not senha_val:
-                lbl_erro.configure(text="Preencha login e senha.")
+            auth = self._get_auth_service()
+            try:
+                user = auth.autenticar(login_val, senha_val)
+            except ValueError as err:
+                lbl_erro.configure(text=str(err))
                 return
-            user = self.db.autenticar_usuario(login_val, senha_val)
             if user:
                 self.current_user = user
                 self.db.set_current_user(user)
@@ -668,7 +660,7 @@ class App(ctk.CTk):
                 self.grid_rowconfigure(0, weight=0)
                 self.grid_rowconfigure(1, weight=1)
                 self._build_main_ui()
-                if user.get("trocar_senha"):
+                if auth.precisa_trocar_senha(user):
                     self.after(300, lambda: messagebox.showwarning(
                         "Segurança — Senha Padrão",
                         "Você está utilizando a senha padrão inicial.\nPor segurança, altere sua senha em Configurações > Usuários.",
@@ -681,13 +673,7 @@ class App(ctk.CTk):
                       fg_color="#0A4174", hover_color="#062F56", text_color="white",
                       font=("Aileron", 13, "bold"), height=40, width=290).pack(padx=30, pady=(10, 5))
 
-        try:
-            _cur = self.db.conn.cursor()
-            _cur.execute("SELECT trocar_senha FROM usuarios WHERE login = 'admincentral'")
-            _row_adm = _cur.fetchone()
-            _mostrar_dica = bool(_row_adm and _row_adm[0])
-        except Exception:
-            _mostrar_dica = False
+        _mostrar_dica = self._get_auth_service().precisa_trocar_senha()
         if _mostrar_dica:
             ctk.CTkLabel(login_card, text="Primeiro acesso? Use: admincentral / admin9438",
                          font=("Aileron", 10), text_color=("gray50", "gray60")).pack(pady=(0, 15))
@@ -1764,18 +1750,10 @@ class App(ctk.CTk):
         def _tentar_login():
             u = entry_user.get().strip()
             p = entry_pass.get()
-            if verify_admin(u, p):
+            if self._get_auth_service().verificar_gate_admin(u, p):
                 login_win.destroy()
                 on_success()
                 return
-            try:
-                user_db = self.db.autenticar_usuario(u, p)
-                if user_db and user_db.get("perfil") in ("admin", "gerente"):
-                    login_win.destroy()
-                    on_success()
-                    return
-            except Exception:
-                pass
             lbl_erro.configure(text="Usuário ou senha incorretos!")
 
         ctk.CTkButton(login_win, text="Entrar", command=_tentar_login,
@@ -2833,24 +2811,23 @@ class App(ctk.CTk):
                 return
             login_val = user_logins[idx]
 
-            # Validar credenciais antes de gerar QR
-            user = self.db.autenticar_usuario(login_val, senha_val)
+            # Validar credenciais antes de gerar QR via AuthService
+            try:
+                user = self._get_auth_service().autenticar(login_val, senha_val)
+            except ValueError as err:
+                messagebox.showwarning("QR Code", str(err), parent=dialog)
+                return
             if not user:
                 messagebox.showerror("QR Code", "Senha incorreta para o usuário selecionado.", parent=dialog)
                 return
 
-            # Gerar token de sessão seguro (sem incluir a senha no QR)
-            import secrets
-            token = secrets.token_hex(32)
-            if self.api_server and hasattr(self.api_server, '_sessions'):
-                import time
-                self.api_server._sessions[token] = {
-                    "user": user,
-                    "expires": time.time() + self.api_server._SESSION_TTL
-                }
+            if not self.api_server:
+                messagebox.showerror("QR Code", "Servidor API local indisponível.", parent=dialog)
+                return
 
-            # QR Code contém apenas IP, porta, login e token (SEM senha)
-            qr_data = json.dumps({"ip": ip_local, "port": 5050, "login": login_val, "token": token}, ensure_ascii=False)
+            # Criar sessão de pareamento via método público thread-safe (sem tocar em _sessions)
+            pareamento = self.api_server.criar_sessao_pareamento(user, ip_local=ip_local)
+            qr_data = pareamento["qr_payload"]
             try:
                 import qrcode
                 from PIL import Image as PILImage, ImageTk

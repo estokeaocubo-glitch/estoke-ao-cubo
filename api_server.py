@@ -60,6 +60,7 @@ class EstokeAPI:
         self._rate_limiter = RateLimiter(max_requests=60, window_secs=60)
         self._login_limiter = RateLimiter(max_requests=5, window_secs=60)
         self._sessions = {}  # token -> {"user": {...}, "expires": timestamp}
+        self._sessions_lock = threading.RLock()
         self._SESSION_TTL = 8 * 3600  # 8 horas
 
         if FLASK_AVAILABLE:
@@ -68,11 +69,72 @@ class EstokeAPI:
             self._register_routes()
 
     def _cleanup_sessions(self):
-        """Remove sessões expiradas."""
+        """Remove sessões expiradas de forma thread-safe."""
         now = time.time()
-        expired = [t for t, s in self._sessions.items() if s["expires"] < now]
-        for t in expired:
-            del self._sessions[t]
+        with self._sessions_lock:
+            expired = [t for t, s in list(self._sessions.items()) if s["expires"] < now]
+            for t in expired:
+                self._sessions.pop(t, None)
+
+    def criar_sessao_pareamento(self, usuario: dict, ip_local: str | None = None) -> dict:
+        """
+        Cria sessão de pareamento mobile para um usuário já autenticado na sessão desktop.
+        Não recebe nem armazena senha; retorna payload JSON pronto para QR Code.
+        """
+        if not isinstance(usuario, dict) or not usuario.get("id"):
+            raise ValueError("Usuário autenticado inválido para pareamento mobile.")
+
+        # Sanitizar cópia do usuário para nunca reter campos sensíveis na sessão
+        user_safe = {
+            k: v for k, v in usuario.items()
+            if k not in ("senha", "senha_hash", "password", "password_hash")
+        }
+        login_val = str(user_safe.get("login") or "").strip()
+        if not login_val:
+            # db.autenticar_usuario não inclui 'login' no dict retornado; resolve pelo id
+            with self.db._lock:
+                if hasattr(self.db, "_ensure_open"):
+                    self.db._ensure_open()
+                cur = self.db.conn.cursor()
+                cur.execute("SELECT login FROM usuarios WHERE id = ?", (user_safe["id"],))
+                row_login = cur.fetchone()
+            login_val = str(row_login[0]).strip() if (row_login and row_login[0]) else str(user_safe.get("nome") or "")
+        if not login_val:
+            raise ValueError("Login do usuário não encontrado para pareamento mobile.")
+        user_safe["login"] = login_val
+
+        ip_resolvido = str(ip_local or "").strip()
+        if not ip_resolvido:
+            try:
+                import socket as _sock
+                s = _sock.socket(_sock.AF_INET, _sock.SOCK_DGRAM)
+                try:
+                    s.connect(("8.8.8.8", 80))
+                    ip_resolvido = s.getsockname()[0]
+                finally:
+                    s.close()
+            except Exception:
+                ip_resolvido = "127.0.0.1"
+
+        token = secrets.token_hex(32)
+        with self._sessions_lock:
+            self._sessions[token] = {
+                "user": user_safe,
+                "expires": time.time() + self._SESSION_TTL,
+            }
+
+        qr_payload = json.dumps(
+            {"ip": ip_resolvido, "port": self.port, "login": login_val, "token": token},
+            ensure_ascii=False,
+        )
+        return {
+            "ip": ip_resolvido,
+            "port": self.port,
+            "login": login_val,
+            "token": token,
+            "expires_in": self._SESSION_TTL,
+            "qr_payload": qr_payload,
+        }
 
     def _require_auth(self, acao_necessaria=None):
         """Verifica token de autenticação, rate limit, atividade do usuário e permissões RBAC."""
@@ -84,35 +146,43 @@ class EstokeAPI:
         if not token:
             return None, (jsonify({"error": "Token não fornecido"}), 401)
 
-        # Verificar sessão ativa
+        # Verificar sessão ativa sob lock próprio (sem aninhar com db._lock)
         self._cleanup_sessions()
-        session = self._sessions.get(token)
-        if not session:
-            return None, (jsonify({"error": "Token inválido ou expirado"}), 401)
+        with self._sessions_lock:
+            session = self._sessions.get(token)
+            if not session:
+                return None, (jsonify({"error": "Token inválido ou expirado"}), 401)
+            user_id = session["user"]["id"]
 
         # Prevenção de Sessões Órfãs: Verificar status ativo no banco em tempo real
-        user_id = session["user"]["id"]
         with self.db._lock:
+            if hasattr(self.db, "_ensure_open"):
+                self.db._ensure_open()
             cursor = self.db.conn.cursor()
             cursor.execute("SELECT ativo, perfil, loja_id FROM usuarios WHERE id=?", (user_id,))
             row = cursor.fetchone()
         if not row or row[0] != 1:
-            if token in self._sessions:
-                del self._sessions[token]
+            with self._sessions_lock:
+                self._sessions.pop(token, None)
             return None, (jsonify({"error": "Acesso revogado. Usuário inativo ou excluído."}), 403)
 
-        # Atualizar os dados de perfil e loja na sessão a partir do banco
-        session["user"]["perfil"] = row[1]
-        session["user"]["loja_id"] = row[2]
+        # Atualizar os dados de perfil e loja na sessão e renovar TTL sob lock
+        with self._sessions_lock:
+            session = self._sessions.get(token)
+            if not session:
+                return None, (jsonify({"error": "Token inválido ou expirado"}), 401)
+            session["user"]["perfil"] = row[1]
+            session["user"]["loja_id"] = row[2]
+            perfil_atual = session["user"]["perfil"]
+            user_snapshot = dict(session["user"])
+            session["expires"] = time.time() + self._SESSION_TTL
 
         # Verificar permissões do perfil (RBAC)
         if acao_necessaria:
-            if not self.db.usuario_tem_permissao(session["user"]["perfil"], acao_necessaria):
+            if not self.db.usuario_tem_permissao(perfil_atual, acao_necessaria):
                 return None, (jsonify({"error": f"Acesso negado. Requer permissão para '{acao_necessaria}'."}), 403)
 
-        # Renovar TTL a cada requisição válida
-        session["expires"] = time.time() + self._SESSION_TTL
-        return session["user"], None
+        return user_snapshot, None
 
     def _register_routes(self):
         app = self.app
@@ -138,12 +208,13 @@ class EstokeAPI:
                 user = self.db.autenticar_usuario(login_val, senha)
 
                 if user:
-                    # Gerar token de sessão seguro
+                    # Gerar token de sessão seguro sob lock de sessões
                     token = secrets.token_hex(32)
-                    self._sessions[token] = {
-                        "user": user,
-                        "expires": time.time() + self._SESSION_TTL
-                    }
+                    with self._sessions_lock:
+                        self._sessions[token] = {
+                            "user": user,
+                            "expires": time.time() + self._SESSION_TTL
+                        }
                     return jsonify({"user": user, "token": token})
                 return jsonify({"error": "Credenciais inválidas"}), 401
             except Exception as e:
@@ -966,7 +1037,8 @@ class EstokeAPI:
         self._thread = None
         if t is not None and t.is_alive() and t is not threading.current_thread():
             t.join(timeout=5.0)
-        self._sessions.clear()
+        with self._sessions_lock:
+            self._sessions.clear()
 
     def is_running(self):
         return self._running

@@ -103,52 +103,35 @@ class SupervisorAuthDialog(BaseDialog):
         self.protocol("WM_DELETE_WINDOW", self._cancelar)
 
     def _validar(self):
+        from services.auth_service import AuthService
+
         login = self.entry_login.get().strip()
         senha = self.entry_senha.get()
         motivo = self.entry_motivo.get().strip() if self.entry_motivo is not None else ""
 
-        if not login or not senha:
-            self.lbl_erro.configure(text="Preencha login e senha do supervisor.")
-            return
-
-        if self.exigir_motivo and not motivo:
-            self.lbl_erro.configure(text="Informe o motivo obrigatório da operação.")
-            self.entry_motivo.focus_set()
-            return
-
-        sup_user = None
         try:
-            u = self.db.autenticar_usuario(login, senha)
-            if u and u.get("perfil") in ("admin", "gerente"):
-                sup_user = u
-        except Exception:
-            sup_user = None
-
-        if sup_user is None and config.verify_admin(login, senha):
-            sup_user = {"id": None, "nome": f"Admin ({login})", "perfil": "admin"}
-
-        if sup_user is None:
-            self.lbl_erro.configure(text="Credenciais inválidas ou sem perfil Admin/Gerente.")
-            return
-
-        sup_id = sup_user.get("id")
-        sup_nome = sup_user.get("nome") or login
-        try:
-            self.db.registrar_alteracao(
-                "Autorização Supervisor",
-                f"Ação '{self.acao}' autorizada por {sup_nome}" + (f" | Motivo: {motivo}" if motivo else ""),
-                usuario_id=sup_id,
-                entidade="autorizacao",
-                depois={"acao": self.acao, "supervisor": sup_nome, "motivo": motivo},
+            auth = AuthService(self.db, config_module=config)
+            res = auth.autorizar_supervisor(
+                login=login,
+                senha=senha,
+                acao=self.acao,
+                motivo=motivo,
+                exigir_motivo=self.exigir_motivo,
             )
-        except Exception:
-            pass
+        except ValueError as err:
+            self.lbl_erro.configure(text=str(err))
+            if self.exigir_motivo and not motivo and self.entry_motivo is not None:
+                self.entry_motivo.focus_set()
+            return
+        except PermissionError as err:
+            self.lbl_erro.configure(text=str(err))
+            return
 
         self.result = {
-            "approved": True,
-            "supervisor_id": sup_id,
-            "supervisor_nome": sup_nome,
-            "motivo": motivo,
+            "approved": res["approved"],
+            "supervisor_id": res["supervisor_id"],
+            "supervisor_nome": res["supervisor_nome"],
+            "motivo": res["motivo"],
         }
         try:
             self.grab_release()
