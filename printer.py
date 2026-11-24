@@ -170,13 +170,24 @@ class ReceiptAuditor:
 # ============================================================
 
 class PrintJob:
-    """Estrutura interna para encapsular um trabalho de impressão."""
-    def __init__(self, text: str, logo_path: str = None, job_id: str = None, pix_payload: str = None, venda_id: int = None):
+    """Estrutura interna para encapsular um trabalho de impressão ou pulso de gaveta."""
+    def __init__(
+        self,
+        text: str,
+        logo_path: str = None,
+        job_id: str = None,
+        pix_payload: str = None,
+        venda_id: int = None,
+        job_type: str = "print",
+        drawer_printer=None,
+    ):
         self.text = text
         self.logo_path = logo_path
         self.job_id = job_id or datetime.datetime.now().strftime("%Y%m%d%H%M%S%f")
         self.pix_payload = pix_payload
         self.venda_id = venda_id
+        self.job_type = job_type
+        self.drawer_printer = drawer_printer
         self.created_at = time.time()
 
 
@@ -235,8 +246,28 @@ class PrintQueueManager(threading.Thread):
 
         return True
 
+    def enqueue_drawer(self, drawer_printer=None) -> bool:
+        """Enfileira pulso de abertura de gaveta no worker background sem bloquear a thread chamadora."""
+        job_id = f"drawer_{datetime.datetime.now().strftime('%Y%m%d%H%M%S%f')}"
+        job = PrintJob(
+            text="",
+            job_id=job_id,
+            job_type="open_drawer",
+            drawer_printer=drawer_printer,
+        )
+        self.queue.put(job)
+        return True
+
     def _execute_job(self, job: PrintJob):
-        """Imprime fisicamente o documento usando o driver correto configurado."""
+        """Imprime fisicamente o documento ou dispara abertura de gaveta usando o driver configurado."""
+        if getattr(job, "job_type", "print") == "open_drawer":
+            try:
+                printer = job.drawer_printer if job.drawer_printer is not None else _create_raw_printer()
+                printer.abrir_gaveta()
+            except Exception as e:
+                logger.error("Erro ao abrir gaveta assincronamente (job %s): %s", job.job_id, e)
+            return
+
         self.auditor.registrar_impressao(job.job_id, job.text)
         status = 'Impresso'
         error_msg = None
@@ -405,7 +436,8 @@ class AsyncPrinterWrapper(BasePrinter):
         PrintQueueManager.get_instance().enqueue(job)
 
     def abrir_gaveta(self):
-        return self.real_printer.abrir_gaveta()
+        """Enfileira a abertura da gaveta no PrintQueueManager sem socket/spooler síncrono na thread chamadora."""
+        return PrintQueueManager.get_instance().enqueue_drawer(self.real_printer)
 
 
 class TextFilePrinter(BasePrinter):

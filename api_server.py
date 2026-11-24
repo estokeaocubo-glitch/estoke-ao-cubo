@@ -53,6 +53,8 @@ class EstokeAPI:
         self.db = db
         self.port = port
         self._thread = None
+        self._server = None
+        self._last_error = None
         self._running = False
         self.app = None
         self._rate_limiter = RateLimiter(max_requests=60, window_secs=60)
@@ -398,9 +400,12 @@ class EstokeAPI:
                 return err
             
             # Tenancy Isolation (BOLA) Check
-            cursor = self.db.conn.cursor()
-            cursor.execute("SELECT loja_id FROM produtos WHERE id=?", (prod_id,))
-            p_row = cursor.fetchone()
+            with self.db._lock:
+                if hasattr(self.db, '_ensure_open'):
+                    self.db._ensure_open()
+                cursor = self.db.conn.cursor()
+                cursor.execute("SELECT loja_id FROM produtos WHERE id=?", (prod_id,))
+                p_row = cursor.fetchone()
             if not p_row:
                 return jsonify({"error": "Produto não encontrado"}), 404
             if user['perfil'] != 'admin' and user['loja_id'] is not None and p_row[0] is not None and p_row[0] != user['loja_id']:
@@ -435,9 +440,12 @@ class EstokeAPI:
                 return err
             
             # Tenancy Isolation (BOLA) Check
-            cursor = self.db.conn.cursor()
-            cursor.execute("SELECT loja_id FROM produtos WHERE id=?", (prod_id,))
-            p_row = cursor.fetchone()
+            with self.db._lock:
+                if hasattr(self.db, '_ensure_open'):
+                    self.db._ensure_open()
+                cursor = self.db.conn.cursor()
+                cursor.execute("SELECT loja_id FROM produtos WHERE id=?", (prod_id,))
+                p_row = cursor.fetchone()
             if not p_row:
                 return jsonify({"error": "Produto não encontrado"}), 404
             if user['perfil'] != 'admin' and user['loja_id'] is not None and p_row[0] is not None and p_row[0] != user['loja_id']:
@@ -456,9 +464,12 @@ class EstokeAPI:
                 return err
             
             # Tenancy Isolation (BOLA) Check
-            cursor = self.db.conn.cursor()
-            cursor.execute("SELECT loja_id FROM produtos WHERE id=?", (prod_id,))
-            p_row = cursor.fetchone()
+            with self.db._lock:
+                if hasattr(self.db, '_ensure_open'):
+                    self.db._ensure_open()
+                cursor = self.db.conn.cursor()
+                cursor.execute("SELECT loja_id FROM produtos WHERE id=?", (prod_id,))
+                p_row = cursor.fetchone()
             if not p_row:
                 return jsonify({"error": "Produto não encontrado"}), 404
             if user['perfil'] != 'admin' and user['loja_id'] is not None and p_row[0] is not None and p_row[0] != user['loja_id']:
@@ -880,24 +891,81 @@ class EstokeAPI:
             return "PDV Web ativo.", 200
 
     def start(self):
-        """Inicia o servidor API em background."""
+        """Inicia o servidor API em background usando WSGI make_server com shutdown controlado."""
         if not FLASK_AVAILABLE or self._running:
             return False
+        self._last_error = None
+        try:
+            from werkzeug.serving import make_server
+            if os.name == 'nt' and self.port != 0:
+                # No Windows, SO_REUSEADDR do WSGI permite bind duplicado; valida porta livre antes
+                import socket as _sock
+                _probe = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
+                try:
+                    if hasattr(_sock, 'SO_EXCLUSIVEADDRUSE'):
+                        _probe.setsockopt(_sock.SOL_SOCKET, _sock.SO_EXCLUSIVEADDRUSE, 1)
+                    _probe.bind(('0.0.0.0', self.port))
+                finally:
+                    _probe.close()
+            self._server = make_server('0.0.0.0', self.port, self.app, threaded=True)
+            # Atualiza a porta real alocada pelo SO quando iniciada em porta efêmera (0)
+            if self.port == 0:
+                self.port = self._server.server_port
+        except OSError as e:
+            self._server = None
+            self._running = False
+            self._last_error = (
+                f"Não foi possível iniciar a API na porta {self.port}: "
+                f"porta já em uso ou indisponível ({e})."
+            )
+            logger.error("%s", self._last_error)
+            return False
+        except Exception as e:
+            self._server = None
+            self._running = False
+            self._last_error = f"Erro ao preparar servidor API na porta {self.port}: {e}"
+            logger.error("%s", self._last_error)
+            return False
+
         self._running = True
-        self._thread = threading.Thread(target=self._run_server, daemon=True)
+        self._thread = threading.Thread(target=self._run_server, name=f"EstokeAPI-{self.port}", daemon=True)
         self._thread.start()
         logger.info("API REST iniciada na porta %d", self.port)
         return True
 
     def _run_server(self):
+        """Loop do servidor WSGI encerrável via stop()."""
+        srv = self._server
+        if srv is None:
+            self._running = False
+            return
         try:
-            self.app.run(host='0.0.0.0', port=self.port, debug=False, use_reloader=False)
+            srv.serve_forever()
         except Exception as e:
-            logger.error("Erro ao iniciar API: %s", e)
+            if self._running:
+                self._last_error = str(e)
+                logger.error("Erro na execução da API: %s", e)
+        finally:
             self._running = False
 
     def stop(self):
+        """Encerra o servidor WSGI de forma limpa e libera imediatamente a porta TCP."""
         self._running = False
+        srv = self._server
+        self._server = None
+        if srv is not None:
+            try:
+                srv.shutdown()
+            except Exception as e:
+                logger.warning("Aviso ao encerrar loop WSGI da API: %s", e)
+            try:
+                srv.server_close()
+            except Exception as e:
+                logger.warning("Aviso ao fechar socket da API: %s", e)
+        t = self._thread
+        self._thread = None
+        if t is not None and t.is_alive() and t is not threading.current_thread():
+            t.join(timeout=5.0)
         self._sessions.clear()
 
     def is_running(self):

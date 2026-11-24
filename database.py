@@ -6,6 +6,8 @@ import shutil
 import sys
 import logging
 import threading
+import functools
+import types
 import uuid
 import getpass
 import subprocess
@@ -259,6 +261,24 @@ class Database:
         _restrict_file_acl_windows(self.db_path)
         self.create_tables()
 
+    # Registro de locks por conexão ativa para compartilhar o mesmo RLock com serviços externos (ex: SonhosService)
+    _CONN_REGISTRY_LOCK = threading.Lock()
+    _CONN_REGISTRY = {}
+
+    @classmethod
+    def get_lock_for_connection(cls, conn):
+        """Retorna (lock, ensure_open) associados a uma conexão SQLite gerenciada por Database."""
+        if conn is None:
+            return None, None
+        with cls._CONN_REGISTRY_LOCK:
+            return cls._CONN_REGISTRY.get(id(conn), (None, None))
+
+    def _ensure_open(self):
+        """Garante, sob o lock do banco, que a conexão ainda está aberta antes de qualquer operação."""
+        with self._lock:
+            if getattr(self, "_closed", False) or getattr(self, "conn", None) is None:
+                raise RuntimeError("Operação recusada: a conexão com o banco de dados já foi fechada.")
+
     def _open_connection(self):
         """Abre e configura uma conexão SQLite com WAL, Foreign Keys e suporte multi-thread."""
         conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=60.0)
@@ -271,6 +291,8 @@ class Database:
             conn.execute("PRAGMA mmap_size = 268435456")
         except Exception as e:
             logger.warning("Nao foi possivel ativar os pragmas de alta performance: %s", e)
+        with Database._CONN_REGISTRY_LOCK:
+            Database._CONN_REGISTRY[id(conn)] = (self._lock, self._ensure_open)
         return conn
 
     def is_trial_mode(self):
@@ -2893,8 +2915,17 @@ class Database:
             if getattr(self, '_closed', False):
                 return
             self._closed = True
+            conn_ref = getattr(self, 'conn', None)
+            if conn_ref is not None:
+                with Database._CONN_REGISTRY_LOCK:
+                    Database._CONN_REGISTRY.pop(id(conn_ref), None)
             conn_closed = False
             try:
+                # Consolida o WAL antes de fechar para evitar perda de dados antes da criptografia
+                try:
+                    self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                except Exception:
+                    pass
                 self.conn.close()
                 conn_closed = True
                 logger.info("Conexão com banco de dados fechada.")
@@ -3591,6 +3622,7 @@ class Database:
             return False, "O motivo do cancelamento é obrigatório."
 
         with self._lock:
+            self._ensure_open()
             uid = usuario_id if usuario_id is not None else getattr(self, "current_user_id", None)
             try:
                 cursor = self.conn.cursor()
@@ -6145,3 +6177,37 @@ class Database:
                 vendas_sem_webhook or webhooks_sem_venda or divergencia_valor or abs(total_pix_mp - total_pix_pdv) > 0.01
             ),
         }
+
+
+def _aplicar_lock_metodos_database(cls):
+    """
+    Serializa automaticamente sob self._lock (RLock) e guarda _ensure_open()
+    todos os métodos de instância de Database que operam sobre a conexão SQLite,
+    preservando assinaturas, SQL e formatos de retorno originais.
+    """
+    ignorados = {
+        "__init__",
+        "_open_connection",
+        "_ensure_open",
+        "close",
+        "cancelar_venda",
+        "is_trial_mode",
+        "aplicar_retencao_backups",
+    }
+
+    def _envolver(fn):
+        @functools.wraps(fn)
+        def wrapper(self, *args, **kwargs):
+            with self._lock:
+                self._ensure_open()
+                return fn(self, *args, **kwargs)
+        return wrapper
+
+    for nome, atributo in list(cls.__dict__.items()):
+        if nome.startswith("__") or nome in ignorados:
+            continue
+        if isinstance(atributo, types.FunctionType):
+            setattr(cls, nome, _envolver(atributo))
+
+
+_aplicar_lock_metodos_database(Database)

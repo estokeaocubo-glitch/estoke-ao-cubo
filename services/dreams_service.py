@@ -4,6 +4,7 @@ Módulo de Gerenciamento de Sonhos — Validação estrita, Sanitização e Prev
 import sqlite3
 import html
 import datetime
+import threading
 from typing import Dict, Any, Optional
 
 class DreamValidationError(Exception):
@@ -15,26 +16,54 @@ class DreamConcurrencyError(Exception):
     pass
 
 class SonhosService:
-    def __init__(self, conn: sqlite3.Connection):
-        self.conn = conn
+    def __init__(self, conn: sqlite3.Connection, lock: Optional[threading.RLock] = None):
+        # Aceita tanto sqlite3.Connection quanto instância de Database
+        if hasattr(conn, "conn") and hasattr(conn, "_lock"):
+            self._db = conn
+            self.conn = conn.conn
+            self._lock = lock or conn._lock
+            self._ensure_open_fn = getattr(conn, "_ensure_open", None)
+        else:
+            self._db = None
+            self.conn = conn
+            self._lock = lock
+            self._ensure_open_fn = None
+            if self._lock is None:
+                try:
+                    from database import Database
+                    db_lock, ensure_fn = Database.get_lock_for_connection(conn)
+                    if db_lock is not None:
+                        self._lock = db_lock
+                        self._ensure_open_fn = ensure_fn
+                except Exception:
+                    pass
+            if self._lock is None:
+                self._lock = threading.RLock()
         self._ensure_table()
+
+    def _ensure_open(self):
+        """Valida que a conexão gerenciada pelo Database ainda está aberta."""
+        if self._ensure_open_fn is not None:
+            self._ensure_open_fn()
 
     def _ensure_table(self):
         """Garante a estrutura correta com a coluna 'version' para OCC."""
-        cursor = self.conn.cursor()
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS sonhos (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                usuario_id INTEGER NOT NULL,
-                titulo TEXT NOT NULL,
-                descricao TEXT NOT NULL,
-                categoria TEXT,
-                data_registro TEXT NOT NULL,
-                version INTEGER DEFAULT 1,
-                FOREIGN KEY (usuario_id) REFERENCES usuarios(id)
-            )
-        """)
-        self.conn.commit()
+        with self._lock:
+            self._ensure_open()
+            cursor = self.conn.cursor()
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS sonhos (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    usuario_id INTEGER NOT NULL,
+                    titulo TEXT NOT NULL,
+                    descricao TEXT NOT NULL,
+                    categoria TEXT,
+                    data_registro TEXT NOT NULL,
+                    version INTEGER DEFAULT 1,
+                    FOREIGN KEY (usuario_id) REFERENCES usuarios(id)
+                )
+            """)
+            self.conn.commit()
 
     def _sanitizar_e_validar(self, dados: Dict[str, Any]) -> Dict[str, Any]:
         """Realiza sanitização robusta contra XSS e valida regras de negócio."""
@@ -68,70 +97,76 @@ class SonhosService:
     def adicionar_sonho(self, dados_input: Dict[str, Any]) -> int:
         """Adiciona um sonho de forma segura via queries parametrizadas."""
         dados = self._sanitizar_e_validar(dados_input)
-        cursor = self.conn.cursor()
-        
-        cursor.execute("""
-            INSERT INTO sonhos (usuario_id, titulo, descricao, categoria, data_registro, version)
-            VALUES (?, ?, ?, ?, ?, 1)
-        """, (dados['usuario_id'], dados['titulo'], dados['descricao'], dados['categoria'], dados['data_registro']))
-        
-        self.conn.commit()
-        return cursor.lastrowid
+        with self._lock:
+            self._ensure_open()
+            cursor = self.conn.cursor()
+
+            cursor.execute("""
+                INSERT INTO sonhos (usuario_id, titulo, descricao, categoria, data_registro, version)
+                VALUES (?, ?, ?, ?, ?, 1)
+            """, (dados['usuario_id'], dados['titulo'], dados['descricao'], dados['categoria'], dados['data_registro']))
+
+            self.conn.commit()
+            return cursor.lastrowid
 
     def editar_sonho(self, sonho_id: int, dados_input: Dict[str, Any], versao_lida: int, usuario_requisitor_id: int) -> bool:
         """Edita o registro garantindo consistência com Controle de Concorrência Otimista (OCC)."""
         dados = self._sanitizar_e_validar(dados_input)
-        cursor = self.conn.cursor()
+        with self._lock:
+            self._ensure_open()
+            cursor = self.conn.cursor()
 
-        # 1. Validação de Autorização e existência do registro
-        cursor.execute("SELECT usuario_id, version FROM sonhos WHERE id = ?", (sonho_id,))
-        row = cursor.fetchone()
-        if not row:
-            raise DreamValidationError("Sonho não encontrado.")
-        
-        dono_id, versao_atual = row[0], row[1]
-        
-        if dono_id != usuario_requisitor_id:
-            raise PermissionError("Operação não autorizada. Este registro não pertence a você.")
+            # 1. Validação de Autorização e existência do registro
+            cursor.execute("SELECT usuario_id, version FROM sonhos WHERE id = ?", (sonho_id,))
+            row = cursor.fetchone()
+            if not row:
+                raise DreamValidationError("Sonho não encontrado.")
 
-        # 2. Verificação de Concorrência (OCC)
-        if versao_atual != versao_lida:
-            raise DreamConcurrencyError(
-                "O registro foi atualizado por outro usuário enquanto você o visualizava. "
-                "Por favor, atualize a página e refaça a edição para evitar perda de informações."
-            )
+            dono_id, versao_atual = row[0], row[1]
 
-        # 3. Atualização segura incrementando a versão
-        cursor.execute("""
-            UPDATE sonhos 
-            SET titulo = ?, descricao = ?, categoria = ?, data_registro = ?, version = version + 1
-            WHERE id = ? AND version = ? AND usuario_id = ?
-        """, (dados['titulo'], dados['descricao'], dados['categoria'], dados['data_registro'], sonho_id, versao_lida, usuario_requisitor_id))
-        
-        self.conn.commit()
-        
-        if cursor.rowcount == 0:
-            # Se nenhuma linha foi alterada, a concorrência falhou no exato momento do commit
-            raise DreamConcurrencyError("Erro de concorrência detectado durante a gravação.")
-            
-        return True
+            if dono_id != usuario_requisitor_id:
+                raise PermissionError("Operação não autorizada. Este registro não pertence a você.")
+
+            # 2. Verificação de Concorrência (OCC)
+            if versao_atual != versao_lida:
+                raise DreamConcurrencyError(
+                    "O registro foi atualizado por outro usuário enquanto você o visualizava. "
+                    "Por favor, atualize a página e refaça a edição para evitar perda de informações."
+                )
+
+            # 3. Atualização segura incrementando a versão
+            cursor.execute("""
+                UPDATE sonhos
+                SET titulo = ?, descricao = ?, categoria = ?, data_registro = ?, version = version + 1
+                WHERE id = ? AND version = ? AND usuario_id = ?
+            """, (dados['titulo'], dados['descricao'], dados['categoria'], dados['data_registro'], sonho_id, versao_lida, usuario_requisitor_id))
+
+            self.conn.commit()
+
+            if cursor.rowcount == 0:
+                # Se nenhuma linha foi alterada, a concorrência falhou no exato momento do commit
+                raise DreamConcurrencyError("Erro de concorrência detectado durante a gravação.")
+
+            return True
 
     def listar_sonhos(self, usuario_id: Optional[int] = None) -> list:
         """Lista todos os sonhos/anotações do banco de dados, decodificados."""
-        # 1 linha para explicar o motivo: A consulta é decodificada transacionalmente para entrega instantânea e segura na UI.
-        cursor = self.conn.cursor()
-        if usuario_id:
-            cursor.execute("""
-                SELECT id, usuario_id, titulo, descricao, categoria, data_registro, version 
-                FROM sonhos WHERE usuario_id = ? ORDER BY data_registro DESC
-            """, (usuario_id,))
-        else:
-            cursor.execute("""
-                SELECT id, usuario_id, titulo, descricao, categoria, data_registro, version 
-                FROM sonhos ORDER BY data_registro DESC
-            """)
-        
-        rows = cursor.fetchall()
+        # A consulta roda sob o lock do banco para evitar corrida de cursor em multi-thread.
+        with self._lock:
+            self._ensure_open()
+            cursor = self.conn.cursor()
+            if usuario_id:
+                cursor.execute("""
+                    SELECT id, usuario_id, titulo, descricao, categoria, data_registro, version
+                    FROM sonhos WHERE usuario_id = ? ORDER BY data_registro DESC
+                """, (usuario_id,))
+            else:
+                cursor.execute("""
+                    SELECT id, usuario_id, titulo, descricao, categoria, data_registro, version
+                    FROM sonhos ORDER BY data_registro DESC
+                """)
+
+            rows = cursor.fetchall()
         import html
         return [
             {
@@ -148,18 +183,20 @@ class SonhosService:
 
     def remover_sonho(self, sonho_id: int, usuario_requisitor_id: int) -> bool:
         """Remove um sonho/anotação garantindo que pertence ao usuário requisitor."""
-        # 1 linha para explicar o motivo: Bloqueio estrito garante a propriedade individual de cada nota no ambiente de rede.
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT usuario_id FROM sonhos WHERE id = ?", (sonho_id,))
-        row = cursor.fetchone()
-        if not row:
-            raise DreamValidationError("Anotação não encontrada.")
-        
-        dono_id = row[0]
-        if dono_id != usuario_requisitor_id:
-            raise PermissionError("Operação não autorizada. Este registro não pertence a você.")
-            
-        cursor.execute("DELETE FROM sonhos WHERE id = ? AND usuario_id = ?", (sonho_id, usuario_requisitor_id))
-        self.conn.commit()
-        return cursor.rowcount > 0
+        # Bloqueio estrito sob lock garante propriedade e consistência em ambiente multi-thread.
+        with self._lock:
+            self._ensure_open()
+            cursor = self.conn.cursor()
+            cursor.execute("SELECT usuario_id FROM sonhos WHERE id = ?", (sonho_id,))
+            row = cursor.fetchone()
+            if not row:
+                raise DreamValidationError("Anotação não encontrada.")
+
+            dono_id = row[0]
+            if dono_id != usuario_requisitor_id:
+                raise PermissionError("Operação não autorizada. Este registro não pertence a você.")
+
+            cursor.execute("DELETE FROM sonhos WHERE id = ? AND usuario_id = ?", (sonho_id, usuario_requisitor_id))
+            self.conn.commit()
+            return cursor.rowcount > 0
 
