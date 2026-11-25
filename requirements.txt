@@ -29,3 +29,6 @@ flask
 
 # criptografia do banco de dados
 cryptography
+
+# interface v2.0 (janela nativa WebView2)
+pywebview==6.2.1

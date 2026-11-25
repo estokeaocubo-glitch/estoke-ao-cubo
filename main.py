@@ -6,6 +6,11 @@ script_dir = os.path.dirname(os.path.abspath(__file__))
 if script_dir not in sys.path:
     sys.path.insert(0, script_dir)
 
+# Interface v2.0 (PyWebView) opt-in via --ui=web; o padrão segue sendo a UI legada (CustomTkinter).
+if __name__ == '__main__' and "--ui=web" in sys.argv[1:] and "--self-test" not in sys.argv[1:]:
+    from app_desktop import main as _main_web
+    sys.exit(_main_web(sys.argv[1:]))
+
 import customtkinter as ctk
 from customtkinter import CTkButton
 from tkinter import messagebox, filedialog, ttk
