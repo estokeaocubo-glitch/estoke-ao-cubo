@@ -1,10 +1,10 @@
 ; Script único Inno Setup 6 para o Estoke Ao Cubo (Full e Trial)
 ; Recebe parametros via linha de comando ISCC.exe:
-;   /DMyAppVersion=4.6.0
+;   /DMyAppVersion=4.6.1
 ;   /DMyAppEdition=full|trial
 
 #ifndef MyAppVersion
-  #define MyAppVersion "4.6.0"
+  #define MyAppVersion "4.6.1"
 #endif
 
 #ifndef MyAppEdition
@@ -52,7 +52,7 @@ MinVersion=10.0.17763
 CloseApplications=yes
 RestartApplications=no
 UninstallDisplayIcon={app}\{#MyExeName}
-VersionInfoVersion=4.6.0.0
+VersionInfoVersion=4.6.1.0
 VersionInfoCompany=Estoke Ao Cubo
 VersionInfoDescription=Estoke Ao Cubo - Sistema de Gestao Comercial e PDV
 VersionInfoCopyright=Copyright (C) 2026 Estoke Ao Cubo

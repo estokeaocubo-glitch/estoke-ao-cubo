@@ -23,7 +23,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-APP_VERSION = "4.6.0"
+APP_VERSION = "4.6.1"
 
 ISCC_CANDIDATES = [
     os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "Inno Setup 6", "ISCC.exe"),

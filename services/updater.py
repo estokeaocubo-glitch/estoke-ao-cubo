@@ -30,7 +30,7 @@ import config as app_config
 
 logger = logging.getLogger("EstokeAoCubo.updater")
 
-APP_VERSION = "4.6.0"
+APP_VERSION = "4.6.1"
 DEFAULT_UPDATE_MANIFEST_URL = "https://updates.estokeaocubo.com.br/version.json"
 # Chave pública que valida o version.json do auto-update (par gerado no hotfix v4.6.1;
 # a privada fica fora do repositório).
