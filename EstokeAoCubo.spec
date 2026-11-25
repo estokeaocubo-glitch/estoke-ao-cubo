@@ -75,6 +75,8 @@ hiddenimports = [
     "services.updater",
     "services.compras_service",
     "services.fiscal_service",
+    "services.producao_service",
+    "services.troca_service",
     # Subpacote views
     "views",
     "views.base",

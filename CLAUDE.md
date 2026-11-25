@@ -23,11 +23,12 @@ Sistema de gestão/PDV para varejo, food service e serviços (desktop Windows).
 
 ## Estrutura
 ```
-main.py            App CustomTkinter (ainda com regras de negócio a extrair) + --self-test (8.554 linhas)
-database.py        Monolito de acesso a dados (SQLite + RLock) (6.726 linhas)
+main.py            App CustomTkinter (ainda com regras de negócio a extrair) + --self-test (8.485 linhas)
+database.py        Monolito de acesso a dados (SQLite + RLock) (6.833 linhas)
 migrations.py      Migrações de schema
 api_server.py      API REST Flask local (1.044 linhas, 41 rotas)
-services/          Camada de domínio (alvo da extração F1b)
+services/          Camada de domínio (alvo da extração F1b; Lote 7: estoque_service com kits/reposição,
+                   producao_service, troca_service)
 views/             Telas já modularizadas (pdv_view, financeiro_view, admin_view...)
 paths.py           Caminhos de dados/recursos (respeita ESTOKE_DATA_DIR) e get_web_path()
 crash_handler.py   Hooks de exceção + diálogo de erro
@@ -48,7 +49,7 @@ Use o venv do projeto `C:\dev\EstokeAoCubo\.venv` (Python 3.14, `requirements.tx
 $py = "C:\dev\EstokeAoCubo\.venv\Scripts\python.exe"
 $env:PYTHONUTF8 = "0"
 
-# Testes (baseline atual: 242 passam / 1 falha preexistente em
+# Testes (baseline atual: 257 passam / 1 falha preexistente em
 # test_mercadopago_integration::test_01_carregamento_credenciais, que exige token real no .env)
 $env:ESTOKE_DATA_DIR = (New-Item -ItemType Directory -Force "$env:TEMP\estoke_pytest").FullName
 & $py -m pytest -q
@@ -58,7 +59,9 @@ $env:ESTOKE_DATA_DIR = (New-Item -ItemType Directory -Force "$env:TEMP\estoke_se
 & $py main.py --self-test
 
 # Smoke test da UI: script em ESTOKE_DATA_DIR temporário, com MP/Focus/impressora mockados
-# (referência: smoke_pdv_lote6.py do agente anterior; ESTOKE_LOAD_DOTENV=0)
+# (referência: smoke_pdv_lote6.py do agente anterior; ESTOKE_LOAD_DOTENV=0).
+# Padrão do Lote 7: patch de App._show_first_access_screen/_show_login_screen para no-op,
+# messagebox mockado, abrir cada diálogo e destruir as janelas novas.
 
 # Build/release (só quando pedido)
 & $py build_local.py
@@ -101,7 +104,7 @@ O roadmap vivo e as anotações fora de escopo ficam em `implementation_plan.md`
 enquanto não existir aqui, a última versão está na pasta do agente anterior, em
 `%USERPROFILE%\.gemini\antigravity\brain\7f1adfc0-...\implementation_plan.md`).
 Ordem atual: hotfix v4.6.1 → higiene (venv, requirements, teste MP `live`, `__version__`;
-lotes H1 e H2+H3 = migração v10) → F1b Lote 7 (estoque/kits/produção/trocas)
+lotes H1 e H2+H3 = migração v10) → F1b Lote 7 (estoque/kits/produção/trocas, concluído)
 → F1b Lote 8 (restaurante, cadastros, migração v11, API)
 → isolamento por loja restante → F2 (ponte PyWebView) → F3 (UI em `web/`) → pré-release.
 
@@ -113,5 +116,12 @@ lotes H1 e H2+H3 = migração v10) → F1b Lote 7 (estoque/kits/produção/troca
   DRE e comissões só contam OS terminal, pela data de conclusão.
 - A UI (`views/`) ainda não passa `loja_id` para contas a pagar: conta nova vai para a loja padrão
   e a lista mostra todas as lojas.
+- Lote 7: `registrar_baixa_insumo`, `adicionar_ficha_tecnica`, `remover_ficha_tecnica`,
+  `registrar_producao` e `registrar_troca` rodam sob `_lock` com rollback e checam tudo antes de escrever.
+  Estoque negativo continua bloqueado em baixa, produção e troca. `adicionar_kit` retorna o id.
+- Dívidas anotadas para o Lote 8 (v11): `loja_id` em `trocas_devolucoes`, `producao_diaria`,
+  `baixa_insumos`, `fichas_tecnicas` e `kits` (hoje só o lançamento financeiro da troca leva a loja).
+- Dívidas fora de escopo: `db.vender_kit` é código morto (o PDV não chama); `kit_itens` liga o
+  componente por `produto_nome` (renomear o produto quebra o kit).
 - Arquivos sensíveis fora do Git: `.env` (credenciais MP/Focus), chaves privadas em `C:\dev\_segredos\`.
   Nunca commitar, nunca imprimir o conteúdo.
