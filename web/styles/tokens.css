@@ -1,0 +1,133 @@
+/*
+ * Estoke ao Cubo v2.0 — design tokens (light padrão, dark via [data-theme="dark"]).
+ * 100% offline: só fontes do sistema, nada remoto.
+ */
+:root {
+  color-scheme: light;
+
+  /* Superfícies */
+  --canvas: #F0F0F5;
+  --glass: rgba(255, 255, 255, 0.84);
+  --glass-strong: rgba(255, 255, 255, 0.92);
+  --solid: #FFFFFF;
+  --input-bg: #FFFFFF;
+  --hover-bg: rgba(10, 65, 116, 0.06);
+  --active-bg: rgba(10, 65, 116, 0.11);
+
+  /* Texto */
+  --text: #001D39;
+  --text-2: #4A607A;
+  --text-on-accent: #FFFFFF;
+
+  /* Ação / destaque */
+  --cta: #0A4174;
+  --cta-hover: #062F56;
+  --accent: #0A4174;
+  --accent-soft: rgba(10, 65, 116, 0.10);
+  --focus-ring: rgba(10, 65, 116, 0.45);
+
+  /* Estados */
+  --danger: #B42318;
+  --danger-soft: rgba(180, 35, 24, 0.09);
+  --success: #146C43;
+  --success-soft: rgba(20, 108, 67, 0.10);
+  --warning: #8A5A00;
+  --warning-soft: rgba(138, 90, 0, 0.10);
+
+  /* Bordas e sombras */
+  --border: 1px solid rgba(0, 29, 57, 0.09);
+  --border-color: rgba(0, 29, 57, 0.09);
+  --border-strong: rgba(0, 29, 57, 0.18);
+  --shadow-sm: 0 1px 2px rgba(0, 29, 57, 0.06);
+  --shadow-md: 0 8px 24px -8px rgba(0, 29, 57, 0.14), 0 2px 6px rgba(0, 29, 57, 0.05);
+  --shadow-lg: 0 24px 60px -16px rgba(0, 29, 57, 0.28);
+
+  /* Topbar (paleta herdada da UI legada) */
+  --tb-adicionar: #AED6F1;
+  --tb-vender: #7BBDE8;
+  --tb-servico: #6AADDA;
+  --tb-lista: #5DADE2;
+  --tb-relatorio: #2874A6;
+  --tb-dre: #1A5276;
+  --tb-f11: #154360;
+  --tb-text-light: #001D39;
+  --tb-text-dark: #FFFFFF;
+
+  /* Grain */
+  --grain-opacity: 0.025;
+
+  /* Glass */
+  --blur: 12px;
+
+  /* Tipografia (sistema; Segoe UI Variable no Windows 11) */
+  --font: "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
+  --font-display: "Segoe UI Variable Display", "Segoe UI", system-ui, sans-serif;
+  --font-mono: "Cascadia Mono", Consolas, "Courier New", monospace;
+  --fs-xs: 12px;
+  --fs-sm: 13px;
+  --fs-md: 14px;
+  --fs-lg: 16px;
+  --fs-xl: 20px;
+  --fs-2xl: 26px;
+  --fs-3xl: 32px;
+
+  /* Espaçamento e raio */
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-5: 20px;
+  --sp-6: 24px;
+  --sp-8: 32px;
+  --radius-sm: 8px;
+  --radius-md: 12px;
+  --radius-lg: 18px;
+  --radius-pill: 999px;
+
+  /* Layout */
+  --sidebar-w: 248px;
+  --sidebar-w-collapsed: 68px;
+  --topbar-h: 64px;
+  --gap: 16px;
+
+  --ease: cubic-bezier(0.2, 0.7, 0.2, 1);
+  --dur: 160ms;
+}
+
+[data-theme="dark"] {
+  color-scheme: dark;
+
+  --canvas: #12151C;
+  --glass: rgba(28, 33, 44, 0.78);
+  --glass-strong: rgba(28, 33, 44, 0.9);
+  --solid: #1B202C;
+  --input-bg: #1B202C;
+  --hover-bg: rgba(174, 214, 241, 0.07);
+  --active-bg: rgba(93, 173, 226, 0.16);
+
+  --text: #F1F5F9;
+  --text-2: #94A3B8;
+  --text-on-accent: #0B1A2A;
+
+  --cta: #5DADE2;
+  --cta-hover: #7BBDE8;
+  --accent: #7BBDE8;
+  --accent-soft: rgba(93, 173, 226, 0.14);
+  --focus-ring: rgba(123, 189, 232, 0.55);
+
+  --danger: #F28B82;
+  --danger-soft: rgba(242, 139, 130, 0.12);
+  --success: #6FCF97;
+  --success-soft: rgba(111, 207, 151, 0.12);
+  --warning: #F2C94C;
+  --warning-soft: rgba(242, 201, 76, 0.12);
+
+  --border: 1px solid rgba(174, 214, 241, 0.12);
+  --border-color: rgba(174, 214, 241, 0.12);
+  --border-strong: rgba(174, 214, 241, 0.24);
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.3);
+  --shadow-md: 0 10px 28px -10px rgba(0, 0, 0, 0.55), 0 2px 6px rgba(0, 0, 0, 0.25);
+  --shadow-lg: 0 28px 70px -18px rgba(0, 0, 0, 0.7);
+
+  --grain-opacity: 0.035;
+}

@@ -268,10 +268,14 @@ class TestPathsAndContract:
     """Valida paths.get_web_path e contrato AST puro de services/auth_service.py."""
 
     def test_get_web_path_compativel_meipass_sem_criar_pasta(self, tmp_path, monkeypatch):
-        # Em modo desenvolvimento, resolve para .../web/index.html sem criar a pasta web/
+        # Em modo desenvolvimento, resolve para .../web/index.html sem criar diretórios.
+        # (A partir da v2.0 a pasta web/ existe no repositório, então a garantia de
+        # "não criar" é verificada com um subdiretório inexistente.)
         p_dev = paths.get_web_path("index.html")
         assert p_dev.endswith(os.path.join("web", "index.html"))
-        assert not os.path.exists(os.path.join(paths.get_install_dir(), "web"))
+        p_inexistente = paths.get_web_path("__nao_existe__", "x.html")
+        assert p_inexistente.endswith(os.path.join("web", "__nao_existe__", "x.html"))
+        assert not os.path.exists(os.path.join(paths.get_install_dir(), "web", "__nao_existe__"))
 
         # Em modo frozen (_MEIPASS), resolve dentro de sys._MEIPASS/web/...
         fake_meipass = tmp_path / "meipass_bundle"
