@@ -11,14 +11,22 @@ Sistema de gestão/PDV para varejo, food service e serviços (desktop Windows).
 - **Regras de negócio:** `services/` (Python puro, **sem import de UI** — contratos AST nos testes).
 - **Integrações:** Mercado Pago (PIX + Point TEF), Focus NFe (NFC-e mod. 65 via Outbox),
   impressora térmica/gaveta/balança, Gemini (`ai_module.py`), auto-update Ed25519 (`services/updater.py`).
+- **Auto-update:** manifesto em `https://estoke-updates.pages.dev/version.json` e instaladores em
+  `https://estoke-updates.pages.dev/releases/vX.Y.Z/` (Pages `estoke-updates`, proxy do bucket R2
+  `estoke-trial-downloads`). O domínio `estokeaocubo.com.br` **não** está registrado: não usar.
+- **Duas chaves Ed25519 separadas** em `services/updater.py`:
+  - `DEFAULT_ED25519_PUBLIC_KEY_B64` (`D1csAK…`, desde a v4.6.1) valida **só o manifesto do auto-update**.
+    A privada fica fora do repo (`C:\dev\_segredos\updater_private.pem`); nunca exibir nem commitar.
+  - `DEFAULT_LICENSE_PUBLIC_KEY_B64` (`fO2QB…`) valida **tokens de licença**. Não trocar: as licenças
+    já emitidas deixariam de valer.
 - **Build:** PyInstaller (`EstokeAoCubo.spec`, `--onedir`) + Inno Setup (`EstokeSetup.iss`), edições Full/Trial.
 
 ## Estrutura
 ```
-main.py            App CustomTkinter (ainda com regras de negócio a extrair) + --self-test
-database.py        Monolito de acesso a dados (SQLite + RLock)
+main.py            App CustomTkinter (ainda com regras de negócio a extrair) + --self-test (8.554 linhas)
+database.py        Monolito de acesso a dados (SQLite + RLock) (6.726 linhas)
 migrations.py      Migrações de schema
-api_server.py      API REST Flask local
+api_server.py      API REST Flask local (1.044 linhas, 41 rotas)
 services/          Camada de domínio (alvo da extração F1b)
 views/             Telas já modularizadas (pdv_view, financeiro_view, admin_view...)
 paths.py           Caminhos de dados/recursos (respeita ESTOKE_DATA_DIR) e get_web_path()
@@ -28,18 +36,19 @@ tests/             Suíte pytest (pytest.ini: testpaths = tests, pythonpath = .)
 build_local.py     Pipeline único de build/release (APP_VERSION)
 version_info.txt   Metadados PE da versão
 ```
-Fora do repo (pasta pai `G:\Meu Drive\100`): site Next.js (`app/`, `components/`, `dist_site/`),
+Linhas e rotas conferidas em 25/11/2026 na `feat/pywebview-f1b`.
+Repo de trabalho: `C:\dev\EstokeAoCubo`. Fora do repo (pasta antiga `G:\Meu Drive\100`, somente leitura): site Next.js (`app/`, `components/`, `dist_site/`),
 geradores de nicho (`gerar_bancos_nichos.py`, `bancos_nichos/`), `projeto_trial/`, `auditoria/`.
 
 ## Comandos
-Use o venv `C:\auditoria_estoke\.venv-auditoria` (Python 3.14). O `.venv` do projeto está quebrado.
+Use o venv do projeto `C:\dev\EstokeAoCubo\.venv` (Python 3.14, `requirements.txt` + pytest).
 **Nunca** rode nada contra os dados reais (`%LOCALAPPDATA%\EstokeAoCubo`): sempre `ESTOKE_DATA_DIR` isolado.
 
 ```powershell
-$py = "C:\auditoria_estoke\.venv-auditoria\Scripts\python.exe"
+$py = "C:\dev\EstokeAoCubo\.venv\Scripts\python.exe"
 $env:PYTHONUTF8 = "0"
 
-# Testes (baseline atual: 209 passam / 1 falha preexistente em
+# Testes (baseline atual: 226 passam / 1 falha preexistente em
 # test_mercadopago_integration::test_01_carregamento_credenciais, que exige token real no .env)
 $env:ESTOKE_DATA_DIR = (New-Item -ItemType Directory -Force "$env:TEMP\estoke_pytest").FullName
 & $py -m pytest -q
@@ -72,8 +81,8 @@ $env:ESTOKE_DATA_DIR = (New-Item -ItemType Directory -Force "$env:TEMP\estoke_se
    da UI em `ESTOKE_DATA_DIR` isolado, hash do commit.
 10. **Trava anti-loop:** 2 falhas seguidas pelo mesmo erro → pare e explique a causa raiz.
 11. Diffs enxutos. Melhorias fora do escopo: anotar no `implementation_plan.md`, não implementar.
-12. O repo está no Google Drive: timeout de I/O em teste pode ser do Drive. Rode o teste de novo
-    isolado e informe; não mascare.
+12. Timeout de I/O em teste: rode o teste de novo isolado e informe; não mascare. O repo saiu do
+    Google Drive (agora em `C:\dev`), mas o bundle de backup continua em `G:\Meu Drive\backup\`.
 
 ## Convenções de commit
 - Formato: `tipo(escopo): descrição em português, minúscula, sem ponto final`.
@@ -82,8 +91,10 @@ $env:ESTOKE_DATA_DIR = (New-Item -ItemType Directory -Force "$env:TEMP\estoke_se
 
 ## Branches
 - `main` (= `origin/main`), `chore/checkpoint-v4.6.0`, `feat/pywebview-f1a`, `feat/pywebview-f1b` (ativa).
+- `hotfix/v4.6.1` está no origin, com a tag `v4.6.1` → `1caccee`. Os 4 commits dela foram portados
+  para a f1b via `cherry-pick -x`.
 - `feat/pywebview-f1a` e `feat/pywebview-f1b` **não estão no origin**.
-- Release em produção: v4.6.0 (instaladores em `release/`, gerados antes do checkpoint `5619b61`).
+- Release em produção: v4.6.1 (build da `hotfix/v4.6.1`, publicada em `estoke-updates.pages.dev`).
 
 ## Roadmap
 O roadmap vivo e as anotações fora de escopo ficam em `implementation_plan.md` (na raiz do repo;
@@ -94,9 +105,9 @@ Ordem atual: hotfix v4.6.1 → higiene (venv, requirements, teste MP `live`, `__
 → isolamento por loja restante → F2 (ponte PyWebView) → F3 (UI em `web/`) → pré-release.
 
 ## Armadilhas conhecidas
-- `database.__version__` ("4.3.0") diverge de `version_info.txt`/`build_local.APP_VERSION` ("4.6.0").
+- `database.__version__` ("4.3.0") diverge de `version_info.txt`/`build_local.APP_VERSION` ("4.6.1").
 - `contas_pagar` não tem `loja_id`; `pagar_conta()` gera gasto sem loja.
 - `servicos` não tem `data_conclusao`; `gerar_dre`/`calcular_comissoes` usam `servicos.data`.
 - `resumo_caixa_atual()` recebe `loja_id` mas não filtra por ele.
-- Arquivos sensíveis fora do Git: `.env` (credenciais MP/Focus), `../key.pem` (provável chave de assinatura).
+- Arquivos sensíveis fora do Git: `.env` (credenciais MP/Focus), chaves privadas em `C:\dev\_segredos\`.
   Nunca commitar, nunca imprimir o conteúdo.
