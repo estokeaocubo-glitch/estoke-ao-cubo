@@ -32,7 +32,12 @@ logger = logging.getLogger("EstokeAoCubo.updater")
 
 APP_VERSION = "4.6.0"
 DEFAULT_UPDATE_MANIFEST_URL = "https://updates.estokeaocubo.com.br/version.json"
-DEFAULT_ED25519_PUBLIC_KEY_B64 = "fO2QB+dHmaf/kA4UAtfyRSfIK+wUI+tb0DZxX9nlowc="
+# Chave pública que valida o version.json do auto-update (par gerado no hotfix v4.6.1;
+# a privada fica fora do repositório).
+DEFAULT_ED25519_PUBLIC_KEY_B64 = "D1csAKUbmtRR6bIvsVqW9wu0cJyPVduZJRN/vrOHkUo="
+# Chave pública que valida tokens de licença: continua a mesma da v4.6.0 para que
+# licenças já emitidas não caiam para trial ao trocar a chave do auto-update.
+DEFAULT_LICENSE_PUBLIC_KEY_B64 = "fO2QB+dHmaf/kA4UAtfyRSfIK+wUI+tb0DZxX9nlowc="
 INNO_SILENT_FLAGS = ("/SILENT", "/CLOSEAPPLICATIONS", "/RESTARTAPPLICATIONS", "/SUPPRESSMSGBOXES")
 
 
@@ -62,8 +67,14 @@ def _b64u_decode(text: str) -> bytes:
     return base64.urlsafe_b64decode(text + pad)
 
 
-def load_ed25519_public_key(public_key: Ed25519PublicKey | bytes | str | None = None) -> Ed25519PublicKey:
-    """Carrega chave pública Ed25519 de objeto, bytes PEM/raw ou string base64."""
+def load_ed25519_public_key(
+    public_key: Ed25519PublicKey | bytes | str | None = None,
+    default_b64: str = DEFAULT_ED25519_PUBLIC_KEY_B64,
+) -> Ed25519PublicKey:
+    """Carrega chave pública Ed25519 de objeto, bytes PEM/raw ou string base64.
+
+    Sem chave explícita: env ESTOKE_UPDATER_PUBKEY_B64, config updater_pubkey_b64 ou default_b64.
+    """
     if isinstance(public_key, Ed25519PublicKey):
         return public_key
 
@@ -72,7 +83,7 @@ def load_ed25519_public_key(public_key: Ed25519PublicKey | bytes | str | None = 
         key_str = (
             os.environ.get("ESTOKE_UPDATER_PUBKEY_B64")
             or cfg.get("updater_pubkey_b64")
-            or DEFAULT_ED25519_PUBLIC_KEY_B64
+            or default_b64
         )
         public_key = key_str
 
@@ -279,7 +290,7 @@ def verify_license_token(
     parts = raw.split(".", 1)
     payload_b64, sig_b64 = parts[0], parts[1]
     try:
-        pub = load_ed25519_public_key(public_key)
+        pub = load_ed25519_public_key(public_key, default_b64=DEFAULT_LICENSE_PUBLIC_KEY_B64)
         sig_bytes = _b64u_decode(sig_b64)
         pub.verify(sig_bytes, payload_b64.encode("ascii"))
         payload = json.loads(_b64u_decode(payload_b64).decode("utf-8"))
