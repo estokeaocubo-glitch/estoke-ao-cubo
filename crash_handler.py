@@ -18,7 +18,7 @@ import uuid
 
 logger = logging.getLogger("EstokeAoCubo.crash")
 
-APP_VERSION = "4.6.0"
+APP_VERSION = "4.6.1"
 _fault_log_handle = None
 _installed = False
 _crash_dialog_open = False
