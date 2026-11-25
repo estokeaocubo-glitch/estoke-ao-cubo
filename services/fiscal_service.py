@@ -829,7 +829,16 @@ class FiscalService:
             return rej
 
         provider = self._get_provider()
-        res = provider.emitir_nfce(doc)
+        try:
+            res = provider.emitir_nfce(doc)
+        except Exception as exc:
+            logger.warning("Exceção inesperada ao transmitir NFC-e ref=%s: %s", transacao_id, exc)
+            res = FiscalEmitResult(
+                sucesso=False,
+                status="erro_comunicacao",
+                referencia=str(transacao_id),
+                mensagem_sefaz=f"Falha ao transmitir NFC-e: {exc}",
+            )
 
         if res.status in ("erro_comunicacao", "pendente_emissao"):
             pend = FiscalEmitResult(
@@ -863,6 +872,69 @@ class FiscalService:
 
         self._salvar_documento_db(transacao_id, doc.ambiente, res, doc_dict_clean)
         return res
+
+    def reemitir_nfce(
+        self,
+        transacao_id: str,
+        consumidor_cpf_cnpj: str = "",
+        tef_integrado: bool = False,
+        troco: float = 0.0,
+        outbox_service: Any = None,
+    ) -> FiscalEmitResult:
+        """
+        Reemite NFC-e pendente, em erro de comunicação ou rejeitada sem alterar a venda já gravada.
+        Idempotente quando já autorizada; consulta previamente se estiver em processamento.
+        """
+        tx_id = str(transacao_id or "").strip()
+        if not tx_id:
+            raise ValueError("transacao_id obrigatório para reemissão de NFC-e.")
+
+        atual = self.obter_documento(tx_id)
+        if atual and atual.get("status") == "autorizado":
+            return FiscalEmitResult(
+                sucesso=True,
+                status="autorizado",
+                referencia=tx_id,
+                chave_acesso=str(atual.get("chave_acesso") or ""),
+                numero=str(atual.get("numero") or ""),
+                serie=str(atual.get("serie") or ""),
+                protocolo=str(atual.get("protocolo") or ""),
+                qrcode_url=str(atual.get("qrcode_url") or ""),
+                url_danfe=str(atual.get("url_danfe") or ""),
+                xml_url=str(atual.get("xml_url") or ""),
+                mensagem_sefaz=str(atual.get("mensagem_sefaz") or "NFC-e já autorizada."),
+            )
+
+        if atual and atual.get("status") == "processando":
+            provider = self._get_provider()
+            try:
+                cons = provider.consultar_nfce(tx_id)
+            except Exception as exc:
+                cons = FiscalEmitResult(
+                    sucesso=False,
+                    status="erro_comunicacao",
+                    referencia=tx_id,
+                    mensagem_sefaz=f"Falha ao consultar NFC-e em processamento: {exc}",
+                )
+            if cons.status == "autorizado":
+                try:
+                    payload_doc = json.loads(atual.get("payload_json") or "{}")
+                except Exception:
+                    payload_doc = {}
+                self._salvar_documento_db(tx_id, atual.get("ambiente") or "homologacao", cons, payload_doc)
+                return cons
+            if cons.status == "processando":
+                return cons
+            if cons.status == "erro_comunicacao" and "404" not in str(cons.mensagem_sefaz):
+                return cons
+
+        return self.emitir_para_venda(
+            tx_id,
+            consumidor_cpf_cnpj=consumidor_cpf_cnpj,
+            tef_integrado=tef_integrado,
+            troco=troco,
+            outbox_service=outbox_service,
+        )
 
     def processar_outbox_nfce(self, payload: dict[str, Any]) -> tuple[bool, str, bool] | tuple[bool, str]:
         """

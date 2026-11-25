@@ -2298,13 +2298,18 @@ class Database:
             logger.error("Erro ao fechar caixa: %s", e)
             return False, str(e)
 
-    def caixa_aberto(self, usuario_id=None):
-        """Retorna dados do caixa aberto ou None."""
+    def caixa_aberto(self, usuario_id=None, loja_id=None):
+        """Retorna dados do caixa aberto (opcionalmente filtrado por usuário e loja ativa) ou None."""
         cursor = self.conn.cursor()
+        where = ["status = 'aberto'"]
+        params = []
         if usuario_id is not None:
-            cursor.execute("SELECT * FROM caixa WHERE status = 'aberto' AND usuario_id = ?", (usuario_id,))
-        else:
-            cursor.execute("SELECT * FROM caixa WHERE status = 'aberto'")
+            where.append("usuario_id = ?")
+            params.append(usuario_id)
+        if loja_id is not None:
+            where.append("(loja_id = ? OR loja_id IS NULL)")
+            params.append(loja_id)
+        cursor.execute(f"SELECT * FROM caixa WHERE {' AND '.join(where)}", params)
         row = cursor.fetchone()
         if row:
             col_names = [d[0] for d in cursor.description]
@@ -3399,7 +3404,148 @@ class Database:
             return False, str(e)
 
     # --- Vendas Detalhadas ---
-    def registrar_venda_detalhada(self, itens, total, desconto=0.0, cliente="Consumidor Final", forma_pagamento="Dinheiro", vendedor="", formas_usadas=None, usuario_id=None, loja_id=None, registrar_entrada=True, transacao_id=None):
+    def obter_venda_por_transacao(self, transacao_id):
+        """Consulta venda já registrada pelo identificador idempotente transacao_id."""
+        tx = str(transacao_id or "").strip()
+        if not tx:
+            return None
+        from decimal import Decimal, ROUND_HALF_UP
+
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                """SELECT id, valor_total, COALESCE(desconto, 0), forma_pagamento, loja_id, caixa_id
+                   FROM vendas WHERE transacao_id = ? ORDER BY id ASC""",
+                (tx,),
+            )
+            rows = cursor.fetchall()
+            if not rows:
+                return None
+            total_liq = Decimal("0.00")
+            for r in rows:
+                total_liq += Decimal(str(r[1] or 0)) - Decimal(str(r[2] or 0))
+            return {
+                "venda_ids": [int(r[0]) for r in rows],
+                "venda_id": int(rows[0][0]),
+                "transacao_id": tx,
+                "total": float(total_liq.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)),
+                "forma_pagamento": rows[0][3],
+                "loja_id": rows[0][4],
+                "caixa_id": rows[0][5],
+            }
+
+    def validar_pre_venda(self, itens, desconto=0.0, usuario_id=None, loja_id=None, cliente="Consumidor Final", formas_usadas=None):
+        """
+        Pré-valida caixa aberto na loja ativa, totais monetários em Decimal e estoque agregado
+        antes de acionar meios de pagamento externos (TEF/Pinpad). Não realiza escrita.
+        """
+        from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+        import math
+
+        if not itens or not isinstance(itens, list):
+            return False, "A venda deve possuir pelo menos um item."
+
+        with self._lock:
+            caixa_aberto = self.caixa_aberto(usuario_id=usuario_id, loja_id=loja_id)
+            if not caixa_aberto and usuario_id is not None:
+                caixa_aberto = self.caixa_aberto(loja_id=loja_id)
+            if not caixa_aberto:
+                return False, "Caixa fechado para a loja ativa. Abra o caixa antes de registrar vendas."
+
+            try:
+                desconto_d = Decimal(str(desconto or 0)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            except (InvalidOperation, ValueError):
+                return False, "Valor de desconto inválido."
+            if desconto_d < Decimal("0.00"):
+                return False, "Valor de desconto inválido."
+
+            total_bruto_d = Decimal("0.00")
+            demanda_produtos = {}
+            cursor = self.conn.cursor()
+
+            for item in itens:
+                try:
+                    qtd_f = float(item.get("qtd", 0))
+                    preco_f = float(item.get("preco", 0))
+                except (TypeError, ValueError):
+                    return False, "Quantidade ou preço unitário inválido."
+                if math.isnan(qtd_f) or math.isinf(qtd_f) or qtd_f <= 0:
+                    return False, "A quantidade de cada item deve ser maior que zero."
+                if math.isnan(preco_f) or math.isinf(preco_f) or preco_f < 0:
+                    return False, "Preço unitário inválido."
+
+                qtd_d = Decimal(str(qtd_f))
+                preco_d = Decimal(str(preco_f))
+                total_bruto_d += (preco_d * qtd_d).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+                item_type = item.get("type") or item.get("tipo") or "produto"
+                item_id = item.get("id")
+                qtd_num = int(qtd_f) if qtd_f.is_integer() else qtd_f
+
+                if item_type == "kit" and item_id is not None:
+                    disp_kit = self.verificar_disponibilidade_kit(item_id)
+                    if disp_kit < qtd_num:
+                        return False, f"Estoque insuficiente de componentes para o Kit (Disponível: {disp_kit})."
+                    cursor.execute(
+                        """SELECT p.id, ki.quantidade
+                           FROM kit_itens ki JOIN produtos p ON ki.produto_nome = p.nome
+                           WHERE ki.kit_id = ?""",
+                        (item_id,),
+                    )
+                    for comp_id, comp_qtd in cursor.fetchall():
+                        demanda_produtos[comp_id] = demanda_produtos.get(comp_id, 0) + (comp_qtd * qtd_num)
+                elif item_id is not None:
+                    demanda_produtos[item_id] = demanda_produtos.get(item_id, 0) + qtd_num
+
+            total_bruto_d = total_bruto_d.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            if desconto_d > total_bruto_d + Decimal("0.005"):
+                return False, f"Desconto (R$ {float(desconto_d):.2f}) não pode exceder o valor bruto da venda (R$ {float(total_bruto_d):.2f})."
+
+            net_total_d = (total_bruto_d - desconto_d).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            if net_total_d <= Decimal("0.00"):
+                return False, "O valor líquido da venda deve ser maior que zero."
+
+            for prod_id, qtd_req in demanda_produtos.items():
+                cursor.execute("SELECT nome, quantidade FROM produtos WHERE id = ?", (prod_id,))
+                prod = cursor.fetchone()
+                if not prod:
+                    return False, f"Produto ID {prod_id} não encontrado."
+                nome_prod, qtd_atual = prod
+                if (qtd_atual or 0) < qtd_req:
+                    return False, f"Estoque insuficiente para '{nome_prod}'. Disponível: {qtd_atual}"
+
+            if formas_usadas and any(f.get("forma") == "Fiado" for f in formas_usadas):
+                if not cliente or cliente == "Consumidor Final":
+                    return False, "Cliente obrigatório para venda fiado."
+                cursor.execute("SELECT id FROM clientes WHERE nome = ? LIMIT 1", (cliente,))
+                if not cursor.fetchone():
+                    return False, f"Cliente '{cliente}' não encontrado para venda fiado."
+
+            loja_efetiva = loja_id if loja_id is not None else caixa_aberto.get("loja_id")
+            return True, {
+                "caixa_id": caixa_aberto["id"],
+                "loja_id": loja_efetiva,
+                "total_bruto": float(total_bruto_d),
+                "desconto": float(desconto_d),
+                "net_total": float(net_total_d),
+            }
+
+    def registrar_venda_detalhada(
+        self,
+        itens,
+        total,
+        desconto=0.0,
+        cliente="Consumidor Final",
+        forma_pagamento="Dinheiro",
+        vendedor="",
+        formas_usadas=None,
+        usuario_id=None,
+        loja_id=None,
+        registrar_entrada=True,
+        transacao_id=None,
+        fiado_info=None,
+        pagamentos_mp_registros=None,
+    ):
         """Registra venda detalhada na tabela vendas com itens individuais, validação atômica de estoque e vinculação ao caixa do operador."""
         with self._lock:
             return self._registrar_venda_detalhada_locked(
@@ -3407,28 +3553,71 @@ class Database:
                 forma_pagamento=forma_pagamento, vendedor=vendedor,
                 formas_usadas=formas_usadas, usuario_id=usuario_id,
                 loja_id=loja_id, registrar_entrada=registrar_entrada,
-                transacao_id=transacao_id
+                transacao_id=transacao_id, fiado_info=fiado_info,
+                pagamentos_mp_registros=pagamentos_mp_registros,
             )
 
-    def _registrar_venda_detalhada_locked(self, itens, total, desconto=0.0, cliente="Consumidor Final", forma_pagamento="Dinheiro", vendedor="", formas_usadas=None, usuario_id=None, loja_id=None, registrar_entrada=True, transacao_id=None):
+    def _registrar_venda_detalhada_locked(
+        self,
+        itens,
+        total,
+        desconto=0.0,
+        cliente="Consumidor Final",
+        forma_pagamento="Dinheiro",
+        vendedor="",
+        formas_usadas=None,
+        usuario_id=None,
+        loja_id=None,
+        registrar_entrada=True,
+        transacao_id=None,
+        fiado_info=None,
+        pagamentos_mp_registros=None,
+    ):
+        from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+        import math
+
+        def _dec(val):
+            return Decimal(str(val or 0))
+
+        def _r2(val_d):
+            return val_d.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
         try:
-            import math
             if not itens or not isinstance(itens, list):
                 return False, "A venda deve possuir pelo menos um item."
 
-            # Verificar se o caixa está aberto (priorizando o operador informado)
-            caixa_aberto = self.caixa_aberto(usuario_id=usuario_id) if usuario_id is not None else self.caixa_aberto()
+            tx_clean = str(transacao_id).strip() if transacao_id else ""
+            cursor = self.conn.cursor()
+
+            # Idempotência por transacao_id: reenvio não duplica venda, estoque nem caixa
+            if tx_clean:
+                cursor.execute("SELECT id FROM vendas WHERE transacao_id = ? ORDER BY id ASC", (tx_clean,))
+                existing = [int(r[0]) for r in cursor.fetchall()]
+                if existing:
+                    self.ultima_transacao_id = tx_clean
+                    return True, existing
+
+            # Verificar se o caixa está aberto na loja ativa (priorizando o operador informado)
+            caixa_aberto = (
+                self.caixa_aberto(usuario_id=usuario_id, loja_id=loja_id)
+                if usuario_id is not None
+                else self.caixa_aberto(loja_id=loja_id)
+            )
             if not caixa_aberto and usuario_id is not None:
-                caixa_aberto = self.caixa_aberto()
+                caixa_aberto = self.caixa_aberto(loja_id=loja_id)
             if not caixa_aberto:
                 return False, "Caixa fechado. Abra o caixa antes de registrar vendas."
 
-            desconto = round(float(desconto or 0.0), 2)
-            if math.isnan(desconto) or math.isinf(desconto) or desconto < 0:
+            try:
+                desconto_raw = float(desconto or 0.0)
+            except (TypeError, ValueError):
                 return False, "Valor de desconto inválido."
+            if math.isnan(desconto_raw) or math.isinf(desconto_raw) or desconto_raw < 0:
+                return False, "Valor de desconto inválido."
+            desconto_d = _r2(_dec(desconto_raw))
 
-            # Validar itens e calcular total bruto real
-            total_bruto = 0.0
+            # Validar itens e calcular total bruto real em Decimal
+            total_bruto_d = Decimal("0.00")
             for item in itens:
                 qtd = float(item.get('qtd', 0))
                 preco = float(item.get('preco', 0))
@@ -3436,23 +3625,24 @@ class Database:
                     return False, "A quantidade de cada item deve ser maior que zero."
                 if math.isnan(preco) or math.isinf(preco) or preco < 0:
                     return False, "Preço unitário inválido."
-                total_bruto += preco * qtd
-            total_bruto = round(total_bruto, 2)
+                total_bruto_d += _r2(_dec(preco) * _dec(qtd))
+            total_bruto_d = _r2(total_bruto_d)
 
-            if desconto > total_bruto + 0.005:
-                return False, f"Desconto (R$ {desconto:.2f}) não pode exceder o valor bruto da venda (R$ {total_bruto:.2f})."
+            if desconto_d > total_bruto_d + Decimal("0.005"):
+                return False, f"Desconto (R$ {float(desconto_d):.2f}) não pode exceder o valor bruto da venda (R$ {float(total_bruto_d):.2f})."
 
-            # Detecção inteligente: evita duplo abatimento caso a UI tenha passado total já descontado
-            net_total = round(total_bruto - desconto, 2)
+            net_total_d = _r2(total_bruto_d - desconto_d)
+            if net_total_d <= Decimal("0.00"):
+                return False, "O valor líquido da venda deve ser maior que zero."
 
-            cursor = self.conn.cursor()
             caixa_id = caixa_aberto['id']
             if loja_id is None:
                 loja_id = caixa_aberto.get('loja_id')
             data_venda = datetime.datetime.now().isoformat()
 
-            # Pré-validação atômica de estoque para TODOS os itens antes de qualquer escrita
+            # Pré-validação atômica de estoque (agregada por produto) antes de qualquer escrita
             info_estoque_itens = []
+            demanda_produtos = {}
             for item in itens:
                 item_type = item.get('type') or item.get('tipo') or 'produto'
                 item_id = item.get('id')
@@ -3468,12 +3658,14 @@ class Database:
                         WHERE ki.kit_id = ?
                     """, (item_id,))
                     comp_rows = cursor.fetchall()
-                    custo_kit_unit = sum(float(r[1]) * float(r[2] or 0.0) for r in comp_rows)
+                    for comp_id, comp_qtd, _ in comp_rows:
+                        demanda_produtos[comp_id] = demanda_produtos.get(comp_id, 0) + int(comp_qtd * qtd)
+                    custo_kit_unit = sum(_dec(r[1]) * _dec(r[2] or 0) for r in comp_rows)
                     info_estoque_itens.append({
                         "is_kit": True,
                         "kit_id": item_id,
                         "componentes": comp_rows,
-                        "custo_unit": custo_kit_unit,
+                        "custo_unit_d": custo_kit_unit,
                     })
                 elif item_id is not None:
                     cursor.execute("SELECT nome, quantidade, quantidade_inicial, preco_compra FROM produtos WHERE id = ?", (item_id,))
@@ -3481,8 +3673,7 @@ class Database:
                     if not prod:
                         return False, f"Produto ID {item_id} não encontrado."
                     nome_prod, qtd_atual, qtd_inicial, prod_preco_compra = prod
-                    if (qtd_atual or 0) < qtd:
-                        return False, f"Estoque insuficiente para '{nome_prod}'. Disponível: {qtd_atual}"
+                    demanda_produtos[item_id] = demanda_produtos.get(item_id, 0) + qtd
                     custo_unit = item.get('preco_compra')
                     if custo_unit is None:
                         custo_unit = prod_preco_compra if prod_preco_compra is not None else 0.0
@@ -3492,39 +3683,47 @@ class Database:
                         "nome_prod": nome_prod,
                         "qtd_atual": qtd_atual,
                         "qtd_inicial": qtd_inicial,
-                        "custo_unit": float(custo_unit or 0.0),
+                        "custo_unit_d": _dec(custo_unit or 0.0),
                     })
                 else:
                     custo_unit = item.get('preco_compra')
                     info_estoque_itens.append({
                         "is_kit": False,
                         "produto_id": None,
-                        "custo_unit": float(custo_unit or 0.0),
+                        "custo_unit_d": _dec(custo_unit or 0.0),
                     })
 
-            # Mapeamento de formas de pagamento
-            pagos = {
-                'valor_dinheiro': 0.0,
-                'valor_pix': 0.0,
-                'valor_cartao_debito': 0.0,
-                'valor_cartao_credito': 0.0,
-                'valor_fiado': 0.0
+            # Validar demanda total agregada (cobre mesmo produto repetido no carrinho ou em kit + avulso)
+            for prod_id_chk, qtd_req_total in demanda_produtos.items():
+                cursor.execute("SELECT nome, quantidade FROM produtos WHERE id = ?", (prod_id_chk,))
+                row_chk = cursor.fetchone()
+                if not row_chk or (row_chk[1] or 0) < qtd_req_total:
+                    nome_chk = row_chk[0] if row_chk else f"ID {prod_id_chk}"
+                    disp_chk = row_chk[1] if row_chk else 0
+                    return False, f"Estoque insuficiente para '{nome_chk}'. Disponível: {disp_chk}"
+
+            # Mapeamento de formas de pagamento em Decimal (ROUND_HALF_UP)
+            pagos_d = {
+                'valor_dinheiro': Decimal("0.00"),
+                'valor_pix': Decimal("0.00"),
+                'valor_cartao_debito': Decimal("0.00"),
+                'valor_cartao_credito': Decimal("0.00"),
+                'valor_fiado': Decimal("0.00"),
             }
             mapping = {
                 "Dinheiro": "valor_dinheiro",
                 "PIX": "valor_pix",
                 "Cartão Débito": "valor_cartao_debito",
                 "Cartão Crédito": "valor_cartao_credito",
-                "Fiado": "valor_fiado"
+                "Fiado": "valor_fiado",
             }
 
             if formas_usadas:
                 for f in formas_usadas:
                     col = mapping.get(f.get("forma"))
                     if col:
-                        pagos[col] = round(pagos[col] + float(f.get("valor", 0.0)), 2)
+                        pagos_d[col] = _r2(pagos_d[col] + _dec(f.get("valor", 0.0)))
             elif forma_pagamento and ("|" in str(forma_pagamento) or ":" in str(forma_pagamento)):
-                # Suporte a string de pagamento misto ex: "Dinheiro: 20.00 | PIX: 30.00"
                 import re
                 partes = re.split(r'[|+]', str(forma_pagamento))
                 parsed_any = False
@@ -3534,123 +3733,215 @@ class Database:
                         if nome_forma.lower() in parte.lower():
                             m = re.search(r'(\d+(?:[.,]\d+)?)', parte)
                             if m:
-                                val_f = float(m.group(1).replace(',', '.'))
-                                pagos[col] = round(pagos[col] + val_f, 2)
+                                val_d = _r2(_dec(m.group(1).replace(',', '.')))
+                                pagos_d[col] = _r2(pagos_d[col] + val_d)
                                 parsed_any = True
                             break
                 if not parsed_any:
-                    pagos['valor_dinheiro'] = net_total
+                    pagos_d['valor_dinheiro'] = net_total_d
             else:
                 col = mapping.get(forma_pagamento)
                 if col:
-                    pagos[col] = net_total
+                    pagos_d[col] = net_total_d
                 else:
-                    pagos['valor_dinheiro'] = net_total
+                    pagos_d['valor_dinheiro'] = net_total_d
 
-            restante_pagos = pagos.copy()
-            restante_desconto = desconto
+            restante_pagos_d = pagos_d.copy()
+            restante_desconto_d = desconto_d
             venda_ids = []
-            transacao_id = str(transacao_id).strip() if transacao_id else uuid.uuid4().hex[:12]
+            transacao_id = tx_clean if tx_clean else uuid.uuid4().hex[:12]
             self.ultima_transacao_id = transacao_id
 
-            for idx, item in enumerate(itens):
-                info_est = info_estoque_itens[idx]
-                qtd = int(item['qtd']) if float(item['qtd']).is_integer() else float(item['qtd'])
-                preco_unit = float(item['preco'])
-                valor_item = round(preco_unit * qtd, 2)
+            cursor.execute("SAVEPOINT sp_registrar_venda")
+            try:
+                for idx, item in enumerate(itens):
+                    info_est = info_estoque_itens[idx]
+                    qtd = int(item['qtd']) if float(item['qtd']).is_integer() else float(item['qtd'])
+                    qtd_d = _dec(qtd)
+                    preco_unit_d = _dec(item['preco'])
+                    valor_item_d = _r2(preco_unit_d * qtd_d)
 
-                if idx == len(itens) - 1:
-                    desconto_item = round(restante_desconto, 2)
-                else:
-                    desconto_item = round((valor_item / total_bruto * desconto), 2) if total_bruto > 0 else 0.0
-                    restante_desconto = round(restante_desconto - desconto_item, 2)
-
-                custo_unit = info_est['custo_unit']
-                lucro = round((preco_unit - custo_unit) * qtd - desconto_item, 2)
-
-                prop = (valor_item - desconto_item) / net_total if net_total > 0 else (1.0 / len(itens))
-                item_pagos = {}
-                for col in pagos:
                     if idx == len(itens) - 1:
-                        item_pagos[col] = round(restante_pagos[col], 2)
+                        desconto_item_d = _r2(restante_desconto_d)
                     else:
-                        val_prop = round(pagos[col] * prop, 2)
-                        item_pagos[col] = val_prop
-                        restante_pagos[col] = round(restante_pagos[col] - val_prop, 2)
+                        desconto_item_d = _r2((valor_item_d / total_bruto_d) * desconto_d) if total_bruto_d > Decimal("0.00") else Decimal("0.00")
+                        restante_desconto_d = _r2(restante_desconto_d - desconto_item_d)
 
-                produto_id_db = None if info_est['is_kit'] else info_est.get('produto_id')
+                    custo_unit_d = info_est['custo_unit_d']
+                    lucro_d = _r2((preco_unit_d - custo_unit_d) * qtd_d - desconto_item_d)
+                    valor_liq_item_d = _r2(valor_item_d - desconto_item_d)
 
-                cursor.execute(
-                    """INSERT INTO vendas (
-                        produto_id, quantidade, valor_total, data_venda, lucro, forma_pagamento, cliente, status, desconto, vendedor, caixa_id,
-                        valor_dinheiro, valor_pix, valor_cartao_debito, valor_cartao_credito, valor_fiado, formas_pagamento, transacao_id, loja_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        produto_id_db, qtd, valor_item, data_venda, lucro, forma_pagamento, cliente, 'Concluída', desconto_item, vendedor, caixa_id,
-                        item_pagos['valor_dinheiro'], item_pagos['valor_pix'], item_pagos['valor_cartao_debito'], item_pagos['valor_cartao_credito'], item_pagos['valor_fiado'],
-                        forma_pagamento, transacao_id, loja_id
+                    prop_d = (valor_liq_item_d / net_total_d) if net_total_d > Decimal("0.00") else (Decimal("1") / Decimal(len(itens)))
+                    item_pagos = {}
+                    for col in pagos_d:
+                        if idx == len(itens) - 1:
+                            item_pagos[col] = float(_r2(restante_pagos_d[col]))
+                        else:
+                            val_prop_d = _r2(pagos_d[col] * prop_d)
+                            item_pagos[col] = float(val_prop_d)
+                            restante_pagos_d[col] = _r2(restante_pagos_d[col] - val_prop_d)
+
+                    produto_id_db = None if info_est['is_kit'] else info_est.get('produto_id')
+
+                    cursor.execute(
+                        """INSERT INTO vendas (
+                            produto_id, quantidade, valor_total, data_venda, lucro, forma_pagamento, cliente, status, desconto, vendedor, caixa_id,
+                            valor_dinheiro, valor_pix, valor_cartao_debito, valor_cartao_credito, valor_fiado, formas_pagamento, transacao_id, loja_id
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            produto_id_db, qtd, float(valor_item_d), data_venda, float(lucro_d), forma_pagamento, cliente, 'Concluída',
+                            float(desconto_item_d), vendedor, caixa_id,
+                            item_pagos['valor_dinheiro'], item_pagos['valor_pix'], item_pagos['valor_cartao_debito'],
+                            item_pagos['valor_cartao_credito'], item_pagos['valor_fiado'],
+                            forma_pagamento, transacao_id, loja_id,
+                        )
                     )
-                )
-                v_id = cursor.lastrowid
-                venda_ids.append((v_id, round(valor_item - desconto_item, 2)))
+                    v_id = cursor.lastrowid
+                    venda_ids.append((v_id, float(valor_liq_item_d)))
 
-                # Baixa de estoque
-                if info_est['is_kit']:
-                    for comp_prod_id, comp_qtd_kit, _ in info_est['componentes']:
-                        baixa_comp = int(comp_qtd_kit * qtd)
-                        cursor.execute("UPDATE produtos SET quantidade = quantidade - ? WHERE id = ?", (baixa_comp, comp_prod_id))
-                elif produto_id_db is not None:
-                    nova_qtd = info_est['qtd_atual'] - qtd
-                    cursor.execute("UPDATE produtos SET quantidade = ? WHERE id = ?", (nova_qtd, produto_id_db))
-                    nome_prod = info_est['nome_prod']
-                    qtd_inicial = info_est['qtd_inicial']
-                    base = qtd_inicial if qtd_inicial and qtd_inicial > 0 else (nova_qtd + qtd)
-                    if base > 0 and (nova_qtd / base) <= 0.30:
-                        cursor.execute("SELECT id FROM estabelecimento WHERE tarefa LIKE ? AND status != 'Concluído'", (f"%{nome_prod}%",))
-                        if not cursor.fetchone():
-                            cursor.execute(
-                                "INSERT INTO estabelecimento (area_local, tarefa, status, prioridade) VALUES (?, ?, ?, ?)",
-                                ("Estoque", f"Repor {nome_prod} (Estoque Baixo: {nova_qtd})", "Pendente", "Alta")
-                            )
+                    # Baixa de estoque atômica (decremento relativo para evitar sobrescrita em itens repetidos)
+                    if info_est['is_kit']:
+                        for comp_prod_id, comp_qtd_kit, _ in info_est['componentes']:
+                            baixa_comp = int(comp_qtd_kit * qtd)
+                            cursor.execute("UPDATE produtos SET quantidade = quantidade - ? WHERE id = ?", (baixa_comp, comp_prod_id))
+                    elif produto_id_db is not None:
+                        cursor.execute("UPDATE produtos SET quantidade = quantidade - ? WHERE id = ?", (qtd, produto_id_db))
+                        cursor.execute("SELECT quantidade FROM produtos WHERE id = ?", (produto_id_db,))
+                        nova_qtd = cursor.fetchone()[0]
+                        nome_prod = info_est['nome_prod']
+                        qtd_inicial = info_est['qtd_inicial']
+                        base = qtd_inicial if qtd_inicial and qtd_inicial > 0 else (nova_qtd + qtd)
+                        if base > 0 and (nova_qtd / base) <= 0.30:
+                            cursor.execute("SELECT id FROM estabelecimento WHERE tarefa LIKE ? AND status != 'Concluído'", (f"%{nome_prod}%",))
+                            if not cursor.fetchone():
+                                cursor.execute(
+                                    "INSERT INTO estabelecimento (area_local, tarefa, status, prioridade) VALUES (?, ?, ?, ?)",
+                                    ("Estoque", f"Repor {nome_prod} (Estoque Baixo: {nova_qtd})", "Pendente", "Alta")
+                                )
 
-            # Registrar entrada financeira pelo valor líquido real
-            if registrar_entrada:
-                cursor.execute(
-                    "INSERT INTO entradas (data, valor, descricao, loja_id) VALUES (?, ?, ?, ?)",
-                    (data_venda[:10], net_total, f"Venda PDV: {len(itens)} itens | {cliente} | {forma_pagamento}", loja_id)
-                )
+                # Registrar entrada financeira pelo valor líquido real
+                if registrar_entrada:
+                    cursor.execute(
+                        "INSERT INTO entradas (data, valor, descricao, loja_id) VALUES (?, ?, ?, ?)",
+                        (data_venda[:10], float(net_total_d), f"Venda PDV: {len(itens)} itens | {cliente} | {forma_pagamento}", loja_id)
+                    )
 
-            # Atualizar compras_recorrentes e fidelidade do cliente (sobre valor líquido)
-            if cliente != "Consumidor Final":
-                cursor.execute("UPDATE clientes SET compras_recorrentes = compras_recorrentes + 1 WHERE nome = ?", (cliente,))
-                pontos_ganhos = int(net_total // 10)
-                if pontos_ganhos > 0:
-                    cursor.execute("SELECT id FROM clientes WHERE nome = ?", (cliente,))
-                    c_row = cursor.fetchone()
-                    if c_row:
-                        cursor.execute('''INSERT INTO fidelidade (cliente_id, pontos, total_acumulado, data_ultima_compra)
-                            VALUES (?, ?, ?, ?)
-                            ON CONFLICT(cliente_id) DO UPDATE SET
-                                pontos = pontos + excluded.pontos,
-                                total_acumulado = total_acumulado + excluded.total_acumulado,
-                                data_ultima_compra = excluded.data_ultima_compra''',
-                            (c_row[0], pontos_ganhos, net_total, data_venda))
+                # Atualizar compras_recorrentes e fidelidade do cliente (sobre valor líquido)
+                if cliente != "Consumidor Final":
+                    cursor.execute("UPDATE clientes SET compras_recorrentes = compras_recorrentes + 1 WHERE nome = ?", (cliente,))
+                    pontos_ganhos = int(net_total_d // Decimal("10"))
+                    if pontos_ganhos > 0:
+                        cursor.execute("SELECT id FROM clientes WHERE nome = ?", (cliente,))
+                        c_row = cursor.fetchone()
+                        if c_row:
+                            cursor.execute('''INSERT INTO fidelidade (cliente_id, pontos, total_acumulado, data_ultima_compra)
+                                VALUES (?, ?, ?, ?)
+                                ON CONFLICT(cliente_id) DO UPDATE SET
+                                    pontos = pontos + excluded.pontos,
+                                    total_acumulado = total_acumulado + excluded.total_acumulado,
+                                    data_ultima_compra = excluded.data_ultima_compra''',
+                                (c_row[0], pontos_ganhos, float(net_total_d), data_venda))
 
-            # Registrar em AUDITORIA_CAIXA para cada item vendido
-            ids_apenas = []
-            for venda_id, val_liq_item in venda_ids:
-                ids_apenas.append(venda_id)
-                cursor.execute(
-                    '''INSERT INTO auditoria_caixa (caixa_id, data_hora, tipo_operacao, venda_id, forma_pagamento, valor, descricao)
-                       VALUES (?, ?, ?, ?, ?, ?, ?)''',
-                    (caixa_id, data_venda, 'VENDA', venda_id, forma_pagamento, val_liq_item, f"Venda registrada: {cliente}")
-                )
+                # Registrar em AUDITORIA_CAIXA para cada item vendido
+                ids_apenas = []
+                for venda_id, val_liq_item in venda_ids:
+                    ids_apenas.append(venda_id)
+                    cursor.execute(
+                        '''INSERT INTO auditoria_caixa (caixa_id, data_hora, tipo_operacao, venda_id, forma_pagamento, valor, descricao)
+                           VALUES (?, ?, ?, ?, ?, ?, ?)''',
+                        (caixa_id, data_venda, 'VENDA', venda_id, forma_pagamento, val_liq_item, f"Venda registrada: {cliente}")
+                    )
 
-            self.conn.commit()
+                # Registrar fiado na mesma transação atômica quando informado
+                if fiado_info and isinstance(fiado_info, dict) and fiado_info.get("cliente_id"):
+                    fiado_val_f = float(_r2(_dec(fiado_info.get("valor", 0))))
+                    fiado_venc = fiado_info.get("data_vencimento") or (datetime.date.today() + datetime.timedelta(days=30)).isoformat()
+                    fiado_desc = fiado_info.get("descricao") or f"Venda PDV #{ids_apenas[0]} ({len(itens)} itens)"
+                    cursor.execute(
+                        "INSERT INTO contas_receber (cliente_id, valor, data_venda, data_vencimento, status, descricao) VALUES (?, ?, ?, ?, 'Pendente', ?)",
+                        (int(fiado_info["cliente_id"]), fiado_val_f, data_venda[:10], fiado_venc, fiado_desc),
+                    )
+
+                # Registrar pagamentos MP/TEF aprovados na mesma transação atômica
+                if pagamentos_mp_registros:
+                    agora_mp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    for mp_reg in pagamentos_mp_registros:
+                        pid_mp = str(mp_reg.get("payment_id") or "").strip()
+                        if not pid_mp:
+                            continue
+                        payload_clean = self._sanitize_mp_payload(mp_reg.get("payload") or {})
+                        payload_json = json.dumps(payload_clean, ensure_ascii=False)
+                        cursor.execute(
+                            """
+                            INSERT INTO pagamentos_mp (
+                                payment_id, tipo, external_reference, status, status_detail,
+                                valor, point_intent_id, device_id, payload_json, data_aprovacao,
+                                criado_em, atualizado_em
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            ON CONFLICT(payment_id) DO UPDATE SET
+                                tipo = COALESCE(NULLIF(excluded.tipo, ''), pagamentos_mp.tipo),
+                                external_reference = CASE
+                                    WHEN COALESCE(excluded.external_reference, '') != '' THEN excluded.external_reference
+                                    ELSE pagamentos_mp.external_reference
+                                END,
+                                status = CASE
+                                    WHEN pagamentos_mp.status = 'approved' AND excluded.status IN ('pending', 'in_process')
+                                        THEN 'approved'
+                                    ELSE excluded.status
+                                END,
+                                status_detail = CASE
+                                    WHEN pagamentos_mp.status = 'approved' AND excluded.status IN ('pending', 'in_process')
+                                        THEN pagamentos_mp.status_detail
+                                    ELSE excluded.status_detail
+                                END,
+                                valor = CASE WHEN excluded.valor > 0 THEN excluded.valor ELSE pagamentos_mp.valor END,
+                                point_intent_id = COALESCE(NULLIF(excluded.point_intent_id, ''), pagamentos_mp.point_intent_id),
+                                device_id = COALESCE(NULLIF(excluded.device_id, ''), pagamentos_mp.device_id),
+                                payload_json = excluded.payload_json,
+                                data_aprovacao = COALESCE(NULLIF(excluded.data_aprovacao, ''), pagamentos_mp.data_aprovacao),
+                                atualizado_em = excluded.atualizado_em
+                            """,
+                            (
+                                pid_mp,
+                                str(mp_reg.get("tipo") or "point").strip().lower(),
+                                str(mp_reg.get("external_reference") or transacao_id).strip(),
+                                str(mp_reg.get("status") or "approved").strip().lower(),
+                                str(mp_reg.get("status_detail") or ""),
+                                float(_r2(_dec(mp_reg.get("valor", 0.0)))),
+                                str(mp_reg.get("point_intent_id") or ""),
+                                str(mp_reg.get("device_id") or ""),
+                                payload_json,
+                                str(mp_reg.get("data_aprovacao") or ""),
+                                agora_mp,
+                                agora_mp,
+                            ),
+                        )
+
+                cursor.execute("RELEASE SAVEPOINT sp_registrar_venda")
+                self.conn.commit()
+            except Exception:
+                try:
+                    cursor.execute("ROLLBACK TO SAVEPOINT sp_registrar_venda")
+                    cursor.execute("RELEASE SAVEPOINT sp_registrar_venda")
+                except Exception:
+                    pass
+                raise
+
             self.registrar_alteracao(
                 "Venda Detalhada",
-                f"{len(itens)} itens | Líquido: R$ {net_total:.2f} | Desc: R$ {desconto:.2f} | Cliente: {cliente} | Pgto: {forma_pagamento}"
+                f"{len(itens)} itens | Líquido: R$ {float(net_total_d):.2f} | Desc: R$ {float(desconto_d):.2f} | Cliente: {cliente} | Pgto: {forma_pagamento}",
+                usuario_id=usuario_id,
+                entidade="vendas",
+                entidade_id=transacao_id,
             )
+            if fiado_info and isinstance(fiado_info, dict) and fiado_info.get("cliente_id"):
+                fiado_val_f = float(_r2(_dec(fiado_info.get("valor", 0))))
+                fiado_venc = fiado_info.get("data_vencimento") or (datetime.date.today() + datetime.timedelta(days=30)).isoformat()
+                self.registrar_alteracao(
+                    "Venda Fiado",
+                    f"Fiado R$ {fiado_val_f:.2f} p/ cliente ID {fiado_info['cliente_id']}. Venc: {fiado_venc}",
+                    usuario_id=usuario_id,
+                )
             return True, ids_apenas
         except Exception as e:
             try:

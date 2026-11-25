@@ -12,6 +12,7 @@ import hmac
 import hashlib
 import urllib.request
 import urllib.error
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Dict, Any, Optional
 
 logger = logging.getLogger('EstokeAoCubo.mercadopago')
@@ -327,7 +328,7 @@ class MercadoPagoService:
         if float(valor or 0.0) <= 0:
             return {"sucesso": False, "erro": "O valor da cobrança Point deve ser maior que zero."}
 
-        amount_cents = int(round(float(valor) * 100))
+        amount_cents = int((Decimal(str(valor)) * Decimal("100")).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
         if amount_cents <= 0:
             return {"sucesso": False, "erro": "Valor em centavos inválido."}
 
@@ -472,6 +473,49 @@ class MercadoPagoService:
         except Exception as exc:
             logger.error("Erro ao cancelar intenção Point %s (%s): %s", iid, dev_id, exc)
             return {"sucesso": False, "intent_id": iid, "device_id": dev_id, "cancelado": False, "erro": str(exc)}
+
+    def estornar_pagamento(
+        self,
+        payment_id: str,
+        valor: Optional[float] = None,
+        idempotency_key: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Solicita estorno/reembolso de um pagamento aprovado no Mercado Pago
+        via POST /v1/payments/{payment_id}/refunds com chave de idempotência.
+        """
+        pid = str(payment_id or "").strip()
+        if not pid:
+            return {"sucesso": False, "payment_id": "", "erro": "payment_id obrigatório para estorno."}
+
+        dados: Optional[dict] = None
+        valor_tag = "full"
+        if valor is not None:
+            valor_dec = Decimal(str(valor)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            if valor_dec <= Decimal("0.00"):
+                return {"sucesso": False, "payment_id": pid, "erro": "Valor de estorno deve ser maior que zero."}
+            dados = {"amount": float(valor_dec)}
+            valor_tag = str(valor_dec)
+
+        idem_key = idempotency_key or str(uuid.uuid5(uuid.NAMESPACE_DNS, f"estoke-refund-{pid}-{valor_tag}"))
+        try:
+            resp = self._fazer_requisicao(
+                f"/v1/payments/{pid}/refunds",
+                metodo="POST",
+                dados=dados,
+                idempotency_key=idem_key,
+            )
+            return {
+                "sucesso": True,
+                "refund_id": str(resp.get("id") or ""),
+                "payment_id": pid,
+                "status": str(resp.get("status") or "approved"),
+                "valor": float(resp.get("amount") or (dados["amount"] if dados else 0.0)),
+                "raw": resp,
+            }
+        except Exception as exc:
+            logger.error("Erro ao estornar pagamento %s no Mercado Pago: %s", pid, exc)
+            return {"sucesso": False, "payment_id": pid, "erro": str(exc)}
 
 
 # Instância global singleton

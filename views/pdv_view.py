@@ -8,6 +8,8 @@ persistência de rascunho, vendas suspensas, multi-pagamento e cleanup seguro de
 from __future__ import annotations
 
 import copy
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+import json
 import logging
 import math
 import os
@@ -56,6 +58,12 @@ class PDVDialog(ctk.CTkToplevel):
         self._hover_tooltip_img_ref = None
         self._hover_current_item = None
         self._suspend_draft_save = False
+        self._finalizando_venda_lock = threading.Lock()
+        self._finalizando_venda = False
+        self._tx_id_em_curso: str | None = None
+        self._ultimo_cupom: dict[str, Any] | None = None
+        self.ultima_pendencia_tef: list[dict[str, Any]] = []
+        self.btn_finalizar = None
 
         self.title("PDV - Registrar Venda")
         self.geometry("900x600")
@@ -1559,7 +1567,7 @@ class PDVDialog(ctk.CTkToplevel):
             wraplength=410,
         ).pack(pady=(1, 2))
 
-        ctk.CTkButton(
+        self.btn_finalizar = ctk.CTkButton(
             right_frame,
             text="FINALIZAR VENDA (F12)",
             command=lambda: self.finalizar_venda(),
@@ -1567,7 +1575,8 @@ class PDVDialog(ctk.CTkToplevel):
             fg_color="#28a745",
             hover_color="#218838",
             font=("Aileron", 14, "bold"),
-        ).pack(pady=(8, 10), padx=10, fill="x")
+        )
+        self.btn_finalizar.pack(pady=(8, 10), padx=10, fill="x")
 
         # Atalhos de Teclado rastreados para cleanup seguro no destroy
         self._bind_shortcut("<F2>", lambda _e: self.entry_scan.focus_set())
@@ -1705,24 +1714,42 @@ class PDVDialog(ctk.CTkToplevel):
             item_row.setdefault("type", "produto")
         return self._add_to_cart_logic(item_row, qtd, peso_kg=peso_kg)
 
+    @staticmethod
+    def _to_dec(val: Any) -> Decimal:
+        try:
+            return Decimal(str(val or 0))
+        except (InvalidOperation, ValueError, TypeError):
+            return Decimal("0.00")
+
+    @staticmethod
+    def _round2_dec(val: Decimal) -> Decimal:
+        return val.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
     def _calcular_desconto(self) -> tuple[float, float]:
-        total_bruto = sum(item["qtd"] * item["preco"] for item in self.carrinho)
+        total_bruto_d = Decimal("0.00")
+        for item in self.carrinho:
+            total_bruto_d += self._round2_dec(self._to_dec(item.get("qtd", 0)) * self._to_dec(item.get("preco", 0)))
+        total_bruto_d = self._round2_dec(total_bruto_d)
         try:
             raw = self.entry_desconto.get().strip()
-            desc_val = float(raw.replace(",", ".")) if raw else 0.0
-        except ValueError:
-            desc_val = 0.0
+            desc_val_d = self._to_dec(raw.replace(",", ".")) if raw else Decimal("0.00")
+        except Exception:
+            desc_val_d = Decimal("0.00")
         if self.tipo_desconto_var.get() == "%":
-            valor_desconto = total_bruto * (desc_val / 100.0)
+            valor_desconto_d = self._round2_dec(total_bruto_d * (desc_val_d / Decimal("100")))
         else:
-            valor_desconto = desc_val
-        valor_desconto = min(max(0.0, valor_desconto), total_bruto)
-        return round(valor_desconto, 2), round(total_bruto - valor_desconto, 2)
+            valor_desconto_d = self._round2_dec(desc_val_d)
+        valor_desconto_d = min(max(Decimal("0.00"), valor_desconto_d), total_bruto_d)
+        total_final_d = self._round2_dec(total_bruto_d - valor_desconto_d)
+        return float(valor_desconto_d), float(total_final_d)
 
     def calcular_resumo_venda(self) -> dict[str, float]:
-        subtotal = round(sum(float(i["qtd"]) * float(i["preco"]) for i in self.carrinho), 2)
+        subtotal_d = Decimal("0.00")
+        for i in self.carrinho:
+            subtotal_d += self._round2_dec(self._to_dec(i.get("qtd", 0)) * self._to_dec(i.get("preco", 0)))
+        subtotal_d = self._round2_dec(subtotal_d)
         desconto, total = self._calcular_desconto()
-        return {"subtotal": subtotal, "desconto": desconto, "total": total}
+        return {"subtotal": float(subtotal_d), "desconto": desconto, "total": total}
 
     def _atualizar_label_desconto(self, *_args) -> None:
         if not self.carrinho:
@@ -1737,6 +1764,9 @@ class PDVDialog(ctk.CTkToplevel):
     def update_cart_ui(self) -> None:
         if self._is_closed:
             return
+        if not self._finalizando_venda:
+            # Novo estado do carrinho exige nova chave de transação na próxima finalização
+            self._tx_id_em_curso = None
         self.entry_troco.delete(0, "end")
         self.lbl_troco.configure(text="")
         for item in self.tree.get_children():
@@ -1948,149 +1978,342 @@ class PDVDialog(ctk.CTkToplevel):
             cancel_evt.set()
         return bool(resultado["ok"]), resultado["dados"]
 
-    def finalizar_venda(self, confirmar_automatico: bool = False, imprimir_automatico: bool | None = None) -> tuple[bool, Any]:
-        """Executa validações, TEF Point (se configurado), baixa atômica de estoque, NFC-e, recibo e limpeza."""
-        if getattr(self, "_sem_itens", False):
-            return False, "Sem itens disponíveis."
-        if self._check_trial_limits():
-            return False, "Limite trial atingido."
-        if not self.carrinho:
-            if not confirmar_automatico:
-                messagebox.showerror("Erro", "Carrinho vazio.", parent=self)
-            return False, "Carrinho vazio."
+    def _estornar_pagamentos_tef(
+        self,
+        mp_service: Any,
+        tef_aprovados: list[dict[str, Any]],
+        transacao_id: str,
+        erro_banco: str,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str]:
+        """
+        Decisão (a): quando o TEF é aprovado mas a venda falha no banco, estorna automaticamente
+        cada pagamento aprovado. Se o estorno falhar, registra pendência em log, pagamentos_mp
+        e histórico com NSU e valor para estorno manual.
+        """
+        estornados: list[dict[str, Any]] = []
+        pendencias: list[dict[str, Any]] = []
+        user_id_pdv = self.current_user.get("id") if isinstance(self.current_user, dict) else None
 
-        formas_usadas = []
-        total_pgto_informado = 0.0
-        for p in self.pagamentos_list:
-            forma = p["forma_var"].get()
-            val_str = p["valor_entry"].get().strip().replace(",", ".")
-            try:
-                val = float(val_str) if val_str else 0.0
-            except ValueError:
-                val = 0.0
-            if val > 0 or len(self.pagamentos_list) == 1:
-                formas_usadas.append({"forma": forma, "valor": val})
-                total_pgto_informado += val
+        for pg in tef_aprovados:
+            pid = str(pg.get("payment_id") or "").strip()
+            nsu = str(pg.get("nsu") or pid or pg.get("intent_id") or "SEM_NSU").strip()
+            valor_f = float(pg.get("valor") or 0.0)
+            intent_id = str(pg.get("intent_id") or "").strip()
+            device_id = str(pg.get("device_id") or "").strip()
 
-        valor_desconto, total_com_desconto = self._calcular_desconto()
-        if len(formas_usadas) == 1 and formas_usadas[0]["valor"] == 0:
-            formas_usadas[0]["valor"] = total_com_desconto
-
-        has_dinheiro = any(f["forma"] == "Dinheiro" for f in formas_usadas)
-        outros_valores = sum(f["valor"] for f in formas_usadas if f["forma"] != "Dinheiro")
-        if has_dinheiro:
-            for f in formas_usadas:
-                if f["forma"] == "Dinheiro" and (f["valor"] == 0 or total_pgto_informado < total_com_desconto):
-                    f["valor"] = max(0.0, total_com_desconto - outros_valores)
-
-        total_pgto_informado = sum(f["valor"] for f in formas_usadas)
-        if total_pgto_informado < total_com_desconto - 0.005:
-            msg_insuf = f"O valor total pago (R$ {total_pgto_informado:.2f}) é insuficiente para cobrir o total da venda (R$ {total_com_desconto:.2f})."
-            if not confirmar_automatico:
-                messagebox.showerror("Erro de Pagamento", msg_insuf, parent=self)
-            return False, msg_insuf
-
-        troco_real = 0.0
-        if has_dinheiro:
-            try:
-                recebido_val = float(self.entry_troco.get().replace(",", "."))
-                esperado_din = max(0.0, total_com_desconto - outros_valores)
-                if recebido_val > esperado_din:
-                    troco_real = round(recebido_val - esperado_din, 2)
-            except ValueError:
-                pass
-
-        forma_pgto = (
-            " + ".join(f"{f['forma']} R${f['valor']:.2f}" for f in formas_usadas)
-            if len(formas_usadas) > 1
-            else formas_usadas[0]["forma"]
-        )
-
-        # Anti-fraude: supervisor se desconto exceder teto configurado
-        try:
-            cfg_antifraude = self.db.get_config_nota()
-            limite_desc_pct = float(cfg_antifraude.get("desconto_max_sem_senha", 10.0) or 10.0)
-        except Exception:
-            cfg_antifraude = {}
-            limite_desc_pct = 10.0
-
-        subtotal_original = sum(
-            float(i.get("qtd", 0)) * float(i.get("preco_original", i.get("preco", 0))) for i in self.carrinho
-        )
-        desconto_itens_soma = sum(
-            float(i.get("qtd", 0)) * max(0.0, float(i.get("preco_original", i.get("preco", 0))) - float(i.get("preco", 0)))
-            for i in self.carrinho
-        )
-        desconto_total_efetivo = desconto_itens_soma + valor_desconto
-        if subtotal_original > 0 and desconto_total_efetivo > 0:
-            pct_desconto_efetivo = (desconto_total_efetivo / subtotal_original) * 100.0
-            if pct_desconto_efetivo > limite_desc_pct + 0.01:
-                if not self._exigir_supervisor(
-                    f"Desconto de {pct_desconto_efetivo:.1f}% (R$ {desconto_total_efetivo:.2f}) acima do limite de {limite_desc_pct:.1f}%"
-                ):
-                    return False, "Autorização de supervisor negada."
-
-        if any(f["forma"] == "Fiado" for f in formas_usadas) and self.var_cliente.get() == "Consumidor Final":
-            if not confirmar_automatico:
-                messagebox.showerror("Erro", "Para venda fiado, selecione um cliente cadastrado.", parent=self)
-            return False, "Cliente obrigatório para venda fiado."
-
-        obs_venda = self.entry_obs_venda.get().strip()
-        if not confirmar_automatico:
-            msg_confirm = f"Finalizar venda?\n\nSubtotal: R$ {sum(i['qtd']*i['preco'] for i in self.carrinho):.2f}"
-            if valor_desconto > 0:
-                msg_confirm += f"\nDesconto: -R$ {valor_desconto:.2f}"
-            msg_confirm += f"\nTotal: R$ {total_com_desconto:.2f}\nPagamento: {forma_pgto}"
-            if obs_venda:
-                msg_confirm += f"\nObs: {obs_venda}"
-            if troco_real > 0:
-                msg_confirm += f"\nTroco: R$ {troco_real:.2f}"
-            if not messagebox.askyesno("Confirmar", msg_confirm, parent=self):
-                return False, "Cancelado pelo operador."
-
-        transacao_id = uuid.uuid4().hex[:12]
-        tef_integrado = False
-
-        # --- TEF / Pinpad Mercado Pago Point (quando dispositivo configurado para Cartão) ---
-        device_id = str(cfg_antifraude.get("mp_point_device_id") or "").strip()
-        pagamentos_cartao = [f for f in formas_usadas if f["forma"] in ("Cartão Crédito", "Cartão Débito") and f["valor"] > 0]
-        if device_id and pagamentos_cartao:
-            from services.mercadopago_service import get_mercadopago_service
-            mp_srv = get_mercadopago_service()
-            if mp_srv.esta_configurado():
-                for pg_c in pagamentos_cartao:
-                    tipo_pt = "debit_card" if "Débito" in pg_c["forma"] else "credit_card"
-                    ok_pt, dados_pt = self._processar_tef_point_modal(
-                        device_id=device_id,
-                        valor=pg_c["valor"],
-                        tipo_cartao=tipo_pt,
-                        transacao_id=transacao_id,
-                        mp_service=mp_srv,
+            res_est = {"sucesso": False, "erro": "payment_id ausente para estorno."}
+            if pid and mp_service is not None and hasattr(mp_service, "estornar_pagamento"):
+                try:
+                    res_est = mp_service.estornar_pagamento(
+                        payment_id=pid,
+                        valor=valor_f,
+                        idempotency_key=f"estorno-{transacao_id}-{pid}",
                     )
-                    if not ok_pt:
-                        err_pt = dados_pt.get("erro") or "Pagamento não aprovado no Pinpad Point."
-                        if not confirmar_automatico:
-                            messagebox.showwarning("TEF Point", err_pt, parent=self)
-                        return False, err_pt
-                    tef_integrado = True
-                    if dados_pt.get("payment_id") and hasattr(self.db, "registrar_pagamento_mp"):
+                except Exception as exc:
+                    res_est = {"sucesso": False, "erro": str(exc)}
+
+            if res_est.get("sucesso"):
+                estornados.append({"payment_id": pid, "nsu": nsu, "valor": valor_f, "refund_id": res_est.get("refund_id", "")})
+                if pid and hasattr(self.db, "registrar_pagamento_mp"):
+                    try:
                         self.db.registrar_pagamento_mp(
-                            payment_id=str(dados_pt["payment_id"]),
+                            payment_id=pid,
                             tipo="point",
                             external_reference=transacao_id,
-                            status="approved",
-                            valor=float(pg_c["valor"]),
-                            point_intent_id=str(dados_pt.get("intent_id") or ""),
+                            status="refunded",
+                            status_detail="auto_refund_db_error",
+                            valor=valor_f,
+                            point_intent_id=intent_id,
                             device_id=device_id,
-                            payload=dados_pt,
+                            payload={"refund": res_est, "erro_banco": erro_banco},
                         )
+                    except Exception as exc_reg:
+                        logger.warning("Falha ao atualizar pagamentos_mp após estorno %s: %s", pid, exc_reg)
+                try:
+                    self.db.registrar_alteracao(
+                        "Estorno TEF Automático",
+                        f"Venda #{transacao_id} não gravada ({erro_banco}). TEF estornado: NSU {nsu} | R$ {valor_f:.2f}",
+                        usuario_id=user_id_pdv,
+                        entidade="pagamentos_mp",
+                        entidade_id=pid or transacao_id,
+                        depois={"nsu": nsu, "payment_id": pid, "valor": valor_f, "status": "refunded"},
+                    )
+                except Exception:
+                    pass
+            else:
+                err_est = str(res_est.get("erro") or "Falha desconhecida no estorno TEF")
+                pend = {
+                    "transacao_id": transacao_id,
+                    "payment_id": pid,
+                    "nsu": nsu,
+                    "intent_id": intent_id,
+                    "device_id": device_id,
+                    "valor": valor_f,
+                    "erro_banco": erro_banco,
+                    "erro_estorno": err_est,
+                    "status": "estorno_pendente",
+                }
+                pendencias.append(pend)
+                self.ultima_pendencia_tef.append(pend)
+                logger.critical(
+                    "PENDENCIA_ESTORNO_TEF_MANUAL | tx=%s | NSU=%s | payment_id=%s | valor=R$ %.2f | erro_banco=%s | erro_estorno=%s",
+                    transacao_id,
+                    nsu,
+                    pid,
+                    valor_f,
+                    erro_banco,
+                    err_est,
+                )
+                if pid and hasattr(self.db, "registrar_pagamento_mp"):
+                    try:
+                        self.db.registrar_pagamento_mp(
+                            payment_id=pid,
+                            tipo="point",
+                            external_reference=transacao_id,
+                            status="estorno_pendente",
+                            status_detail=err_est[:200],
+                            valor=valor_f,
+                            point_intent_id=intent_id,
+                            device_id=device_id,
+                            payload=pend,
+                        )
+                    except Exception as exc_reg:
+                        logger.warning("Falha ao persistir estorno_pendente em pagamentos_mp (%s): %s", pid, exc_reg)
+                try:
+                    self.db.registrar_alteracao(
+                        "Pendência Estorno TEF",
+                        f"ESTORNO MANUAL NECESSÁRIO | Tx #{transacao_id} | NSU: {nsu} | Valor: R$ {valor_f:.2f} | Erro banco: {erro_banco} | Erro estorno: {err_est}",
+                        usuario_id=user_id_pdv,
+                        entidade="pagamentos_mp",
+                        entidade_id=pid or transacao_id,
+                        depois=pend,
+                    )
+                except Exception:
+                    pass
+
+        if pendencias:
+            itens_txt = "; ".join(f"NSU {p['nsu']} (R$ {p['valor']:.2f})" for p in pendencias)
+            msg_op = (
+                f"Erro ao gravar a venda ({erro_banco}).\n\n"
+                f"ATENÇÃO: O estorno automático do cartão falhou! Realize o estorno manual imediatamente:\n"
+                f"{itens_txt}"
+            )
+        else:
+            itens_txt = "; ".join(f"NSU {e['nsu']} (R$ {e['valor']:.2f})" for e in estornados)
+            msg_op = (
+                f"Não foi possível gravar a venda ({erro_banco}).\n\n"
+                f"A cobrança no cartão foi estornada automaticamente: {itens_txt}."
+            )
+        return estornados, pendencias, msg_op
+
+    def _registrar_nfce_pendente_fallback(
+        self,
+        transacao_id: str,
+        erro_msg: str,
+        ambiente: str = "homologacao",
+    ) -> None:
+        """
+        Decisão (b): garante que qualquer falha inesperada na emissão de NFC-e registre
+        o documento como 'pendente_emissao' (reemissível) sem desfazer a venda já gravada.
+        """
+        import datetime as _dt
+
+        agora = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            with self.db._lock:
+                self.db.conn.execute(
+                    """
+                    INSERT INTO nfce_documentos (
+                        transacao_id, status, ambiente, mensagem_sefaz, payload_json,
+                        criado_em, atualizado_em
+                    ) VALUES (?, 'pendente_emissao', ?, ?, '{}', ?, ?)
+                    ON CONFLICT(transacao_id) DO UPDATE SET
+                        status = 'pendente_emissao',
+                        ambiente = excluded.ambiente,
+                        mensagem_sefaz = excluded.mensagem_sefaz,
+                        atualizado_em = excluded.atualizado_em
+                    """,
+                    (str(transacao_id), ambiente, str(erro_msg or "Falha na emissão NFC-e")[:500], agora, agora),
+                )
+                self.db.conn.commit()
+        except Exception as exc_db:
+            logger.warning("Erro ao gravar fallback pendente_emissao NFC-e (%s): %s", transacao_id, exc_db)
+
+        outbox = getattr(self.app, "outbox_service", None)
+        if outbox is not None and hasattr(outbox, "enfileirar"):
+            try:
+                outbox.enfileirar(
+                    "nfce_pendente",
+                    {"transacao_id": str(transacao_id)},
+                    chave_idempotencia=f"nfce:{transacao_id}",
+                    max_tentativas=8,
+                )
+            except Exception as exc_ob:
+                logger.warning("Erro ao enfileirar nfce_pendente na outbox (%s): %s", transacao_id, exc_ob)
+
+    def finalizar_venda(
+        self,
+        confirmar_automatico: bool = False,
+        imprimir_automatico: bool | None = None,
+        transacao_id: str | None = None,
+    ) -> tuple[bool, Any]:
+        """Executa validações, idempotência, pré-check, TEF Point, gravação atômica, NFC-e, recibo e limpeza."""
+        if not self._finalizando_venda_lock.acquire(blocking=False):
+            return False, "Finalização já em andamento."
+
+        self._finalizando_venda = True
+        if self.btn_finalizar is not None:
+            try:
+                self.btn_finalizar.configure(state="disabled")
+            except Exception:
+                pass
 
         try:
-            total_geral = 0.0
+            if getattr(self, "_sem_itens", False):
+                return False, "Sem itens disponíveis."
+            if self._check_trial_limits():
+                return False, "Limite trial atingido."
+            if not self.carrinho:
+                if not confirmar_automatico:
+                    messagebox.showerror("Erro", "Carrinho vazio.", parent=self)
+                return False, "Carrinho vazio."
+
+            formas_usadas = []
+            total_pgto_d = Decimal("0.00")
+            for p in self.pagamentos_list:
+                forma = p["forma_var"].get()
+                val_str = p["valor_entry"].get().strip().replace(",", ".")
+                val_d = self._round2_dec(self._to_dec(val_str)) if val_str else Decimal("0.00")
+                if val_d > Decimal("0.00") or len(self.pagamentos_list) == 1:
+                    formas_usadas.append({"forma": forma, "valor": float(val_d)})
+                    total_pgto_d += val_d
+
+            valor_desconto, total_com_desconto = self._calcular_desconto()
+            total_com_desc_d = self._round2_dec(self._to_dec(total_com_desconto))
+
+            if len(formas_usadas) == 1 and Decimal(str(formas_usadas[0]["valor"])) == Decimal("0.00"):
+                formas_usadas[0]["valor"] = float(total_com_desc_d)
+
+            has_dinheiro = any(f["forma"] == "Dinheiro" for f in formas_usadas)
+            outros_d = sum(
+                (self._round2_dec(self._to_dec(f["valor"])) for f in formas_usadas if f["forma"] != "Dinheiro"),
+                Decimal("0.00"),
+            )
+            total_pgto_d = sum((self._round2_dec(self._to_dec(f["valor"])) for f in formas_usadas), Decimal("0.00"))
+            if has_dinheiro:
+                for f in formas_usadas:
+                    f_val_d = self._round2_dec(self._to_dec(f["valor"]))
+                    if f["forma"] == "Dinheiro" and (f_val_d == Decimal("0.00") or total_pgto_d < total_com_desc_d):
+                        f["valor"] = float(max(Decimal("0.00"), self._round2_dec(total_com_desc_d - outros_d)))
+
+            total_pgto_d = sum((self._round2_dec(self._to_dec(f["valor"])) for f in formas_usadas), Decimal("0.00"))
+            if total_pgto_d < total_com_desc_d - Decimal("0.005"):
+                msg_insuf = (
+                    f"O valor total pago (R$ {float(total_pgto_d):.2f}) é insuficiente para cobrir "
+                    f"o total da venda (R$ {float(total_com_desc_d):.2f})."
+                )
+                if not confirmar_automatico:
+                    messagebox.showerror("Erro de Pagamento", msg_insuf, parent=self)
+                return False, msg_insuf
+
+            troco_real_d = Decimal("0.00")
+            if has_dinheiro:
+                raw_troco = self.entry_troco.get().strip().replace(",", ".")
+                if raw_troco:
+                    recebido_d = self._round2_dec(self._to_dec(raw_troco))
+                    esperado_din_d = max(Decimal("0.00"), self._round2_dec(total_com_desc_d - outros_d))
+                    if recebido_d > esperado_din_d:
+                        troco_real_d = self._round2_dec(recebido_d - esperado_din_d)
+            troco_real = float(troco_real_d)
+
+            forma_pgto = (
+                " + ".join(f"{f['forma']} R${f['valor']:.2f}" for f in formas_usadas)
+                if len(formas_usadas) > 1
+                else formas_usadas[0]["forma"]
+            )
+
+            # Anti-fraude: supervisor se desconto exceder teto configurado
+            try:
+                cfg_antifraude = self.db.get_config_nota() or {}
+                limite_desc_pct = float(cfg_antifraude.get("desconto_max_sem_senha", 10.0) or 10.0)
+            except Exception:
+                cfg_antifraude = {}
+                limite_desc_pct = 10.0
+
+            subtotal_orig_d = Decimal("0.00")
+            desc_itens_d = Decimal("0.00")
+            for i in self.carrinho:
+                q_d = self._to_dec(i.get("qtd", 0))
+                p_orig_d = self._to_dec(i.get("preco_original", i.get("preco", 0)))
+                p_atual_d = self._to_dec(i.get("preco", 0))
+                subtotal_orig_d += q_d * p_orig_d
+                desc_itens_d += q_d * max(Decimal("0.00"), p_orig_d - p_atual_d)
+
+            desconto_total_efetivo_d = desc_itens_d + self._to_dec(valor_desconto)
+            if subtotal_orig_d > Decimal("0.00") and desconto_total_efetivo_d > Decimal("0.00"):
+                pct_desconto_efetivo = float((desconto_total_efetivo_d / subtotal_orig_d) * Decimal("100"))
+                if pct_desconto_efetivo > limite_desc_pct + 0.01:
+                    if not self._exigir_supervisor(
+                        f"Desconto de {pct_desconto_efetivo:.1f}% (R$ {float(desconto_total_efetivo_d):.2f}) acima do limite de {limite_desc_pct:.1f}%"
+                    ):
+                        return False, "Autorização de supervisor negada."
+
+            cliente_nome = self.var_cliente.get()
+            if any(f["forma"] == "Fiado" for f in formas_usadas) and cliente_nome == "Consumidor Final":
+                if not confirmar_automatico:
+                    messagebox.showerror("Erro", "Para venda fiado, selecione um cliente cadastrado.", parent=self)
+                return False, "Cliente obrigatório para venda fiado."
+
+            obs_venda = self.entry_obs_venda.get().strip()
+            if not confirmar_automatico:
+                sub_ui_d = sum(
+                    (self._round2_dec(self._to_dec(i["qtd"]) * self._to_dec(i["preco"])) for i in self.carrinho),
+                    Decimal("0.00"),
+                )
+                msg_confirm = f"Finalizar venda?\n\nSubtotal: R$ {float(sub_ui_d):.2f}"
+                if valor_desconto > 0:
+                    msg_confirm += f"\nDesconto: -R$ {valor_desconto:.2f}"
+                msg_confirm += f"\nTotal: R$ {total_com_desconto:.2f}\nPagamento: {forma_pgto}"
+                if obs_venda:
+                    msg_confirm += f"\nObs: {obs_venda}"
+                if troco_real > 0:
+                    msg_confirm += f"\nTroco: R$ {troco_real:.2f}"
+                if not messagebox.askyesno("Confirmar", msg_confirm, parent=self):
+                    return False, "Cancelado pelo operador."
+
+            # Chave idempotente da transação (reaproveita em reenvios sobre o mesmo carrinho)
+            if transacao_id:
+                tx_id = str(transacao_id).strip()
+            elif self._tx_id_em_curso:
+                tx_id = self._tx_id_em_curso
+            else:
+                tx_id = uuid.uuid4().hex[:12]
+            self._tx_id_em_curso = tx_id
+
+            # Idempotência: se essa transacao_id já foi gravada no banco, não cobra nem grava novamente
+            if hasattr(self.db, "obter_venda_por_transacao"):
+                venda_existente = self.db.obter_venda_por_transacao(tx_id)
+                if venda_existente:
+                    self._tx_id_em_curso = None
+                    return True, {
+                        "venda_id": venda_existente["venda_id"],
+                        "transacao_id": tx_id,
+                        "total": venda_existente["total"],
+                        "forma_pagamento": venda_existente["forma_pagamento"],
+                        "tef_integrado": False,
+                        "nfce": None,
+                        "impressao_ok": True,
+                        "impressao_erro": "",
+                        "reimpressao_disponivel": bool(self._ultimo_cupom or getattr(self.app, "_ultimo_cupom", None)),
+                        "loja_id": venda_existente["loja_id"],
+                        "idempotente": True,
+                    }
+
+            total_geral_d = Decimal("0.00")
             itens_nota = []
             itens_venda = []
             for item in self.carrinho:
-                total_geral += item["qtd"] * item["preco"]
+                total_geral_d += self._round2_dec(self._to_dec(item["qtd"]) * self._to_dec(item["preco"]))
                 itens_nota.append(
                     {
                         "nome": item["nome"],
@@ -2112,51 +2335,142 @@ class PDVDialog(ctk.CTkToplevel):
                         "type": item.get("type", "produto"),
                     }
                 )
+            total_geral = float(self._round2_dec(total_geral_d))
 
-            cliente_nome = self.var_cliente.get()
             user_id_pdv = self.current_user.get("id") if isinstance(self.current_user, dict) else None
             loja_id_pdv = self.current_user.get("loja_id") if isinstance(self.current_user, dict) else None
-            res_venda = self.db.registrar_venda_detalhada(
-                itens_venda,
-                total_geral,
-                valor_desconto,
-                cliente_nome,
-                forma_pgto,
-                vendedor=self.var_vendedor.get(),
-                formas_usadas=formas_usadas,
-                usuario_id=user_id_pdv,
-                loja_id=loja_id_pdv,
-                registrar_entrada=True,
-                transacao_id=transacao_id,
-            )
+
+            # Pré-validação de caixa/estoque/totais na loja ativa ANTES de cobrar no TEF
+            if hasattr(self.db, "validar_pre_venda"):
+                ok_pre, pre_res = self.db.validar_pre_venda(
+                    itens_venda,
+                    desconto=valor_desconto,
+                    usuario_id=user_id_pdv,
+                    loja_id=loja_id_pdv,
+                    cliente=cliente_nome,
+                    formas_usadas=formas_usadas,
+                )
+                if not ok_pre:
+                    if not confirmar_automatico:
+                        messagebox.showerror("Erro", f"Não foi possível finalizar a venda: {pre_res}", parent=self)
+                    return False, str(pre_res)
+                if loja_id_pdv is None and isinstance(pre_res, dict):
+                    loja_id_pdv = pre_res.get("loja_id")
+
+            # --- TEF / Pinpad Mercado Pago Point (quando dispositivo configurado para Cartão) ---
+            tef_integrado = False
+            tef_aprovados: list[dict[str, Any]] = []
+            mp_srv = None
+            device_id = str(cfg_antifraude.get("mp_point_device_id") or "").strip()
+            pagamentos_cartao = [f for f in formas_usadas if f["forma"] in ("Cartão Crédito", "Cartão Débito") and f["valor"] > 0]
+            if device_id and pagamentos_cartao:
+                from services.mercadopago_service import get_mercadopago_service
+                mp_srv = get_mercadopago_service()
+                if mp_srv.esta_configurado():
+                    for pg_c in pagamentos_cartao:
+                        tipo_pt = "debit_card" if "Débito" in pg_c["forma"] else "credit_card"
+                        ok_pt, dados_pt = self._processar_tef_point_modal(
+                            device_id=device_id,
+                            valor=pg_c["valor"],
+                            tipo_cartao=tipo_pt,
+                            transacao_id=tx_id,
+                            mp_service=mp_srv,
+                        )
+                        if not ok_pt:
+                            err_pt = (dados_pt or {}).get("erro") or "Pagamento não aprovado no Pinpad Point."
+                            # Se um cartão anterior já foi aprovado nesta mesma venda, estornar automaticamente
+                            if tef_aprovados:
+                                _, _, msg_est = self._estornar_pagamentos_tef(mp_srv, tef_aprovados, tx_id, err_pt)
+                                err_pt = msg_est
+                            if not confirmar_automatico:
+                                messagebox.showwarning("TEF Point", err_pt, parent=self)
+                            return False, err_pt
+
+                        tef_integrado = True
+                        pid_pt = str((dados_pt or {}).get("payment_id") or "").strip()
+                        nsu_pt = str((dados_pt or {}).get("nsu") or pid_pt or (dados_pt or {}).get("intent_id") or "").strip()
+                        tef_aprovados.append(
+                            {
+                                "payment_id": pid_pt,
+                                "nsu": nsu_pt,
+                                "tipo": "point",
+                                "external_reference": tx_id,
+                                "status": "approved",
+                                "valor": float(pg_c["valor"]),
+                                "point_intent_id": str((dados_pt or {}).get("intent_id") or ""),
+                                "device_id": device_id,
+                                "payload": dados_pt or {},
+                            }
+                        )
+
+            # Preparar fiado atômico (se aplicável) para entrar na mesma transação da venda
+            fiado_info = None
+            if any(f["forma"] == "Fiado" for f in formas_usadas) and cliente_nome != "Consumidor Final":
+                c_df = self.df_clientes[self.df_clientes["nome"] == cliente_nome] if hasattr(self, "df_clientes") else None
+                c_id = int(c_df.iloc[0]["id"]) if (c_df is not None and not c_df.empty) else None
+                if c_id is None:
+                    row_c = self.db.conn.execute("SELECT id FROM clientes WHERE nome = ? LIMIT 1", (cliente_nome,)).fetchone()
+                    if row_c:
+                        c_id = int(row_c[0])
+                if c_id is not None:
+                    valor_fiado_d = sum(
+                        (self._round2_dec(self._to_dec(f["valor"])) for f in formas_usadas if f["forma"] == "Fiado"),
+                        Decimal("0.00"),
+                    )
+                    if valor_fiado_d <= Decimal("0.00"):
+                        valor_fiado_d = total_com_desc_d
+                    fiado_info = {
+                        "cliente_id": c_id,
+                        "valor": float(self._round2_dec(valor_fiado_d)),
+                        "descricao": obs_venda or f"Venda PDV ({len(itens_venda)} itens)",
+                    }
+
+            # --- Gravação atômica única no banco (venda + itens + estoque + caixa + entrada + fiado + pagamentos_mp) ---
+            try:
+                res_venda = self.db.registrar_venda_detalhada(
+                    itens_venda,
+                    total_geral,
+                    valor_desconto,
+                    cliente_nome,
+                    forma_pgto,
+                    vendedor=self.var_vendedor.get(),
+                    formas_usadas=formas_usadas,
+                    usuario_id=user_id_pdv,
+                    loja_id=loja_id_pdv,
+                    registrar_entrada=True,
+                    transacao_id=tx_id,
+                    fiado_info=fiado_info,
+                    pagamentos_mp_registros=tef_aprovados or None,
+                )
+            except Exception as db_exc:
+                res_venda = (False, str(db_exc))
+
             venda_id = None
             if isinstance(res_venda, tuple):
                 if not res_venda[0]:
+                    err_db = str(res_venda[1])
+                    if tef_aprovados:
+                        _, _, err_db = self._estornar_pagamentos_tef(mp_srv, tef_aprovados, tx_id, err_db)
                     if not confirmar_automatico:
-                        messagebox.showerror("Erro", f"Não foi possível registrar a venda: {res_venda[1]}", parent=self)
-                    return False, res_venda[1]
+                        messagebox.showerror("Erro", f"Não foi possível registrar a venda: {err_db}", parent=self)
+                    return False, err_db
                 venda_ids = res_venda[1]
                 if venda_ids:
                     venda_id = venda_ids[0]
 
-            if any(f["forma"] == "Fiado" for f in formas_usadas) and cliente_nome != "Consumidor Final":
-                try:
-                    c_df = self.df_clientes[self.df_clientes["nome"] == cliente_nome]
-                    if not c_df.empty:
-                        c_id = int(c_df.iloc[0]["id"])
-                        valor_fiado_total = sum(f["valor"] for f in formas_usadas if f["forma"] == "Fiado")
-                        if valor_fiado_total <= 0:
-                            valor_fiado_total = total_com_desconto
-                        desc_fiado = obs_venda or f"Venda PDV #{venda_id or ''} ({len(itens_venda)} itens)"
-                        self.db.registrar_fiado(c_id, round(valor_fiado_total, 2), desc_fiado)
-                except Exception as exc:
-                    logger.warning("Erro ao registrar fiado: %s", exc)
+            # A partir deste ponto, a venda está definitivamente gravada no banco (commit OK).
+            self._tx_id_em_curso = None
+            try:
+                self.db.limpar_rascunho_pdv(self.user_id)
+            except Exception as exc_rasc:
+                logger.warning("Aviso ao limpar rascunho PDV após venda #%s: %s", venda_id, exc_rasc)
 
-            config_nota = self.db.get_config_nota()
+            config_nota = self.db.get_config_nota() or {}
 
-            # --- Emissão NFC-e Modelo 65 (quando habilitada) ---
+            # --- Emissão NFC-e Modelo 65 (Decisão b: falha fiscal NUNCA desfaz a venda) ---
             nfce_res_dict = None
             if self.var_emitir_nfce.get() and (config_nota.get("token_api") or getattr(self.app, "fiscal_service", None)):
+                ambiente_cfg = config_nota.get("ambiente") or "homologacao"
                 try:
                     from services.fiscal_service import FiscalService
                     fsrv = getattr(self.app, "fiscal_service", None) or FiscalService(
@@ -2164,12 +2478,13 @@ class PDVDialog(ctk.CTkToplevel):
                     )
                     cpf_nota = self.entry_cpf_nota.get().strip() if hasattr(self, "entry_cpf_nota") else ""
                     f_res = fsrv.emitir_para_venda(
-                        transacao_id,
+                        tx_id,
                         consumidor_cpf_cnpj=cpf_nota,
                         tef_integrado=tef_integrado,
                         troco=troco_real,
                         outbox_service=getattr(self.app, "outbox_service", None),
                     )
+                    reemissivel = f_res.status in ("pendente_emissao", "rejeitado", "erro_comunicacao")
                     nfce_res_dict = {
                         "sucesso": f_res.sucesso,
                         "status": f_res.status,
@@ -2179,15 +2494,51 @@ class PDVDialog(ctk.CTkToplevel):
                         "protocolo": f_res.protocolo,
                         "qrcode_url": f_res.qrcode_url,
                         "url_danfe": f_res.url_danfe,
-                        "ambiente": config_nota.get("ambiente") or "homologacao",
+                        "ambiente": ambiente_cfg,
                         "mensagem_sefaz": f_res.mensagem_sefaz,
+                        "contingencia": bool(f_res.contingencia or f_res.status == "pendente_emissao"),
+                        "reemissivel": reemissivel,
                     }
                     if f_res.status == "rejeitado" and not confirmar_automatico:
-                        messagebox.showwarning("NFC-e Rejeitada pela SEFAZ", f_res.mensagem_sefaz, parent=self)
+                        messagebox.showwarning(
+                            "NFC-e Rejeitada pela SEFAZ",
+                            f"A venda #{venda_id or ''} foi gravada normalmente, mas a NFC-e foi rejeitada e ficou disponível para reemissão:\n{f_res.mensagem_sefaz}",
+                            parent=self,
+                        )
+                    elif f_res.status in ("pendente_emissao", "erro_comunicacao") and not confirmar_automatico:
+                        messagebox.showwarning(
+                            "NFC-e Pendente / Contingência",
+                            f"A venda #{venda_id or ''} foi gravada normalmente. A NFC-e ficou pendente para reemissão:\n{f_res.mensagem_sefaz}",
+                            parent=self,
+                        )
                 except Exception as f_exc:
-                    logger.warning("Erro na emissão NFC-e: %s", f_exc)
+                    logger.warning("Erro na emissão NFC-e (venda %s mantida): %s", tx_id, f_exc)
+                    self._registrar_nfce_pendente_fallback(tx_id, str(f_exc), ambiente=ambiente_cfg)
+                    nfce_res_dict = {
+                        "sucesso": False,
+                        "status": "pendente_emissao",
+                        "chave_acesso": "",
+                        "numero": "",
+                        "serie": "",
+                        "protocolo": "",
+                        "qrcode_url": "",
+                        "url_danfe": "",
+                        "ambiente": ambiente_cfg,
+                        "mensagem_sefaz": str(f_exc),
+                        "contingencia": True,
+                        "reemissivel": True,
+                    }
+                    if not confirmar_automatico:
+                        messagebox.showwarning(
+                            "NFC-e Pendente",
+                            f"A venda #{venda_id or ''} foi gravada normalmente, mas houve falha na transmissão da NFC-e.\nEla ficou pendente para reemissão: {f_exc}",
+                            parent=self,
+                        )
 
-            # Gerar Recibo / DANFE
+            # --- Recibo / DANFE & Impressão (Decisão c: falha na impressora NUNCA desfaz a venda) ---
+            impressao_ok = True
+            impressao_erro = ""
+            reimpressao_disponivel = False
             try:
                 dados_cliente = {"nome": cliente_nome}
                 contato_cliente = self.entry_contato_cliente.get().strip()
@@ -2206,13 +2557,18 @@ class PDVDialog(ctk.CTkToplevel):
                     cand_logo = os.path.join(self.db.data_dir, "product_images", logo_file)
                     if os.path.isfile(cand_logo):
                         logo_path = cand_logo
+
+                cupom_payload = {
+                    "text": text_content,
+                    "logo_path": logo_path,
+                    "venda_id": venda_id,
+                    "transacao_id": tx_id,
+                    "file_path": file_path,
+                }
+                self._ultimo_cupom = cupom_payload
                 if hasattr(self.app, "_ultimo_cupom"):
-                    self.app._ultimo_cupom = {
-                        "text": text_content,
-                        "logo_path": logo_path,
-                        "venda_id": venda_id,
-                        "file_path": file_path,
-                    }
+                    self.app._ultimo_cupom = cupom_payload
+                reimpressao_disponivel = True
 
                 if imprimir_automatico is not None:
                     resp = bool(imprimir_automatico)
@@ -2243,7 +2599,7 @@ class PDVDialog(ctk.CTkToplevel):
                             )
                         elif nfce_res_dict and nfce_res_dict.get("status") in ("pendente_emissao", "processando"):
                             printer.imprimir_comprovante_pendente_nfce(
-                                transacao_id,
+                                tx_id,
                                 itens_nota,
                                 config_nota,
                                 valor_total=total_com_desconto,
@@ -2258,16 +2614,16 @@ class PDVDialog(ctk.CTkToplevel):
                         if not confirmar_automatico:
                             messagebox.showinfo("Sucesso", "Documento enviado para impressão!", parent=self)
                     except Exception as exc:
-                        logger.warning("Erro ao imprimir: %s", exc)
+                        impressao_ok = False
+                        impressao_erro = str(exc)
+                        logger.warning("Erro ao imprimir cupom da venda %s (venda mantida): %s", tx_id, exc)
                         if not confirmar_automatico:
                             messagebox.showwarning(
-                                "Aviso", f"Não foi possível imprimir diretamente.\nO recibo foi salvo em:\n{file_path}", parent=self
+                                "Aviso de Impressão",
+                                f"Venda #{venda_id or ''} registrada com sucesso, mas não foi possível imprimir o cupom:\n{exc}\n\n"
+                                f"Use 'Cupom (F11)' para reimprimir ou consulte o arquivo:\n{file_path}",
+                                parent=self,
                             )
-                            try:
-                                if os.name == "nt":
-                                    os.startfile(file_path)
-                            except Exception:
-                                pass
 
                     if contato_cliente and not confirmar_automatico:
                         enviar_wpp = messagebox.askyesno(
@@ -2286,42 +2642,52 @@ class PDVDialog(ctk.CTkToplevel):
                 elif not confirmar_automatico:
                     messagebox.showinfo("Sucesso", "Venda finalizada!", parent=self)
             except Exception as exc:
-                logger.warning("Erro ao gerar recibo: %s", exc)
+                impressao_ok = False
+                impressao_erro = str(exc)
+                logger.warning("Erro ao gerar recibo (venda %s mantida): %s", tx_id, exc)
                 if not confirmar_automatico:
-                    messagebox.showinfo("Sucesso", "Venda finalizada! (Erro ao gerar recibo)", parent=self)
+                    messagebox.showwarning(
+                        "Aviso",
+                        f"Venda #{venda_id or ''} finalizada com sucesso, mas houve erro ao gerar o recibo: {exc}",
+                        parent=self,
+                    )
 
-            self.db.limpar_rascunho_pdv(self.user_id)
             if hasattr(self.app, "refresh_dashboard"):
-                self.app.refresh_dashboard()
-
-            if self.var_fila_continua.get():
-                self._suspend_draft_save = True
                 try:
-                    self.carrinho.clear()
-                    self.update_cart_ui()
-                    self.entry_desconto.delete(0, "end")
-                    self.entry_obs_venda.delete(0, "end")
-                    if hasattr(self, "entry_cpf_nota"):
-                        self.entry_cpf_nota.delete(0, "end")
-                    for p in list(self.pagamentos_list[1:]):
-                        try:
-                            p["frame"].destroy()
-                            self.pagamentos_list.remove(p)
-                        except Exception:
-                            pass
-                    if self.pagamentos_list:
-                        self.pagamentos_list[0]["valor_entry"].delete(0, "end")
+                    self.app.refresh_dashboard()
+                except Exception as exc_dash:
+                    logger.debug("Aviso ao atualizar dashboard: %s", exc_dash)
+
+            # Sempre limpar carrinho após venda gravada para impedir reenvio acidental
+            self._suspend_draft_save = True
+            try:
+                self.carrinho.clear()
+                self.update_cart_ui()
+                self.entry_desconto.delete(0, "end")
+                self.entry_obs_venda.delete(0, "end")
+                if hasattr(self, "entry_cpf_nota"):
+                    self.entry_cpf_nota.delete(0, "end")
+                for p in list(self.pagamentos_list[1:]):
                     try:
-                        df_p_new = self.db.listar_produtos()
-                        est_map = {int(r["id"]): int(r["quantidade"]) for _, r in df_p_new.iterrows()} if not df_p_new.empty else {}
-                        for it in self.all_items_list:
-                            if it.get("type") == "produto" and int(it.get("id", 0)) in est_map:
-                                it["quantidade"] = est_map[int(it["id"])]
-                        self._populate_product_list()
+                        p["frame"].destroy()
+                        self.pagamentos_list.remove(p)
                     except Exception:
                         pass
-                finally:
-                    self._suspend_draft_save = False
+                if self.pagamentos_list:
+                    self.pagamentos_list[0]["valor_entry"].delete(0, "end")
+                try:
+                    df_p_new = self.db.listar_produtos()
+                    est_map = {int(r["id"]): int(r["quantidade"]) for _, r in df_p_new.iterrows()} if not df_p_new.empty else {}
+                    for it in self.all_items_list:
+                        if it.get("type") == "produto" and int(it.get("id", 0)) in est_map:
+                            it["quantidade"] = est_map[int(it["id"])]
+                    self._populate_product_list()
+                except Exception:
+                    pass
+            finally:
+                self._suspend_draft_save = False
+
+            if self.var_fila_continua.get():
                 self._notify("Venda Registrada", f"Venda #{venda_id or ''} de R$ {total_com_desconto:.2f} concluída!", "info")
                 try:
                     self.entry_scan.focus_set()
@@ -2332,13 +2698,31 @@ class PDVDialog(ctk.CTkToplevel):
 
             return True, {
                 "venda_id": venda_id,
-                "transacao_id": transacao_id,
+                "transacao_id": tx_id,
                 "total": total_com_desconto,
                 "forma_pagamento": forma_pgto,
                 "tef_integrado": tef_integrado,
                 "nfce": nfce_res_dict,
+                "impressao_ok": impressao_ok,
+                "impressao_erro": impressao_erro,
+                "reimpressao_disponivel": reimpressao_disponivel,
+                "loja_id": loja_id_pdv,
+                "idempotente": False,
             }
         except Exception as exc:
+            logger.exception("Erro fatal ao processar venda: %s", exc)
             if not confirmar_automatico:
                 messagebox.showerror("Erro Fatal", f"Ocorreu um erro ao processar venda: {exc}", parent=self)
             return False, str(exc)
+        finally:
+            self._finalizando_venda = False
+            if self.btn_finalizar is not None and not self._is_closed:
+                try:
+                    if self.btn_finalizar.winfo_exists():
+                        self.btn_finalizar.configure(state="normal")
+                except Exception:
+                    pass
+            try:
+                self._finalizando_venda_lock.release()
+            except RuntimeError:
+                pass
