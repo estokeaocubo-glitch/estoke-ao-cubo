@@ -119,12 +119,23 @@ class RelatorioService:
                 vendas_hoje_d = Decimal(str((row_v[0] if row_v else 0) or 0))
                 count_sales_today = int((row_v[1] if row_v else 0) or 0)
 
+                loja_clause_s = " AND (s.loja_id = ? OR s.loja_id IS NULL)" if loja_id is not None else ""
                 cursor.execute(
-                    f"""SELECT COALESCE(SUM(valor), 0)
-                        FROM servicos
-                        WHERE date(data) = date(?)
-                          AND COALESCE(status, 'Concluído') != 'Cancelado'
-                          AND COALESCE(status_os, 'Concluído') IN ('Concluído', 'Entregue', 'Finalizado', ''){loja_clause}""",
+                    f"""SELECT COALESCE(SUM(s.valor), 0)
+                        FROM servicos s
+                        WHERE COALESCE(s.status, 'Concluído') != 'Cancelado'
+                          AND COALESCE(s.status_os, 'Concluído') IN ('Concluído', 'Entregue', 'Finalizado', '')
+                          AND date(COALESCE(
+                                (SELECT MIN(h.data_hora)
+                                 FROM historico h
+                                 WHERE h.acao = 'OS Status'
+                                   AND h.detalhe IN (
+                                       'Serviço #' || s.id || ' -> Concluído',
+                                       'Serviço #' || s.id || ' -> Entregue',
+                                       'Serviço #' || s.id || ' -> Finalizado'
+                                   )),
+                                s.data
+                              )) = date(?){loja_clause_s}""",
                     params_hoje,
                 )
                 row_s = cursor.fetchone()

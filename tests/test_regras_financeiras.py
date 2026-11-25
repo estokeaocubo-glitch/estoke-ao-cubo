@@ -287,6 +287,73 @@ class TestFaturamentoHojeKPI:
         assert dash["faturamento_hoje"] == pytest.approx(90.0)
         assert dash["qtd_vendas_hoje"] == 1
 
+    def test_venda_producao_com_desconto_sem_desconto_duplo_em_comissao_e_faturamento(self, isolated_db, monkeypatch):
+        fake_dt = _make_fake_datetime(_real_dt.date(2026, 11, 24), _real_dt.datetime(2026, 11, 24, 15, 0, 0))
+        monkeypatch.setattr(database, "datetime", fake_dt)
+
+        isolated_db.adicionar_vendedor("Marina", "08:00", "18:00", comissao=5.0)
+        isolated_db.adicionar_produto("Perfume", 20, 100.0, categoria="Cosméticos", preco_compra=40.0)
+        pid = int(isolated_db.listar_produtos().iloc[0]["id"])
+        isolated_db.abrir_caixa(100.0, usuario_id=1, loja_id=1)
+
+        # Registro pelo método de produção: bruto R$ 100,00, desconto R$ 10,00 -> líquido R$ 90,00
+        ok, ids = isolated_db.registrar_venda_detalhada(
+            itens=[{"tipo": "produto", "produto_id": pid, "id": pid, "nome": "Perfume", "qtd": 1, "preco": 100.0}],
+            total=100.0,
+            desconto=10.0,
+            forma_pagamento="PIX",
+            vendedor="Marina",
+            formas_usadas=[{"forma": "PIX", "valor": 90.0}],
+            usuario_id=1,
+            loja_id=1,
+        )
+        assert ok is True and len(ids) == 1
+
+        row_v = isolated_db.conn.execute(
+            "SELECT valor_total, desconto FROM vendas WHERE id = ?",
+            (ids[0],),
+        ).fetchone()
+        assert row_v[0] == pytest.approx(100.0)
+        assert row_v[1] == pytest.approx(10.0)
+
+        com = FinanceiroService(isolated_db).calcular_comissoes("mes", loja_id=1)
+        by_vend = {r["vendedor"]: r for r in com["vendas"]}
+        assert by_vend["Marina"]["faturamento"] == pytest.approx(90.0)
+        assert by_vend["Marina"]["comissao_vendas"] == pytest.approx(4.50)
+
+        dash = RelatorioService(isolated_db).dados_dashboard(loja_id=1)
+        assert dash["faturamento_hoje"] == pytest.approx(90.0)
+
+    def test_servico_aberto_ontem_concluido_hoje_entra_no_faturamento_hoje(self, isolated_db, monkeypatch):
+        dt_d_menos_1 = _make_fake_datetime(_real_dt.date(2026, 11, 23), _real_dt.datetime(2026, 11, 23, 10, 0, 0))
+        monkeypatch.setattr(database, "datetime", dt_d_menos_1)
+
+        ok, sid = isolated_db.registrar_servico(
+            "Cli OS",
+            "Troca de tela",
+            250.0,
+            custo=80.0,
+            forma_pagamento="PIX",
+            status_os="Em Andamento",
+            loja_id=1,
+        )
+        assert ok is True
+
+        # Em D-1 (aberto e ainda em andamento), não pode entrar no faturamento de D-1
+        assert RelatorioService(isolated_db).dados_dashboard(loja_id=1)["faturamento_hoje"] == pytest.approx(0.0)
+
+        # Em D, conclui o serviço -> vira faturamento na data da conclusão (D)
+        dt_d = _make_fake_datetime(_real_dt.date(2026, 11, 24), _real_dt.datetime(2026, 11, 24, 14, 0, 0))
+        monkeypatch.setattr(database, "datetime", dt_d)
+        assert isolated_db.atualizar_status_servico(sid, "Concluído") is True
+        assert RelatorioService(isolated_db).dados_dashboard(loja_id=1)["faturamento_hoje"] == pytest.approx(250.0)
+
+        # Em D+1, avança para Entregue -> continua faturado apenas em D (MIN data_hora), sem duplicar em D+1
+        dt_d_mais_1 = _make_fake_datetime(_real_dt.date(2026, 11, 25), _real_dt.datetime(2026, 11, 25, 9, 0, 0))
+        monkeypatch.setattr(database, "datetime", dt_d_mais_1)
+        assert isolated_db.atualizar_status_servico(sid, "Entregue") is True
+        assert RelatorioService(isolated_db).dados_dashboard(loja_id=1)["faturamento_hoje"] == pytest.approx(0.0)
+
 
 # ==============================================================================
 # 5. CSV do histórico com filtros ativos de período e tipo
