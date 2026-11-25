@@ -99,7 +99,7 @@ class TestEtapa1PDVSmoke:
 
     def test_abertura_adicao_finalizacao_e_cleanup_timers(self, temp_env, shared_app, monkeypatch):
         db, tmpdir = temp_env
-        assert migrations.get_user_version(db.conn) == 9
+        assert migrations.get_user_version(db.conn) == migrations.LATEST_SCHEMA_VERSION
 
         db.abrir_caixa(100.0, "Caixa fumaça PDV", usuario_id=1)
         db.adicionar_produto(

@@ -48,7 +48,7 @@ Use o venv do projeto `C:\dev\EstokeAoCubo\.venv` (Python 3.14, `requirements.tx
 $py = "C:\dev\EstokeAoCubo\.venv\Scripts\python.exe"
 $env:PYTHONUTF8 = "0"
 
-# Testes (baseline atual: 233 passam / 1 falha preexistente em
+# Testes (baseline atual: 242 passam / 1 falha preexistente em
 # test_mercadopago_integration::test_01_carregamento_credenciais, que exige token real no .env)
 $env:ESTOKE_DATA_DIR = (New-Item -ItemType Directory -Force "$env:TEMP\estoke_pytest").FullName
 & $py -m pytest -q
@@ -100,14 +100,18 @@ $env:ESTOKE_DATA_DIR = (New-Item -ItemType Directory -Force "$env:TEMP\estoke_se
 O roadmap vivo e as anotações fora de escopo ficam em `implementation_plan.md` (na raiz do repo;
 enquanto não existir aqui, a última versão está na pasta do agente anterior, em
 `%USERPROFILE%\.gemini\antigravity\brain\7f1adfc0-...\implementation_plan.md`).
-Ordem atual: hotfix v4.6.1 → higiene (venv, requirements, teste MP `live`, `__version__`)
-→ F1b Lote 7 (estoque/kits/produção/trocas) → F1b Lote 8 (restaurante, cadastros, migração v10, API)
+Ordem atual: hotfix v4.6.1 → higiene (venv, requirements, teste MP `live`, `__version__`;
+lotes H1 e H2+H3 = migração v10) → F1b Lote 7 (estoque/kits/produção/trocas)
+→ F1b Lote 8 (restaurante, cadastros, migração v11, API)
 → isolamento por loja restante → F2 (ponte PyWebView) → F3 (UI em `web/`) → pré-release.
 
 ## Armadilhas conhecidas
 - Versão: a fonte única é `services/updater.py` (`APP_VERSION`); `database.__version__` importa de lá.
   Ao subir versão, ainda sincronizar `build_local.py`, `crash_handler.py`, `version_info.txt` e `EstokeSetup.iss`.
-- `contas_pagar` não tem `loja_id`; `pagar_conta()` gera gasto sem loja.
-- `servicos` não tem `data_conclusao`; `gerar_dre`/`calcular_comissoes` usam `servicos.data`.
+- Schema atual: `LATEST_SCHEMA_VERSION = 10`. Teste novo não fixa número de versão; use a constante.
+- `servicos.data_conclusao` é gravada na 1ª entrada em status terminal e nunca é limpa (não há reabertura).
+  DRE e comissões só contam OS terminal, pela data de conclusão.
+- A UI (`views/`) ainda não passa `loja_id` para contas a pagar: conta nova vai para a loja padrão
+  e a lista mostra todas as lojas.
 - Arquivos sensíveis fora do Git: `.env` (credenciais MP/Focus), chaves privadas em `C:\dev\_segredos\`.
   Nunca commitar, nunca imprimir o conteúdo.

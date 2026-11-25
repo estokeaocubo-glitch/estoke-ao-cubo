@@ -673,7 +673,12 @@ class EstokeAPI:
             if err:
                 return err
             status = request.args.get('status')
-            df = self.db.listar_contas_pagar(status=status)
+            # Lote H2: não-admin vê só a própria loja (+ legadas sem loja); admin pode filtrar por ?loja_id=
+            if user['perfil'] != 'admin' and user['loja_id'] is not None:
+                loja_id = user['loja_id']
+            else:
+                loja_id = request.args.get('loja_id', type=int)
+            df = self.db.listar_contas_pagar(status=status, loja_id=loja_id)
             return jsonify(df.to_dict(orient='records'))
 
         @app.route('/api/contas-pagar/<int:conta_id>/pagar', methods=['PUT'])
@@ -681,8 +686,19 @@ class EstokeAPI:
             user, err = self._require_auth()
             if err:
                 return err
+            # Tenancy Isolation (BOLA) Check (Lote H2)
+            with self.db._lock:
+                if hasattr(self.db, '_ensure_open'):
+                    self.db._ensure_open()
+                cursor = self.db.conn.cursor()
+                cursor.execute("SELECT loja_id FROM contas_pagar WHERE id=?", (conta_id,))
+                c_row = cursor.fetchone()
+            if not c_row:
+                return jsonify({"error": "Conta não encontrada"}), 404
+            if user['perfil'] != 'admin' and user['loja_id'] is not None and c_row[0] is not None and c_row[0] != user['loja_id']:
+                return jsonify({"error": "Acesso negado. Conta pertence a outra loja."}), 403
             try:
-                self.db.pagar_conta(conta_id)
+                self.db.pagar_conta(conta_id, loja_id=user.get('loja_id'))
                 return jsonify({"success": True})
             except Exception as e:
                 return jsonify({"error": str(e)}), 400

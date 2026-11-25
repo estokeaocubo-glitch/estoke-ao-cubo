@@ -94,7 +94,7 @@ class TestHomologacaoE2E:
 
     def test_homologacao_turno_pdv_tef_pix_fechamento_pdf(self, temp_env, shared_app, monkeypatch):
         db, tmpdir = temp_env
-        assert migrations.get_user_version(db.conn) == 9
+        assert migrations.get_user_version(db.conn) == migrations.LATEST_SCHEMA_VERSION
 
         # Abertura de caixa
         ok_ab, _ = db.abrir_caixa(150.0, "Caixa Homologação E2E", usuario_id=1)

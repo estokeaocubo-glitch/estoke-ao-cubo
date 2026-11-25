@@ -793,13 +793,13 @@ class TestCancelamentoFiscalAssincrono:
 
             # 1ª execução: deve adicionar autorizado_em em banco já na v9
             v1 = migrations.run_migrations(conn)
-            assert v1 == 9
+            assert v1 == migrations.LATEST_SCHEMA_VERSION
             cols_depois = [r[1] for r in conn.execute("PRAGMA table_info(nfce_documentos)").fetchall()]
             assert "autorizado_em" in cols_depois
 
             # 2ª execução: idempotente, sem erro
             v2 = migrations.run_migrations(conn)
-            assert v2 == 9
+            assert v2 == migrations.LATEST_SCHEMA_VERSION
 
             # Registro antigo deve permanecer com autorizado_em NULL (None)
             row = conn.execute(

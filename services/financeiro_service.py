@@ -132,13 +132,14 @@ class FinanceiroService:
             return []
         return df.to_dict(orient="records")
 
-    def listar_contas_pagar(self, status: str | None = None) -> dict[str, Any]:
+    def listar_contas_pagar(self, status: str | None = None, loja_id: int | None = None) -> dict[str, Any]:
         """
         Lista contas a pagar filtradas por status ('Pendente', 'Pago' ou None/'Todos')
         e calcula o total pendente nos itens retornados, preservando o comportamento da UI.
+        loja_id (opcional): só contas da loja + legadas sem loja; None mantém todas.
         """
         status_param = None if status in (None, "", "Todos") else status
-        df = self.db.listar_contas_pagar(status=status_param)
+        df = self.db.listar_contas_pagar(status=status_param, loja_id=loja_id)
         contas: list[dict[str, Any]] = []
         total_pendente = 0.0
         if df is not None and not df.empty:
@@ -173,8 +174,9 @@ class FinanceiroService:
         categoria: str = "Outro",
         total_parcelas: int | str = 1,
         observacao: str = "",
+        loja_id: int | None = None,
     ) -> None:
-        """Valida dados da conta a pagar e registra no banco."""
+        """Valida dados da conta a pagar e registra no banco (loja_id None = loja padrão)."""
         try:
             valor_float = float(str(valor).strip().replace(",", "."))
         except (TypeError, ValueError) as exc:
@@ -205,11 +207,12 @@ class FinanceiroService:
             cat_str,
             total_parcelas=parcelas_int,
             observacao=obs_str,
+            loja_id=loja_id,
         )
 
-    def pagar_conta(self, conta_id: int) -> None:
-        """Marca conta a pagar como paga."""
-        self.db.pagar_conta(int(conta_id))
+    def pagar_conta(self, conta_id: int, loja_id: int | None = None) -> None:
+        """Marca conta a pagar como paga; o gasto vai para a loja da conta (fallback: loja_id)."""
+        self.db.pagar_conta(int(conta_id), loja_id=loja_id)
 
     def cancelar_conta_pagar(self, conta_id: int) -> None:
         """Cancela conta a pagar."""
@@ -219,7 +222,7 @@ class FinanceiroService:
         """Fachada unificada de CRUD para contas a pagar ('listar', 'adicionar', 'pagar', 'cancelar')."""
         op = (acao or "").strip().lower()
         if op == "listar":
-            return self.listar_contas_pagar(status=kwargs.get("status"))
+            return self.listar_contas_pagar(status=kwargs.get("status"), loja_id=kwargs.get("loja_id"))
         if op == "adicionar":
             return self.adicionar_conta_pagar(
                 descricao=kwargs.get("descricao", ""),
@@ -229,9 +232,10 @@ class FinanceiroService:
                 categoria=kwargs.get("categoria", "Outro"),
                 total_parcelas=kwargs.get("total_parcelas", 1),
                 observacao=kwargs.get("observacao", ""),
+                loja_id=kwargs.get("loja_id"),
             )
         if op == "pagar":
-            return self.pagar_conta(kwargs["conta_id"])
+            return self.pagar_conta(kwargs["conta_id"], loja_id=kwargs.get("loja_id"))
         if op == "cancelar":
             return self.cancelar_conta_pagar(kwargs["conta_id"])
         raise ValueError(f"Ação de contas a pagar desconhecida: {acao!r}")
