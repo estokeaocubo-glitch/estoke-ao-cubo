@@ -31,7 +31,7 @@ import config as app_config
 logger = logging.getLogger("EstokeAoCubo.updater")
 
 APP_VERSION = "4.6.1"
-DEFAULT_UPDATE_MANIFEST_URL = "https://updates.estokeaocubo.com.br/version.json"
+DEFAULT_UPDATE_MANIFEST_URL = "https://estoke-updates.pages.dev/version.json"
 # Chave pública que valida o version.json do auto-update (par gerado no hotfix v4.6.1;
 # a privada fica fora do repositório).
 DEFAULT_ED25519_PUBLIC_KEY_B64 = "D1csAKUbmtRR6bIvsVqW9wu0cJyPVduZJRN/vrOHkUo="
@@ -173,7 +173,7 @@ def build_signed_release_manifest(
     private_key: Ed25519PrivateKey | bytes | str,
     full_installer: str | Path | None = None,
     trial_installer: str | Path | None = None,
-    base_download_url: str = "https://updates.estokeaocubo.com.br/releases",
+    base_download_url: str = "https://estoke-updates.pages.dev/releases",
     notes: str = "",
 ) -> dict[str, Any]:
     """

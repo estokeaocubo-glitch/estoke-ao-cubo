@@ -361,7 +361,7 @@ class TestHomologacaoE2E:
         # Checar atualização como canal Full
         monkeypatch.delenv("ESTOKE_TRIAL", raising=False)
         res_full = updater.check_for_updates(
-            manifest_url="https://updates.estokeaocubo.com.br/version.json",
+            manifest_url="https://estoke-updates.pages.dev/version.json",
             current_version="4.6.0",
             public_key=pub_b64,
             fetcher=lambda _u: manifest,
@@ -374,7 +374,7 @@ class TestHomologacaoE2E:
         # Checar atualização como canal Trial
         monkeypatch.setenv("ESTOKE_TRIAL", "1")
         res_trial = updater.check_for_updates(
-            manifest_url="https://updates.estokeaocubo.com.br/version.json",
+            manifest_url="https://estoke-updates.pages.dev/version.json",
             current_version="4.6.0",
             public_key=pub_b64,
             fetcher=lambda _u: manifest,
