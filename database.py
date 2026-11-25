@@ -15,7 +15,9 @@ import hashlib
 import json
 from cryptography.fernet import Fernet
 
-__version__ = "4.3.0"
+# Fonte única da versão: services/updater.py (APP_VERSION). O updater só depende de
+# config/paths/services.security, que não importam database, então não há ciclo.
+from services.updater import APP_VERSION as __version__  # noqa: E402
 
 logger = logging.getLogger('EstokeAoCubo.database')
 
@@ -2072,13 +2074,21 @@ class Database:
         """Retorna as parciais do caixa atualmente aberto com breakdown detalhado por forma de pagamento."""
         try:
             cursor = self.conn.cursor()
+            # Mesmo filtro de caixa_aberto(): loja_id NULL é caixa legado (antes do multi-loja)
+            # e continua visível em qualquer loja.
+            where = ["status = 'aberto'"]
+            params = []
             if usuario_id is not None:
-                cursor.execute(
-                    "SELECT id, data_abertura, valor_abertura, usuario_id, loja_id FROM caixa WHERE status = 'aberto' AND usuario_id = ?",
-                    (usuario_id,)
-                )
-            else:
-                cursor.execute("SELECT id, data_abertura, valor_abertura, usuario_id, loja_id FROM caixa WHERE status = 'aberto'")
+                where.append("usuario_id = ?")
+                params.append(usuario_id)
+            if loja_id is not None:
+                where.append("(loja_id = ? OR loja_id IS NULL)")
+                params.append(loja_id)
+            cursor.execute(
+                f"SELECT id, data_abertura, valor_abertura, usuario_id, loja_id FROM caixa "
+                f"WHERE {' AND '.join(where)} ORDER BY id",
+                params,
+            )
             row = cursor.fetchone()
             if not row:
                 return None

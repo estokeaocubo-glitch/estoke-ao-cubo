@@ -48,7 +48,7 @@ Use o venv do projeto `C:\dev\EstokeAoCubo\.venv` (Python 3.14, `requirements.tx
 $py = "C:\dev\EstokeAoCubo\.venv\Scripts\python.exe"
 $env:PYTHONUTF8 = "0"
 
-# Testes (baseline atual: 226 passam / 1 falha preexistente em
+# Testes (baseline atual: 233 passam / 1 falha preexistente em
 # test_mercadopago_integration::test_01_carregamento_credenciais, que exige token real no .env)
 $env:ESTOKE_DATA_DIR = (New-Item -ItemType Directory -Force "$env:TEMP\estoke_pytest").FullName
 & $py -m pytest -q
@@ -105,9 +105,9 @@ Ordem atual: hotfix v4.6.1 → higiene (venv, requirements, teste MP `live`, `__
 → isolamento por loja restante → F2 (ponte PyWebView) → F3 (UI em `web/`) → pré-release.
 
 ## Armadilhas conhecidas
-- `database.__version__` ("4.3.0") diverge de `version_info.txt`/`build_local.APP_VERSION` ("4.6.1").
+- Versão: a fonte única é `services/updater.py` (`APP_VERSION`); `database.__version__` importa de lá.
+  Ao subir versão, ainda sincronizar `build_local.py`, `crash_handler.py`, `version_info.txt` e `EstokeSetup.iss`.
 - `contas_pagar` não tem `loja_id`; `pagar_conta()` gera gasto sem loja.
 - `servicos` não tem `data_conclusao`; `gerar_dre`/`calcular_comissoes` usam `servicos.data`.
-- `resumo_caixa_atual()` recebe `loja_id` mas não filtra por ele.
 - Arquivos sensíveis fora do Git: `.env` (credenciais MP/Focus), chaves privadas em `C:\dev\_segredos\`.
   Nunca commitar, nunca imprimir o conteúdo.
