@@ -126,6 +126,7 @@ class RelatorioService:
                         WHERE COALESCE(s.status, 'Concluído') != 'Cancelado'
                           AND COALESCE(s.status_os, 'Concluído') IN ('Concluído', 'Entregue', 'Finalizado', '')
                           AND date(COALESCE(
+                                s.data_conclusao,
                                 (SELECT MIN(h.data_hora)
                                  FROM historico h
                                  WHERE h.acao = 'OS Status'

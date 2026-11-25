@@ -7,7 +7,7 @@ import sqlite3
 
 logger = logging.getLogger("EstokeAoCubo.migrations")
 
-LATEST_SCHEMA_VERSION = 9
+LATEST_SCHEMA_VERSION = 10
 
 
 def get_user_version(conn) -> int:
@@ -548,6 +548,51 @@ def migration_009_fiscal_nfce(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_nfce_status ON nfce_documentos(status)")
 
 
+# Status terminais de OS (mesmo conjunto do RelatorioService, Lote 4b-r1). NULL e '' contam
+# como concluído porque serviço avulso nasce com status_os padrão 'Concluído'.
+STATUS_OS_TERMINAIS = ("Concluído", "Entregue", "Finalizado")
+
+
+def migration_010_loja_contas_pagar_e_conclusao_servicos(cursor) -> None:
+    """
+    Migração 10 (Lotes H2 + H3):
+    - contas_pagar.loja_id: coluna nova; linhas legadas (NULL) vão para a loja padrão
+      (menor id ativo, senão menor id, senão 1).
+    - servicos.data_conclusao: coluna nova; backfill só para OS em status terminal, usando a
+      primeira transição terminal registrada em historico ('OS Status') e, na falta dela,
+      servicos.data. OS abertas ficam NULL.
+    Idempotente: colunas checadas via PRAGMA e backfills só tocam linhas NULL.
+    """
+    if _table_exists(cursor, "contas_pagar"):
+        _add_column_if_missing(cursor, "contas_pagar", "loja_id", "INTEGER DEFAULT NULL")
+        if _table_exists(cursor, "lojas"):
+            loja_padrao_sql = (
+                "COALESCE((SELECT MIN(id) FROM lojas WHERE COALESCE(ativa, 1) = 1), "
+                "(SELECT MIN(id) FROM lojas), 1)"
+            )
+        else:
+            loja_padrao_sql = "1"
+        cursor.execute(f"UPDATE contas_pagar SET loja_id = {loja_padrao_sql} WHERE loja_id IS NULL")
+
+    if _table_exists(cursor, "servicos"):
+        _add_column_if_missing(cursor, "servicos", "data_conclusao", "TEXT DEFAULT NULL")
+        terminais_sql = ", ".join("'" + st + "'" for st in STATUS_OS_TERMINAIS)
+        if _table_exists(cursor, "historico"):
+            detalhes_sql = ", ".join("'Serviço #' || s.id || ' -> " + st + "'" for st in STATUS_OS_TERMINAIS)
+            origem_sql = (
+                "COALESCE((SELECT MIN(h.data_hora) FROM historico h "
+                f"WHERE h.acao = 'OS Status' AND h.detalhe IN ({detalhes_sql})), s.data)"
+            )
+        else:
+            origem_sql = "s.data"
+        cursor.execute(
+            f"""UPDATE servicos AS s SET data_conclusao = {origem_sql}
+                WHERE s.data_conclusao IS NULL
+                  AND COALESCE(s.status_os, 'Concluído') IN ({terminais_sql}, '')"""
+        )
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_servicos_data_conclusao ON servicos(data_conclusao)")
+
+
 MIGRATIONS = [
     (1, "4.3-baseline: Consolidação idempotente de schema e índices", migration_001_baseline_v43),
     (2, "4.4-auditoria: Colunas estruturadas e hash encadeado em historico", migration_002_auditoria_historico),
@@ -558,6 +603,7 @@ MIGRATIONS = [
     (7, "4.5-gestao: Lead time de compras e repositório mensal de XMLs de NF-e", migration_007_compras_e_nfe_log),
     (8, "4.6-pagamentos: Persistência de webhooks/Point Mercado Pago e conciliação PIX", migration_008_conciliacao_pix_e_point),
     (9, "4.6-fiscal: Campos fiscais NFC-e Mod. 65 em produtos/config_nota e nfce_documentos", migration_009_fiscal_nfce),
+    (10, "4.7-higiene: loja_id em contas_pagar e data_conclusao em servicos (H2+H3)", migration_010_loja_contas_pagar_e_conclusao_servicos),
 ]
 
 

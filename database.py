@@ -619,7 +619,8 @@ class Database:
             equipamento TEXT DEFAULT '',
             data_previsao TEXT DEFAULT '',
             caixa_id INTEGER DEFAULT NULL,
-            loja_id INTEGER DEFAULT NULL
+            loja_id INTEGER DEFAULT NULL,
+            data_conclusao TEXT DEFAULT NULL
         )''')
 
         # Tabela de categorias customizáveis
@@ -846,6 +847,7 @@ class Database:
             parcela_atual INTEGER DEFAULT 1,
             total_parcelas INTEGER DEFAULT 1,
             observacao TEXT,
+            loja_id INTEGER DEFAULT NULL,
             FOREIGN KEY (fornecedor_id) REFERENCES fornecedores(id)
         )''')
 
@@ -1985,13 +1987,17 @@ class Database:
             loja_id = kwargs.get('loja_id', None)
             caixa_atual = self.caixa_aberto()
             caixa_id = caixa_atual['id'] if caixa_atual else None
+            # Lote H3: OS que já nasce em status terminal (serviço avulso) é concluída na abertura
+            data_conclusao = data if self._status_os_terminal(status_os) else None
             cursor.execute(
                 """INSERT INTO servicos (
                     data, cliente, descricao, valor, custo, forma_pagamento, observacao,
-                    vendedor, status_os, contato_cliente, equipamento, data_previsao, caixa_id, loja_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    vendedor, status_os, contato_cliente, equipamento, data_previsao, caixa_id, loja_id,
+                    data_conclusao
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (data, cliente, descricao, valor, custo, forma_pagamento, observacao,
-                 vendedor, status_os, contato_cliente, equipamento, data_previsao, caixa_id, loja_id)
+                 vendedor, status_os, contato_cliente, equipamento, data_previsao, caixa_id, loja_id,
+                 data_conclusao)
             )
             servico_id = cursor.lastrowid
             if caixa_id:
@@ -2017,11 +2023,31 @@ class Database:
             self.conn, params=[data_limite]
         )
 
+    # Status terminais de OS: mesmo conjunto do RelatorioService (Lote 4b-r1) e da migração v10.
+    # NULL e '' contam como concluído (serviço avulso nasce com status_os padrão 'Concluído').
+    STATUS_OS_TERMINAIS = ("Concluído", "Entregue", "Finalizado")
+    SQL_STATUS_OS_TERMINAL = "COALESCE(s.status_os, 'Concluído') IN ('Concluído', 'Entregue', 'Finalizado', '')"
+
+    @classmethod
+    def _status_os_terminal(cls, status):
+        return status in (None, "") or status in cls.STATUS_OS_TERMINAIS
+
     def atualizar_status_servico(self, servico_id, novo_status):
-        """Atualiza status da Ordem de Serviço."""
+        """Atualiza status da Ordem de Serviço.
+
+        data_conclusao (Lote H3): gravada com a data/hora atual na PRIMEIRA entrada em status
+        terminal e nunca sobrescrita (Concluído -> Entregue mantém a data original). O domínio
+        não tem regra de reabertura (a trilha de OS só avança), então a data não é limpa se o
+        status voltar a um não terminal; DRE e comissões já exigem status terminal.
+        """
         try:
             cursor = self.conn.cursor()
             cursor.execute("UPDATE servicos SET status_os = ? WHERE id = ?", (novo_status, servico_id))
+            if self._status_os_terminal(novo_status):
+                cursor.execute(
+                    "UPDATE servicos SET data_conclusao = ? WHERE id = ? AND data_conclusao IS NULL",
+                    (datetime.datetime.now().isoformat(), servico_id),
+                )
             self.conn.commit()
             self.registrar_alteracao("OS Status", f"Serviço #{servico_id} -> {novo_status}")
             return True
@@ -4786,6 +4812,7 @@ class Database:
                 if lancar_conta_pagar and duplicatas:
                     hoje_iso = datetime.date.today().isoformat()
                     total_parc = len(duplicatas)
+                    loja_nfe = self._loja_padrao_id()
                     for idx_d, dup in enumerate(duplicatas, 1):
                         n_dup = dup.get("n_dup", str(idx_d))
                         d_venc = dup.get("d_venc", hoje_iso)
@@ -4794,8 +4821,8 @@ class Database:
                             cursor.execute(
                                 """INSERT INTO contas_pagar (
                                     fornecedor_id, descricao, valor, data_emissao, data_vencimento,
-                                    categoria, parcela_atual, total_parcelas, observacao
-                                ) VALUES (?, ?, ?, ?, ?, 'Material', ?, ?, ?)""",
+                                    categoria, parcela_atual, total_parcelas, observacao, loja_id
+                                ) VALUES (?, ?, ?, ?, ?, 'Material', ?, ?, ?, ?)""",
                                 (
                                     fornecedor_id,
                                     f"NF-e #{num_nf} - {forn_nome} (Dup {n_dup})",
@@ -4805,6 +4832,7 @@ class Database:
                                     idx_d,
                                     total_parc,
                                     f"Importado de XML NF-e #{num_nf}",
+                                    loja_nfe,
                                 ),
                             )
                             contas_lancadas += 1
@@ -5397,9 +5425,20 @@ class Database:
     # ============ CONTAS A PAGAR ============
     # ============================================================
 
+    def _loja_padrao_id(self):
+        """Loja padrão: menor id ativo, senão menor id, senão 1 (mesma regra do backfill da v10)."""
+        row = self.conn.execute(
+            "SELECT COALESCE((SELECT MIN(id) FROM lojas WHERE COALESCE(ativa, 1) = 1), "
+            "(SELECT MIN(id) FROM lojas), 1)"
+        ).fetchone()
+        return int(row[0]) if row and row[0] is not None else 1
+
     def adicionar_conta_pagar(self, descricao, valor, data_vencimento, fornecedor_id=None,
-                              categoria='Outro', recorrente=0, total_parcelas=1, observacao=''):
+                              categoria='Outro', recorrente=0, total_parcelas=1, observacao='',
+                              loja_id=None):
         cursor = self.conn.cursor()
+        if loja_id is None:
+            loja_id = self._loja_padrao_id()
         data_emissao = datetime.date.today().isoformat()
         for parcela in range(1, total_parcelas + 1):
             venc = datetime.date.fromisoformat(data_vencimento)
@@ -5407,16 +5446,19 @@ class Database:
                 venc = venc + datetime.timedelta(days=30 * (parcela - 1))
             cursor.execute("""INSERT INTO contas_pagar
                 (fornecedor_id, descricao, valor, data_emissao, data_vencimento, categoria,
-                 recorrente, parcela_atual, total_parcelas, observacao)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                 recorrente, parcela_atual, total_parcelas, observacao, loja_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (fornecedor_id, descricao, valor / total_parcelas, data_emissao,
-                 venc.isoformat(), categoria, recorrente, parcela, total_parcelas, observacao))
+                 venc.isoformat(), categoria, recorrente, parcela, total_parcelas, observacao, loja_id))
         self.conn.commit()
         self.registrar_alteracao("Conta a Pagar", f"'{descricao}' R${valor:.2f} ({total_parcelas}x)")
 
-    def listar_contas_pagar(self, status=None, dias_futuros=None):
+    def listar_contas_pagar(self, status=None, dias_futuros=None, loja_id=None):
         where = []
         params = []
+        if loja_id is not None:
+            where.append("(cp.loja_id = ? OR cp.loja_id IS NULL)")
+            params.append(loja_id)
         if status:
             where.append("cp.status = ?")
             params.append(status)
@@ -5430,15 +5472,23 @@ class Database:
                     {where_str} ORDER BY cp.data_vencimento ASC"""
         return pd.read_sql_query(query, self.conn, params=params)
 
-    def pagar_conta(self, conta_id):
+    def pagar_conta(self, conta_id, loja_id=None):
+        """Quita a conta e lança o gasto na loja DA CONTA (fallback: loja_id informado, depois loja padrão)."""
         cursor = self.conn.cursor()
         cursor.execute("UPDATE contas_pagar SET status='Pago', data_pagamento=? WHERE id=?",
                       (datetime.date.today().isoformat(), conta_id))
         # Registrar como gasto
-        cursor.execute("SELECT descricao, valor, categoria FROM contas_pagar WHERE id=?", (conta_id,))
+        cursor.execute("SELECT descricao, valor, categoria, loja_id FROM contas_pagar WHERE id=?", (conta_id,))
         row = cursor.fetchone()
         if row:
-            self.adicionar_gasto(datetime.date.today().isoformat(), row[1], row[2], f"Pgto: {row[0]}")
+            if row[3] is not None:
+                loja_gasto = row[3]
+            elif loja_id is not None:
+                loja_gasto = loja_id
+            else:
+                loja_gasto = self._loja_padrao_id()
+            self.adicionar_gasto(datetime.date.today().isoformat(), row[1], row[2], f"Pgto: {row[0]}",
+                                 loja_id=loja_gasto)
         self.conn.commit()
         self.registrar_alteracao("Pagar Conta", f"Conta #{conta_id} quitada")
 
@@ -5447,23 +5497,29 @@ class Database:
         cursor.execute("UPDATE contas_pagar SET status='Cancelado' WHERE id=?", (conta_id,))
         self.conn.commit()
 
-    def contas_vencendo(self, dias=7):
+    def contas_vencendo(self, dias=7, loja_id=None):
         """Retorna contas a pagar vencendo nos próximos N dias."""
         hoje = datetime.date.today().isoformat()
         limite = (datetime.date.today() + datetime.timedelta(days=dias)).isoformat()
+        loja_clause = " AND (loja_id = ? OR loja_id IS NULL)" if loja_id is not None else ""
+        params = [hoje, limite] + ([loja_id] if loja_id is not None else [])
         return pd.read_sql_query(
-            "SELECT * FROM contas_pagar WHERE status='Pendente' AND data_vencimento BETWEEN ? AND ? ORDER BY data_vencimento",
-            self.conn, params=[hoje, limite])
+            f"SELECT * FROM contas_pagar WHERE status='Pendente' AND data_vencimento BETWEEN ? AND ?{loja_clause} ORDER BY data_vencimento",
+            self.conn, params=params)
 
-    def contas_vencidas(self):
+    def contas_vencidas(self, loja_id=None):
         hoje = datetime.date.today().isoformat()
+        loja_clause = " AND (loja_id = ? OR loja_id IS NULL)" if loja_id is not None else ""
+        params = [hoje] + ([loja_id] if loja_id is not None else [])
         return pd.read_sql_query(
-            "SELECT * FROM contas_pagar WHERE status='Pendente' AND data_vencimento < ? ORDER BY data_vencimento",
-            self.conn, params=[hoje])
+            f"SELECT * FROM contas_pagar WHERE status='Pendente' AND data_vencimento < ?{loja_clause} ORDER BY data_vencimento",
+            self.conn, params=params)
 
-    def total_contas_pagar_pendente(self):
+    def total_contas_pagar_pendente(self, loja_id=None):
         cursor = self.conn.cursor()
-        cursor.execute("SELECT COALESCE(SUM(valor), 0) FROM contas_pagar WHERE status='Pendente'")
+        loja_clause = " AND (loja_id = ? OR loja_id IS NULL)" if loja_id is not None else ""
+        cursor.execute(f"SELECT COALESCE(SUM(valor), 0) FROM contas_pagar WHERE status='Pendente'{loja_clause}",
+                       (loja_id,) if loja_id is not None else ())
         return cursor.fetchone()[0]
 
     # ============================================================
@@ -5540,10 +5596,13 @@ class Database:
         )
         receita_vendas_d = _dec(cursor.fetchone()[0])
 
-        cursor.execute(
-            f"SELECT COALESCE(SUM(valor), 0) FROM servicos WHERE date(data) BETWEEN date(?) AND date(?){loja_clause}",
-            params_dt
+        # Serviços (Lote H3): só OS em status terminal, pela data de conclusão (fallback: abertura)
+        serv_from = (
+            f"FROM servicos s WHERE {self.SQL_STATUS_OS_TERMINAL} "
+            "AND date(COALESCE(s.data_conclusao, s.data)) BETWEEN date(?) AND date(?)"
+            + (" AND (s.loja_id = ? OR s.loja_id IS NULL)" if loja_id is not None else "")
         )
+        cursor.execute(f"SELECT COALESCE(SUM(s.valor), 0) {serv_from}", params_dt)
         receita_servicos_d = _dec(cursor.fetchone()[0])
 
         receita_bruta_d = receita_vendas_d + receita_servicos_d
@@ -5564,10 +5623,7 @@ class Database:
         )
         cmv_d = _dec(cursor.fetchone()[0])
 
-        cursor.execute(
-            f"SELECT COALESCE(SUM(custo), 0) FROM servicos WHERE date(data) BETWEEN date(?) AND date(?){loja_clause}",
-            params_dt
-        )
+        cursor.execute(f"SELECT COALESCE(SUM(s.custo), 0) {serv_from}", params_dt)
         custo_servicos_d = _dec(cursor.fetchone()[0])
 
         custo_total_d = cmv_d + custo_servicos_d
@@ -5591,8 +5647,8 @@ class Database:
 
         # Contas a pagar pagas no período (informativo — pagar_conta já lança em gastos)
         cursor.execute(
-            "SELECT COALESCE(SUM(valor), 0) FROM contas_pagar WHERE status='Pago' AND date(data_pagamento) BETWEEN date(?) AND date(?)",
-            (inicio, fim)
+            f"SELECT COALESCE(SUM(valor), 0) FROM contas_pagar WHERE status='Pago' AND date(data_pagamento) BETWEEN date(?) AND date(?){loja_clause}",
+            params_dt
         )
         contas_pagas_d = _dec(cursor.fetchone()[0])
 
@@ -5834,7 +5890,8 @@ class Database:
                    SUM(s.valor) as faturamento_servicos
             FROM servicos s
             LEFT JOIN vendedores vd ON s.vendedor = vd.nome
-            WHERE date(s.data) >= date(?) AND s.vendedor != ''{loja_s}
+            WHERE {self.SQL_STATUS_OS_TERMINAL}
+              AND date(COALESCE(s.data_conclusao, s.data)) >= date(?) AND s.vendedor != ''{loja_s}
             GROUP BY s.vendedor
         """
         df_serv = pd.read_sql_query(query_serv, self.conn, params=params)
