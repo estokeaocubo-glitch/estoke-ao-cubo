@@ -39,6 +39,9 @@ METODOS_PUBLICOS = {
     "toggle_fullscreen", "get_sidebar_menu", "check_updates_status",
     "get_first_access_catalog", "complete_first_access", "login", "logout",
     "get_current_session", "autorizar_supervisor",
+    # Marco 2 (dashboard)
+    "get_resumo", "get_graficos", "list_metas", "create_meta", "toggle_meta", "delete_meta",
+    "get_alertas",
 }
 
 

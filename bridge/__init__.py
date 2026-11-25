@@ -206,6 +206,7 @@ class EstokeBridge:
         from bridge.events import EventDispatcher
         from bridge.app_bridge import AppBridge
         from bridge.auth_bridge import AuthBridge
+        from bridge.dashboard_bridge import DashboardBridge
 
         if db is None:
             import database
@@ -219,9 +220,20 @@ class EstokeBridge:
         self._events = EventDispatcher()
         self._window = None
         self._update_fetcher = update_fetcher
-        self._on_session_started = on_session_started
+        self._on_session_started_externo = on_session_started
+        self._on_session_started = self._sessao_iniciada
         self._app = AppBridge(self)
         self._auth = AuthBridge(self)
+        self._dash = DashboardBridge(self)
+
+    def _sessao_iniciada(self, user: dict) -> None:
+        """Pós-login: monitor do dashboard (alertas, tick, update) e rotinas do app (workers)."""
+        try:
+            self._dash._on_login()
+        except Exception:
+            logger.exception("Falha ao iniciar o monitor do dashboard.")
+        if self._on_session_started_externo is not None:
+            self._on_session_started_externo(user)
 
     # -- integração com a janela (não exposto ao JS) --
     def _bind_window(self, window: Any) -> None:
@@ -229,6 +241,7 @@ class EstokeBridge:
         self._events.bind_window(window)
 
     def _shutdown(self) -> None:
+        self._dash._shutdown()
         self._events.close()
 
     # -- utilitário --
@@ -268,6 +281,35 @@ class EstokeBridge:
     @safe_call
     def check_updates_status(self) -> dict:
         return self._app.check_updates_status()
+
+    # -- dashboard_bridge --
+    @safe_call
+    def get_resumo(self, periodo: Any = "30d") -> dict:
+        return self._dash.get_resumo(periodo)
+
+    @safe_call
+    def get_graficos(self, periodo: Any = "30d") -> dict:
+        return self._dash.get_graficos(periodo)
+
+    @safe_call
+    def list_metas(self) -> list:
+        return self._dash.list_metas()
+
+    @safe_call
+    def create_meta(self, titulo: Any, prazo: Any = None, descricao: Any = "") -> dict:
+        return self._dash.create_meta(titulo, prazo, descricao)
+
+    @safe_call
+    def toggle_meta(self, meta_id: Any) -> dict:
+        return self._dash.toggle_meta(meta_id)
+
+    @safe_call
+    def delete_meta(self, meta_id: Any) -> dict:
+        return self._dash.delete_meta(meta_id)
+
+    @safe_call
+    def get_alertas(self) -> dict:
+        return self._dash.get_alertas()
 
     # -- auth_bridge --
     @safe_call

@@ -34,8 +34,10 @@ def _usuario_publico(user: dict | None) -> dict | None:
 def _ler_termos() -> str | None:
     import paths
 
+    # Ordem: bundle/raiz do repo, dist_package/ (onde o build guarda os docs) e pasta de instalação.
     candidatos = [
         paths.get_resource_path("TERMOS_DE_USO.txt"),
+        paths.get_resource_path("dist_package", "TERMOS_DE_USO.txt"),
         os.path.join(paths.get_install_dir(), "TERMOS_DE_USO.txt"),
     ]
     for caminho in candidatos:
