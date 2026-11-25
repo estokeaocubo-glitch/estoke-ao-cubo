@@ -351,7 +351,7 @@ def generate_release_manifest(project_dir: Path, version: str) -> Path:
     trial_path = release_dir / f"EstokeAoCubo_Trial_Setup_v{version}.exe"
 
     priv, pub_b64 = _load_or_create_release_keypair()
-    base_url = os.environ.get("ESTOKE_RELEASE_BASE_URL", "https://updates.estokeaocubo.com.br/releases").strip()
+    base_url = os.environ.get("ESTOKE_RELEASE_BASE_URL", "https://estoke-updates.pages.dev/releases").strip()
     manifest = updater.build_signed_release_manifest(
         version=version,
         private_key=priv,
