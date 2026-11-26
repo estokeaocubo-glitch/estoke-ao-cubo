@@ -34,6 +34,15 @@
   --warning: #8A5A00;
   --warning-soft: rgba(138, 90, 0, 0.10);
 
+  /* Gráficos (paleta categórica, lida via getComputedStyle pelo charts.js) */
+  --chart-1: #0A4174;
+  --chart-2: #2E86C1;
+  --chart-3: #17A589;
+  --chart-4: #D68910;
+  --chart-5: #8E44AD;
+  --chart-6: #C0392B;
+  --chart-7: #7F8C8D;
+
   /* Bordas e sombras */
   --border: 1px solid rgba(0, 29, 57, 0.09);
   --border-color: rgba(0, 29, 57, 0.09);
@@ -121,6 +130,14 @@
   --success-soft: rgba(111, 207, 151, 0.12);
   --warning: #F2C94C;
   --warning-soft: rgba(242, 201, 76, 0.12);
+
+  --chart-1: #7BBDE8;
+  --chart-2: #4FA3E0;
+  --chart-3: #48C9B0;
+  --chart-4: #F5B041;
+  --chart-5: #BB8FCE;
+  --chart-6: #F1948A;
+  --chart-7: #AAB7B8;
 
   --border: 1px solid rgba(174, 214, 241, 0.12);
   --border-color: rgba(174, 214, 241, 0.12);

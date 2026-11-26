@@ -6,6 +6,7 @@ import { route, setGuard, start, navigate } from "./router.js";
 import { bind } from "./hotkeys.js";
 import { renderLogin } from "./pages/login.js";
 import { renderFirstAccess } from "./pages/first-access.js";
+import { refreshDashboard, isDashboardMounted, initDashboardEvents } from "./pages/dashboard.js";
 import {
   mountShell, isShellMounted, unmountShell, renderHome, renderPlaceholder, toggleFullscreen,
 } from "./pages/shell.js";
@@ -92,12 +93,15 @@ bind("Ctrl+E", irPara("/t/lista"));
 bind("Ctrl+R", irPara("/t/relatorio"));
 bind("Ctrl+G", irPara("/m/gastos"));
 bind("Ctrl+K", irPara("/m/kits"));
-bind("F5", () => {
-  if (autenticado() && isShellMounted() && location.hash === "#/inicio") {
+bind("F5", async () => {
+  if (!(autenticado() && isShellMounted() && location.hash === "#/inicio")) return;
+  if (!isDashboardMounted()) {
     renderHome();
-    toast("Painel atualizado.", "success", 1500);
+    return;
   }
+  if (await refreshDashboard({ skeleton: true })) toast("Painel atualizado.", "success", 1500);
 });
+initDashboardEvents();
 bind("F11", () => toggleFullscreen());
 bind("Escape", () => {
   // Esc só sai da tela cheia (como no legado); fora dela não faz nada.

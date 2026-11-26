@@ -4,6 +4,7 @@ import { call } from "../bridge-client.js";
 import { getState, setState, setSidebarCollapsed } from "../state.js";
 import { navigate } from "../router.js";
 import { themeToggleButton, marcoDe } from "./common.js";
+import { renderDashboard, refreshDashboard, isDashboardMounted } from "./dashboard.js";
 
 const TOPBAR_CLASSE = {
   adicionar: "tb-adicionar",
@@ -25,14 +26,6 @@ const ATALHOS_HOME = [
   ["Kits", "Ctrl+K"],
   ["Atualizar painel", "F5"],
   ["Tela cheia", "F11"],
-];
-
-const MARCOS = [
-  ["Marco 1 — Bridge, design system e shell", "done"],
-  ["Marco 2 — Dashboard Bento", "next"],
-  ["Marco 3 — PDV v2.0", ""],
-  ["Marco 4 — Módulos", ""],
-  ["Marco 5 — Empacotamento e cutover", ""],
 ];
 
 let refs = null; // elementos do shell montado
@@ -197,7 +190,10 @@ function lojaSelector(lojas) {
     const s = getState();
     setState({ lojas: { ...s.lojas, loja_ativa_id: res.data.loja_ativa_id }, session: { ...s.session, loja_ativa_id: res.data.loja_ativa_id } });
     toast(`Loja ativa: ${select.options[select.selectedIndex].text}`, "success");
-    if (location.hash === "#/inicio") renderHome();
+    if (location.hash === "#/inicio") {
+      if (isDashboardMounted()) refreshDashboard();
+      else renderHome();
+    }
   });
   return select;
 }
@@ -225,96 +221,18 @@ function nomeDaLoja() {
   return lojas?.lojas?.find((l) => l.id === lojas.loja_ativa_id)?.nome || "—";
 }
 
-/** Home em bento grid (o dashboard com dados reais chega no Marco 2). */
+/** Home: dashboard Bento do Marco 2 (dados reais da loja ativa via bridge). */
 export function renderHome() {
   if (!refs) return;
   marcarAtivo("#/inicio");
-  const { session, bootstrap, menu } = getState();
-  const u = session?.usuario || {};
+  const u = getState().session?.usuario || {};
   const hora = new Date().getHours();
   const saudacao = hora < 12 ? "Bom dia" : hora < 18 ? "Boa tarde" : "Boa noite";
-  const totalModulos = (menu?.secoes || []).reduce((acc, s) => acc + s.itens.length, 0);
-
-  const updates = h("div", { class: "muted" }, "Verificando atualizações…");
-  const grid = h(
-    "div",
-    { class: "bento" },
-    h(
-      "article",
-      { class: "card glass hero span-8 row-2" },
-      h("div", { class: "card-title" }, "Início"),
-      h("h2", {}, `${saudacao}, ${u.nome || ""}`),
-      h("p", { class: "muted" }, "Esta é a nova interface do Estoke ao Cubo. O painel com vendas, estoque e financeiro chega no Marco 2."),
-      h(
-        "div",
-        { class: "hero-meta" },
-        h("span", { class: "badge" }, `${bootstrap?.nicho_info?.icon || ""} ${bootstrap?.nicho_info?.title || "Variados"}`),
-        h("span", { class: "badge" }, `${totalModulos} módulos no menu`),
-        h("span", { class: "badge badge-success" }, "100% offline")
-      )
-    ),
-    h(
-      "article",
-      { class: "card glass span-4" },
-      h("div", { class: "card-title" }, "Sessão"),
-      h(
-        "dl",
-        { class: "kv" },
-        h("dt", {}, "Usuário"), h("dd", {}, `${u.emoji || ""} ${u.nome || "—"}`),
-        h("dt", {}, "Perfil"), h("dd", {}, u.perfil || "—"),
-        h("dt", {}, "Loja ativa"), h("dd", {}, nomeDaLoja()),
-        h("dt", {}, "Versão"), h("dd", { class: "mono" }, bootstrap?.version || "—")
-      )
-    ),
-    h("article", { class: "card glass span-4" }, h("div", { class: "card-title" }, "Atualizações"), updates),
-    placeholderCard("Vendas de hoje", "span-3"),
-    placeholderCard("Ticket médio", "span-3"),
-    placeholderCard("Estoque crítico", "span-3"),
-    placeholderCard("Contas a pagar", "span-3"),
-    h(
-      "article",
-      { class: "card glass span-7" },
-      h("div", { class: "card-title" }, "Atalhos de teclado"),
-      h("ul", { class: "shortcut-list" }, ATALHOS_HOME.map(([rotulo, tecla]) => h("li", {}, h("span", {}, rotulo), h("kbd", {}, tecla))))
-    ),
-    h(
-      "article",
-      { class: "card glass span-5" },
-      h("div", { class: "card-title" }, "Migração da interface"),
-      h(
-        "ul",
-        { class: "milestones" },
-        MARCOS.map(([texto, st]) => h("li", { class: st }, h("span", { class: "dot", "aria-hidden": "true" }), texto))
-      )
-    )
-  );
-
-  clear(refs.content);
-  refs.content.append(
-    h("div", { class: "page-head" }, h("div", {}, h("h1", {}, "Início"), h("p", { class: "muted" }, nomeDaLoja()))),
-    grid
-  );
-
-  call("check_updates_status").then((res) => {
-    if (!document.body.contains(updates)) return;
-    if (!res.ok || res.data?.error) {
-      updates.textContent = "Sem conexão para verificar agora. Tudo segue funcionando offline.";
-    } else if (res.data.available) {
-      updates.textContent = `Nova versão ${res.data.version} disponível (atual ${res.data.current_version}).`;
-    } else {
-      updates.textContent = `Você está na versão mais recente (${res.data.current_version}).`;
-    }
+  renderDashboard(refs.content, {
+    saudacao: u.nome ? `${saudacao}, ${u.nome}` : saudacao,
+    nomeLoja: nomeDaLoja,
+    atalhos: ATALHOS_HOME,
   });
-}
-
-function placeholderCard(titulo, span) {
-  return h(
-    "article",
-    { class: `card glass ${span}` },
-    h("div", { class: "card-title" }, titulo),
-    h("div", { class: "placeholder-metric" }, "—"),
-    h("p", { class: "muted", style: { "margin-top": "auto" } }, "Disponível no Marco 2")
-  );
 }
 
 /** Placeholder navegável para itens da sidebar (#/m/<slug>) e da topbar (#/t/<slug>). */
