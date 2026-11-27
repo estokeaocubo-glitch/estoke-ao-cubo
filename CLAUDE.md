@@ -28,7 +28,7 @@ database.py        Monolito de acesso a dados (SQLite + RLock) (6.833 linhas)
 migrations.py      Migrações de schema
 api_server.py      API REST Flask local (1.044 linhas, 41 rotas)
 services/          Camada de domínio (alvo da extração F1b; Lote 7: estoque_service com kits/reposição,
-                   producao_service, troca_service)
+                   producao_service, troca_service; Lote 8A: restaurante_service, cadastro_service)
 views/             Telas já modularizadas (pdv_view, financeiro_view, admin_view...)
 paths.py           Caminhos de dados/recursos (respeita ESTOKE_DATA_DIR) e get_web_path()
 crash_handler.py   Hooks de exceção + diálogo de erro
@@ -93,10 +93,10 @@ $env:ESTOKE_DATA_DIR = (New-Item -ItemType Directory -Force "$env:TEMP\estoke_se
 - Escopo por fase/lote: `f1a`, `f1b-loteN`, `f1b-loteNb-r1`, `hotfix-vX.Y.Z`.
 
 ## Branches
-- `main` (= `origin/main`), `chore/checkpoint-v4.6.0`, `feat/pywebview-f1a`, `feat/pywebview-f1b` (ativa).
+- `main` (= `origin/main`), `chore/checkpoint-v4.6.0`, `feat/pywebview-f1a`, `feat/pywebview-f1b` (ativa, sincronizada com `origin/feat/pywebview-f1b`), `feat/pywebview-v2` (worktree `C:\dev\EstokeAoCubo-v2`, **não está no origin**).
 - `hotfix/v4.6.1` está no origin, com a tag `v4.6.1` → `1caccee`. Os 4 commits dela foram portados
   para a f1b via `cherry-pick -x`.
-- `feat/pywebview-f1a` e `feat/pywebview-f1b` **não estão no origin**.
+- `feat/pywebview-f1a` **não está no origin**.
 - Release em produção: v4.6.1 (build da `hotfix/v4.6.1`, publicada em `estoke-updates.pages.dev`).
 
 ## Roadmap
@@ -105,10 +105,11 @@ enquanto não existir aqui, a última versão está na pasta do agente anterior,
 `%USERPROFILE%\.gemini\antigravity\brain\7f1adfc0-...\implementation_plan.md`).
 Ordem atual: hotfix v4.6.1 → higiene (venv, requirements, teste MP `live`, `__version__`;
 lotes H1 e H2+H3 = migração v10) → F1b Lote 7 (estoque/kits/produção/trocas, concluído)
-→ F1b Lote 8 (restaurante, cadastros, migração v11, API)
-→ isolamento por loja restante → F2 (ponte PyWebView) → F3 (UI em `web/`) → pré-release.
+→ F1b Lote 8A (restaurante, cadastros, `fechar_comanda` atômico, spec `collect_submodules`, concluído)
+→ F1b Lote 8B (migração v11 com `token_recibo` e `loja_id`, `/recibo`, auth MP, API)
+→ isolamento por loja restante → F2 (ponte PyWebView) → F3 (UI em `web/`) → pré-release (Marco 5: Authenticode).
 
-## Armadilhas conhecidas
+## Armadilhas conhecidas e decisões registradas
 - Versão: a fonte única é `services/updater.py` (`APP_VERSION`); `database.__version__` importa de lá.
   Ao subir versão, ainda sincronizar `build_local.py`, `crash_handler.py`, `version_info.txt` e `EstokeSetup.iss`.
 - Schema atual: `LATEST_SCHEMA_VERSION = 10`. Teste novo não fixa número de versão; use a constante.
@@ -119,9 +120,25 @@ lotes H1 e H2+H3 = migração v10) → F1b Lote 7 (estoque/kits/produção/troca
 - Lote 7: `registrar_baixa_insumo`, `adicionar_ficha_tecnica`, `remover_ficha_tecnica`,
   `registrar_producao` e `registrar_troca` rodam sob `_lock` com rollback e checam tudo antes de escrever.
   Estoque negativo continua bloqueado em baixa, produção e troca. `adicionar_kit` retorna o id.
-- Dívidas anotadas para o Lote 8 (v11): `loja_id` em `trocas_devolucoes`, `producao_diaria`,
-  `baixa_insumos`, `fichas_tecnicas` e `kits` (hoje só o lançamento financeiro da troca leva a loja).
-- Dívidas fora de escopo: `db.vender_kit` é código morto (o PDV não chama); `kit_itens` liga o
-  componente por `produto_nome` (renomear o produto quebra o kit).
+- Lote 8A: `RestauranteService` e `CadastroService` criados; `fechar_comanda` valida tudo antes de escrever,
+  roda com `rollback` em erro, calcula taxa 10%/totais em `Decimal` (`ROUND_HALF_UP`) e grava `loja_id`
+  em `vendas` e `entradas` (explícito → caixa aberto → `_loja_padrao_id()`). `db.vender_kit` e `resumo_caixa`
+  morto (`main.py`) removidos. `EstokeAoCubo.spec` usa `collect_submodules("services")`.
+- **Lacuna fiscal pendente (Lote 8A):** `fechar_comanda` grava linha em `vendas`, mas **não** emite NFC-e nem
+  enfileira na Outbox fiscal (tratar em lote fiscal futuro).
+- **Decisões do Brian para próximos passos:**
+  - **L9 (Lote 8B):** `transacao_id` tem apenas 48 bits; migração v11 adiciona `vendas.token_recibo`
+    (`secrets.token_urlsafe(16)`), `/recibo/<token_recibo>` responde só por esse token (id numérico → 404),
+    remove fallback falso de R$ 100,00; links antigos deixam de funcionar.
+  - **L10 (Lote 8B):** `/loja` não é usada em produção; `/api/pagamento/pix` e `/cartao` exigirão `_require_auth()`,
+    `Decimal`, parcelas 1–12 e rate limit; remover `/loja` e `index.html` de `api_server.py` e `EstokeAoCubo.spec`.
+    `/scanner` só sai se comprovado sem uso.
+  - **C (Authenticode):** adiado para o Marco 5.
+  - **D (`estoke-updates-pages`):** pendente de versionamento em `deploy/pages/` (varredura de segredos, `.gitignore`,
+    commit separado, sem deploy/push, nunca na conta Stiffweb `d95a010e...`).
+- Dívidas anotadas para o Lote 8B (v11): `loja_id` em `mesas`, `comandas`, `vendedores`, `estabelecimento`,
+  `kits`, `fichas_tecnicas`, `producao_diaria`, `baixa_insumos` e `trocas_devolucoes`; `POST /api/vendas` e
+  `/api/caixa/abrir` passando `loja_id`.
+- Dívidas fora de escopo: `kit_itens` liga o componente por `produto_nome` (renomear o produto quebra o kit).
 - Arquivos sensíveis fora do Git: `.env` (credenciais MP/Focus), chaves privadas em `C:\dev\_segredos\`.
   Nunca commitar, nunca imprimir o conteúdo.

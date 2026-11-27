@@ -178,47 +178,22 @@ class ServicoService:
         aplicar_taxa_10: bool = False,
         desconto: float = 0.0,
         observacao: str = "",
+        loja_id: int | None = None,
     ) -> dict[str, Any]:
-        """Calcula taxa de 10%/desconto e fecha a comanda aberta no banco."""
-        comanda = self.db.get_comanda(comanda_id)
-        if not comanda or comanda.get("status") != "aberta":
-            raise ValueError("Comanda não encontrada ou já fechada.")
+        """Delega fechamento de comanda para RestauranteService (compatibilidade L2)."""
+        from services.restaurante_service import RestauranteService
 
-        subtotal = float(comanda.get("total") or 0.0)
-        taxa = round(subtotal * 0.10, 2) if aplicar_taxa_10 else 0.0
-        try:
-            desc_f = float(str(desconto).replace(",", ".")) if desconto not in (None, "") else 0.0
-        except (TypeError, ValueError):
-            desc_f = 0.0
-
-        obs_limpa = str(observacao or "").strip()
-        ok, msg = self.db.fechar_comanda(comanda_id, forma_pagamento, taxa, desc_f, obs_limpa)
-        if not ok:
-            raise RuntimeError(str(msg))
-
-        return {
-            "comanda_id": comanda_id,
-            "subtotal": subtotal,
-            "taxa_servico": taxa,
-            "desconto": desc_f,
-            "total_final": max(subtotal + taxa - desc_f, 0.0),
-            "forma_pagamento": forma_pagamento,
-            "mensagem": msg,
-        }
+        return RestauranteService(self.db).fechar_comanda(
+            comanda_id=comanda_id,
+            forma_pagamento=forma_pagamento,
+            aplicar_taxa_10=aplicar_taxa_10,
+            desconto=desconto,
+            observacao=observacao,
+            loja_id=loja_id,
+        )
 
     def dividir_conta(self, comanda_id: int, num_pessoas: int) -> dict[str, Any]:
-        """
-        Divide o total da comanda pelo número de pessoas delegando ao Database.
-        Preserva integralmente o comportamento atual de arredondamento.
-        """
-        try:
-            n = int(num_pessoas)
-        except (TypeError, ValueError):
-            n = 1
-        if n < 1:
-            n = 1
+        """Delega divisão de conta para RestauranteService (compatibilidade L2)."""
+        from services.restaurante_service import RestauranteService
 
-        resultado = self.db.dividir_conta(comanda_id, n)
-        if not resultado:
-            raise ValueError("Comanda não encontrada.")
-        return resultado
+        return RestauranteService(self.db).dividir_conta(comanda_id, num_pessoas)

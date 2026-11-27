@@ -399,101 +399,6 @@ class Database:
         
         return max_kits if max_kits != float('inf') else 0
 
-    def vender_kit(self, kit_id, qtd_venda=1, forma_pagamento="Dinheiro", cliente="Consumidor Final",
-                   registrar_entrada=True, usuario_id=None, registrar_venda_row=None):
-        """Deduz de forma atômica os componentes do kit e, se registrar_entrada=True, registra a venda no caixa aberto."""
-        if qtd_venda <= 0:
-            return False, "Quantidade de venda inválida."
-        with self._lock:
-            try:
-                componentes = self.get_kit_components(kit_id)
-                if not componentes:
-                    return False, "Kit não encontrado ou sem componentes."
-                cursor = self.conn.cursor()
-
-                cursor.execute("SELECT nome, preco_venda, preco_compra FROM kits WHERE id = ?", (kit_id,))
-                kit_row = cursor.fetchone()
-                nome_kit = kit_row[0] if kit_row else f"Kit #{kit_id}"
-                preco_kit_unit = (kit_row[1] or 0.0) if kit_row else 0.0
-                custo_kit_unit = (kit_row[2] or 0.0) if kit_row else 0.0
-
-                missing = []
-                for comp in componentes:
-                    cursor.execute("SELECT quantidade FROM produtos WHERE nome = ?", (comp['nome'],))
-                    res = cursor.fetchone()
-                    if not res or res[0] < (comp['quantidade'] * qtd_venda):
-                        missing.append(comp['nome'])
-
-                if missing:
-                    return False, f"Estoque insuficiente para: {', '.join(missing)}"
-
-                valor_componentes = 0.0
-                custo_componentes = 0.0
-                for comp in componentes:
-                    cursor.execute("SELECT preco, preco_compra FROM produtos WHERE nome = ?", (comp['nome'],))
-                    res = cursor.fetchone()
-                    if res:
-                        valor_componentes += (res[0] or 0.0) * comp['quantidade'] * qtd_venda
-                        custo_componentes += (res[1] or 0.0) * comp['quantidade'] * qtd_venda
-
-                # Usar o preço promocional do Kit se definido (> 0), senão a soma dos componentes
-                valor_total = round((preco_kit_unit * qtd_venda) if preco_kit_unit > 0 else valor_componentes, 2)
-                custo_total = round((custo_kit_unit * qtd_venda) if custo_kit_unit > 0 else custo_componentes, 2)
-                lucro = round(valor_total - custo_total, 2)
-
-                # Se registrar_venda_row não foi especificado, só cria linha em vendas quando registrar_entrada=True
-                # (quando chamado pelo PDV com registrar_entrada=False, registrar_venda_detalhada já grava a linha na tabela vendas)
-                if registrar_venda_row is None:
-                    registrar_venda_row = bool(registrar_entrada)
-
-                # Baixa efetiva dos componentes
-                for comp in componentes:
-                    total_deduzir = comp['quantidade'] * qtd_venda
-                    cursor.execute(
-                        "UPDATE produtos SET quantidade = quantidade - ? WHERE nome = ?",
-                        (total_deduzir, comp['nome'])
-                    )
-
-                data_venda = datetime.datetime.now().isoformat()
-                if registrar_venda_row:
-                    caixa = self.caixa_aberto(usuario_id)
-                    caixa_id = caixa['id'] if caixa else None
-                    v_din = valor_total if forma_pagamento == "Dinheiro" else 0.0
-                    v_pix = valor_total if forma_pagamento == "PIX" else 0.0
-                    v_deb = valor_total if forma_pagamento == "Cartão Débito" else 0.0
-                    v_cred = valor_total if forma_pagamento == "Cartão Crédito" else 0.0
-                    v_fia = valor_total if forma_pagamento == "Fiado" else 0.0
-                    cursor.execute(
-                        """INSERT INTO vendas (
-                            produto_id, data_venda, quantidade, valor_total, lucro, forma_pagamento,
-                            cliente, status, desconto, caixa_id, valor_dinheiro, valor_pix,
-                            valor_cartao_debito, valor_cartao_credito, valor_fiado, formas_pagamento
-                        ) VALUES (NULL, ?, ?, ?, ?, ?, ?, 'Concluída', 0.0, ?, ?, ?, ?, ?, ?, ?)""",
-                        (data_venda, qtd_venda, valor_total, lucro, forma_pagamento,
-                         cliente, caixa_id, v_din, v_pix, v_deb, v_cred, v_fia, forma_pagamento)
-                    )
-                    venda_id = cursor.lastrowid
-                    if caixa_id:
-                        cursor.execute(
-                            """INSERT INTO auditoria_caixa (caixa_id, data_hora, tipo_operacao, venda_id, forma_pagamento, valor, descricao)
-                               VALUES (?, ?, 'VENDA', ?, ?, ?, ?)""",
-                            (caixa_id, data_venda, venda_id, forma_pagamento, valor_total, f"Venda Kit: {nome_kit}")
-                        )
-
-                if registrar_entrada:
-                    cursor.execute(
-                        "INSERT INTO entradas (data, valor, descricao) VALUES (?, ?, ?)",
-                        (data_venda[:10], valor_total, f"Venda Kit '{nome_kit}' (Qtd: {qtd_venda})")
-                    )
-
-                self.conn.commit()
-                self.registrar_alteracao("Venda Kit", f"Kit '{nome_kit}' (ID {kit_id}) vendido (Qtd: {qtd_venda}). Total: R$ {valor_total:.2f}")
-                return True, f"Venda de kit realizada com sucesso! Total: R$ {valor_total:.2f}"
-            except Exception as e:
-                self.conn.rollback()
-                logger.error("Erro ao vender kit: %s", e)
-                return False, str(e)
-
     def create_tables(self):
         cursor = self.conn.cursor()
         # Tabelas principais
@@ -2884,79 +2789,148 @@ class Database:
             return dict(zip(cols, row))
         return None
 
-    def fechar_comanda(self, comanda_id, forma_pagamento="Dinheiro", taxa_servico=0, desconto=0, observacao=""):
-        """Fecha a comanda, registra a venda vinculada ao caixa e libera a mesa."""
+    def fechar_comanda(self, comanda_id, forma_pagamento="Dinheiro", taxa_servico=0, desconto=0, observacao="", loja_id=None):
+        """Fecha a comanda, registra a venda vinculada ao caixa e libera a mesa (atômico + Decimal + loja_id)."""
+        from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+
+        centavos = Decimal("0.01")
+        cursor = self.conn.cursor()
+
+        # Fase 1: leitura e validação completa antes de qualquer escrita
+        comanda = self.get_comanda(comanda_id)
+        if not comanda:
+            return False, "Comanda não encontrada."
+        if comanda['status'] != 'aberta':
+            return False, "Comanda já está fechada."
+
         try:
-            cursor = self.conn.cursor()
-            comanda = self.get_comanda(comanda_id)
-            if not comanda:
-                return False, "Comanda não encontrada."
-            if comanda['status'] != 'aberta':
-                return False, "Comanda já está fechada."
+            subtotal_dec = Decimal(str(comanda['total'] if comanda.get('total') is not None else 0)).quantize(
+                centavos, rounding=ROUND_HALF_UP
+            )
+            taxa_dec = Decimal(str(taxa_servico if taxa_servico not in (None, "") else 0)).quantize(
+                centavos, rounding=ROUND_HALF_UP
+            )
+            desconto_dec = Decimal(str(desconto if desconto not in (None, "") else 0)).quantize(
+                centavos, rounding=ROUND_HALF_UP
+            )
+        except (InvalidOperation, ValueError):
+            return False, "Valores monetários inválidos para fechamento da comanda."
 
-            caixa_atual = self.caixa_aberto()
-            caixa_id = caixa_atual['id'] if caixa_atual else None
+        if not (subtotal_dec.is_finite() and taxa_dec.is_finite() and desconto_dec.is_finite()):
+            return False, "Valores monetários inválidos para fechamento da comanda."
+        if taxa_dec < Decimal("0.00") or desconto_dec < Decimal("0.00"):
+            return False, "Taxa de serviço e desconto não podem ser negativos."
 
-            data_fechamento = datetime.datetime.now().isoformat()
-            total_bruto = round(float(comanda['total'] or 0.0) + float(taxa_servico or 0.0), 2)
-            desconto = round(float(desconto or 0.0), 2)
-            total_final = round(total_bruto - desconto, 2)
+        caixa_atual = self.caixa_aberto(loja_id=loja_id)
+        caixa_id = caixa_atual['id'] if caixa_atual else None
 
-            cursor.execute("""UPDATE comandas SET status='fechada', data_fechamento=?, forma_pagamento=?,
-                             taxa_servico=?, desconto=?, total=?, observacao=? WHERE id=?""",
-                          (data_fechamento, forma_pagamento, taxa_servico, desconto, total_final, observacao, comanda_id))
+        # Fallback em 3 níveis para loja_id: explícito -> loja do caixa aberto -> loja padrão
+        if loja_id is not None:
+            loja_efetiva = int(loja_id)
+        elif caixa_atual and caixa_atual.get('loja_id') is not None:
+            loja_efetiva = int(caixa_atual['loja_id'])
+        else:
+            loja_efetiva = self._loja_padrao_id()
 
-            # Liberar a mesa
+        cursor.execute(
+            "SELECT produto_id, quantidade FROM comanda_itens WHERE comanda_id = ? ORDER BY data_hora",
+            (comanda_id,),
+        )
+        itens_lidos = cursor.fetchall()
+
+        custo_total_dec = Decimal("0.00")
+        for prod_id, qtd_item in itens_lidos:
+            cursor.execute("SELECT preco_compra FROM produtos WHERE id = ?", (prod_id,))
+            p_row = cursor.fetchone()
+            custo_unit = Decimal(str(p_row[0] or 0)) if p_row else Decimal("0.00")
+            custo_total_dec += custo_unit * Decimal(str(qtd_item or 0))
+
+        total_bruto_dec = (subtotal_dec + taxa_dec).quantize(centavos, rounding=ROUND_HALF_UP)
+        total_final_dec = max(total_bruto_dec - desconto_dec, Decimal("0.00")).quantize(
+            centavos, rounding=ROUND_HALF_UP
+        )
+        lucro_real_dec = (total_final_dec - custo_total_dec).quantize(centavos, rounding=ROUND_HALF_UP)
+
+        taxa_f = float(taxa_dec)
+        desc_f = float(desconto_dec)
+        total_bruto_f = float(total_bruto_dec)
+        total_final_f = float(total_final_dec)
+        lucro_real_f = float(lucro_real_dec)
+
+        v_din = total_final_f if forma_pagamento == "Dinheiro" else 0.0
+        v_pix = total_final_f if forma_pagamento == "PIX" else 0.0
+        v_deb = total_final_f if forma_pagamento == "Cartão Débito" else 0.0
+        v_cred = total_final_f if forma_pagamento == "Cartão Crédito" else 0.0
+        v_fia = total_final_f if forma_pagamento == "Fiado" else 0.0
+        data_fechamento = datetime.datetime.now().isoformat()
+
+        # Fase 2: escrita atômica com rollback em qualquer falha
+        try:
+            cursor.execute(
+                """UPDATE comandas SET status='fechada', data_fechamento=?, forma_pagamento=?,
+                   taxa_servico=?, desconto=?, total=?, observacao=? WHERE id=?""",
+                (data_fechamento, forma_pagamento, taxa_f, desc_f, total_final_f, observacao, comanda_id),
+            )
+
             if comanda['mesa_id']:
                 cursor.execute("UPDATE mesas SET status = 'livre' WHERE id = ?", (comanda['mesa_id'],))
 
-            # Baixar estoque dos itens e calcular custo real
-            itens = self.listar_itens_comanda(comanda_id)
-            custo_total_itens = 0.0
-            for _, item in itens.iterrows():
-                cursor.execute("SELECT preco_compra FROM produtos WHERE id = ?", (item['produto_id'],))
-                p_row = cursor.fetchone()
-                custo_unit = float(p_row[0] or 0.0) if p_row else 0.0
-                custo_total_itens += custo_unit * float(item['quantidade'])
-                cursor.execute("UPDATE produtos SET quantidade = MAX(0, quantidade - ?) WHERE id = ?",
-                              (item['quantidade'], item['produto_id']))
+            for prod_id, qtd_item in itens_lidos:
+                cursor.execute(
+                    "UPDATE produtos SET quantidade = MAX(0, quantidade - ?) WHERE id = ?",
+                    (qtd_item, prod_id),
+                )
 
-            lucro_real = round(total_final - custo_total_itens, 2)
-            v_din = total_final if forma_pagamento == "Dinheiro" else 0.0
-            v_pix = total_final if forma_pagamento == "PIX" else 0.0
-            v_deb = total_final if forma_pagamento == "Cartão Débito" else 0.0
-            v_cred = total_final if forma_pagamento == "Cartão Crédito" else 0.0
-            v_fia = total_final if forma_pagamento == "Fiado" else 0.0
-
-            # Registrar venda vinculada ao caixa_id e com colunas por forma de pagamento
             cursor.execute(
                 """INSERT INTO vendas (
                     quantidade, valor_total, data_venda, lucro, forma_pagamento, cliente, status, desconto, vendedor, caixa_id,
-                    valor_dinheiro, valor_pix, valor_cartao_debito, valor_cartao_credito, valor_fiado, formas_pagamento, transacao_id
-                ) VALUES (?, ?, ?, ?, ?, ?, 'Concluída', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (len(itens), total_bruto, data_fechamento, lucro_real, forma_pagamento,
-                 comanda.get('cliente', 'Consumidor Final'), desconto, comanda.get('garcom', ''), caixa_id,
-                 v_din, v_pix, v_deb, v_cred, v_fia, forma_pagamento, uuid.uuid4().hex[:12]))
+                    valor_dinheiro, valor_pix, valor_cartao_debito, valor_cartao_credito, valor_fiado, formas_pagamento, transacao_id, loja_id
+                ) VALUES (?, ?, ?, ?, ?, ?, 'Concluída', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    len(itens_lidos),
+                    total_bruto_f,
+                    data_fechamento,
+                    lucro_real_f,
+                    forma_pagamento,
+                    comanda.get('cliente', 'Consumidor Final'),
+                    desc_f,
+                    comanda.get('garcom', ''),
+                    caixa_id,
+                    v_din,
+                    v_pix,
+                    v_deb,
+                    v_cred,
+                    v_fia,
+                    forma_pagamento,
+                    uuid.uuid4().hex[:12],
+                    loja_efetiva,
+                ),
+            )
             venda_id = cursor.lastrowid
 
             if caixa_id:
                 cursor.execute(
                     """INSERT INTO auditoria_caixa (caixa_id, data_hora, tipo_operacao, venda_id, forma_pagamento, valor, descricao)
                        VALUES (?, ?, 'VENDA', ?, ?, ?, ?)""",
-                    (caixa_id, data_fechamento, venda_id, forma_pagamento, total_final, f"Comanda #{comanda_id}")
+                    (caixa_id, data_fechamento, venda_id, forma_pagamento, total_final_f, f"Comanda #{comanda_id}"),
                 )
 
-            # Registrar entrada financeira
-            cursor.execute("INSERT INTO entradas (data, valor, descricao) VALUES (?, ?, ?)",
-                          (data_fechamento[:10], total_final, f"Comanda #{comanda_id}"))
+            cursor.execute(
+                "INSERT INTO entradas (data, valor, descricao, loja_id) VALUES (?, ?, ?, ?)",
+                (data_fechamento[:10], total_final_f, f"Comanda #{comanda_id}", loja_efetiva),
+            )
 
             self.conn.commit()
-            self.registrar_alteracao("Fechar Comanda",
-                f"Comanda #{comanda_id} | Total: R$ {total_final:.2f} | Pgto: {forma_pagamento}")
-            return True, f"Comanda #{comanda_id} fechada. Total: R$ {total_final:.2f}"
         except Exception as e:
+            self.conn.rollback()
             logger.error("Erro ao fechar comanda: %s", e)
             return False, str(e)
+
+        self.registrar_alteracao(
+            "Fechar Comanda",
+            f"Comanda #{comanda_id} | Total: R$ {total_final_f:.2f} | Pgto: {forma_pagamento}",
+        )
+        return True, f"Comanda #{comanda_id} fechada. Total: R$ {total_final_f:.2f}"
 
     def listar_comandas_abertas(self):
         return pd.read_sql_query(

@@ -6646,7 +6646,6 @@ class App(ctk.CTk):
 
         # --- TAB CAIXA ---
         caixa_aberto = caixa_svc.caixa_aberto(user_id)
-        resumo_caixa = caixa_svc.resumo_caixa(usuario_id=user_id) if caixa_aberto else None
 
         status_frame = ctk.CTkFrame(tab_caixa, fg_color=("white", "#2B2B2B"), corner_radius=15)
         status_frame.pack(fill="x", padx=10, pady=10)
@@ -7514,6 +7513,9 @@ class App(ctk.CTk):
 
     def open_mesas_manager(self):
         """Gerencia mesas do restaurante com mapa visual."""
+        from services.restaurante_service import RestauranteService
+        rest_svc = RestauranteService(self.db)
+
         window = ctk.CTkToplevel(self)
         window.title("Gestão de Mesas")
         window.geometry("850x650")
@@ -7553,9 +7555,12 @@ class App(ctk.CTk):
             except ValueError:
                 cap = 4
             area = combo_area.get()
-            criadas = self.db.criar_mesas(qtd, cap, area)
-            messagebox.showinfo("Sucesso", f"{criadas} mesa(s) criada(s).", parent=window)
-            _refresh()
+            try:
+                criadas = rest_svc.criar_mesas(qtd, cap, area)
+                messagebox.showinfo("Sucesso", f"{criadas} mesa(s) criada(s).", parent=window)
+                _refresh()
+            except ValueError as err:
+                messagebox.showerror("Erro", str(err), parent=window)
 
         ctk.CTkButton(add_f, text="+ Criar", width=80, height=30, fg_color="#E07B56",
                       hover_color="#C4623E", text_color="white", font=("Aileron", 11, "bold"),
@@ -7574,14 +7579,20 @@ class App(ctk.CTk):
         def _refresh():
             for w in mesas_scroll.winfo_children():
                 w.destroy()
-            df = self.db.listar_mesas()
-            if df.empty:
+            mesas = rest_svc.listar_mesas()
+            if not mesas:
                 ctk.CTkLabel(mesas_scroll, text="Nenhuma mesa cadastrada.\nUse o botão '+ Criar' acima.",
                              font=("Aileron", 13), text_color="gray").pack(pady=40)
                 return
 
             # Agrupar por área
-            for area_nome in df['area'].unique():
+            areas_vistas = []
+            for m in mesas:
+                area_m = m.get('area') or 'Salão'
+                if area_m not in areas_vistas:
+                    areas_vistas.append(area_m)
+
+            for area_nome in areas_vistas:
                 area_label = ctk.CTkLabel(mesas_scroll, text=f"📍 {area_nome}",
                                           font=("Aileron", 13, "bold"), text_color=("#001D39", "white"))
                 area_label.pack(anchor="w", padx=10, pady=(10, 3))
@@ -7589,9 +7600,8 @@ class App(ctk.CTk):
                 area_frame = ctk.CTkFrame(mesas_scroll, fg_color="transparent")
                 area_frame.pack(fill="x", padx=10, pady=(0, 5))
 
-                area_mesas = df[df['area'] == area_nome]
-                col = 0
-                for _, mesa in area_mesas.iterrows():
+                area_mesas = [m for m in mesas if (m.get('area') or 'Salão') == area_nome]
+                for col, mesa in enumerate(area_mesas):
                     status = mesa['status']
                     cores = {"livre": "#28a745", "ocupada": "#FF6B6B", "reservada": "#FFD93D"}
                     cor = cores.get(status, "#888")
@@ -7627,27 +7637,27 @@ class App(ctk.CTk):
 
                     def _del_mesa(mid=mesa['id']):
                         if messagebox.askyesno("Confirmar", "Remover esta mesa?", parent=window):
-                            self.db.remover_mesa(mid)
+                            rest_svc.remover_mesa(mid)
                             _refresh()
                     ctk.CTkButton(btn_frame, text="✕", width=22, height=22, font=("Aileron", 9),
                                   fg_color="white", text_color="red", hover_color="#e0e0e0",
                                   command=_del_mesa).pack(side="left", padx=1)
-
-                    col += 1
 
         self._refresh_mesas = _refresh
         _refresh()
 
     def _abrir_comanda_mesa(self, mesa, parent_window=None):
         """Abre uma comanda para a mesa selecionada e abre o dialog de comanda."""
-        comanda_id = self.db.abrir_comanda(mesa_id=mesa['id'], tipo_atendimento="mesa")
+        from services.restaurante_service import RestauranteService
+        comanda_id = RestauranteService(self.db).abrir_comanda(mesa_id=mesa['id'], tipo_atendimento="mesa")
         if parent_window and hasattr(self, '_refresh_mesas'):
             self._refresh_mesas()
         self._open_comanda_editor(comanda_id)
 
     def _ver_comanda_mesa(self, mesa, parent_window=None):
         """Abre a comanda existente da mesa."""
-        comanda = self.db.get_comanda_por_mesa(mesa['id'])
+        from services.restaurante_service import RestauranteService
+        comanda = RestauranteService(self.db).get_comanda_por_mesa(mesa['id'])
         if comanda:
             self._open_comanda_editor(comanda['id'])
         else:
@@ -7657,6 +7667,9 @@ class App(ctk.CTk):
 
     def open_comandas_dialog(self):
         """Dialog principal de comandas — lista abertas e permite criar nova."""
+        from services.restaurante_service import RestauranteService
+        rest_svc = RestauranteService(self.db)
+
         window = ctk.CTkToplevel(self)
         window.title("Comandas")
         window.geometry("900x650")
@@ -7694,12 +7707,12 @@ class App(ctk.CTk):
         def _refresh():
             for w in scroll_abertas.winfo_children():
                 w.destroy()
-            df = self.db.listar_comandas_abertas()
-            if df.empty:
+            abertas = rest_svc.listar_comandas_abertas()
+            if not abertas:
                 ctk.CTkLabel(scroll_abertas, text="Nenhuma comanda aberta.", font=("Aileron", 13),
                              text_color="gray").pack(pady=30)
                 return
-            for _, c in df.iterrows():
+            for c in abertas:
                 card = ctk.CTkFrame(scroll_abertas, fg_color=("white", "#2B2B2B"), corner_radius=12)
                 card.pack(fill="x", padx=5, pady=4)
 
@@ -7708,7 +7721,8 @@ class App(ctk.CTk):
 
                 tipo_icons = {"mesa": "🍽️", "balcão": "🪑", "delivery": "🛵", "retirada": "📦"}
                 tipo_icon = tipo_icons.get(c['tipo_atendimento'], "📋")
-                mesa_txt = f" — Mesa {int(c['mesa_numero'])}" if pd.notna(c.get('mesa_numero')) else ""
+                mesa_num = c.get('mesa_numero')
+                mesa_txt = f" — Mesa {int(mesa_num)}" if (mesa_num is not None and not pd.isna(mesa_num)) else ""
                 ctk.CTkLabel(info, text=f"{tipo_icon} Comanda #{c['id']}{mesa_txt}",
                              font=("Aileron", 13, "bold"), text_color=("#001D39", "white")).pack(anchor="w")
                 hora = str(c['data_abertura'])[:16].replace('T', ' ')
@@ -7734,15 +7748,16 @@ class App(ctk.CTk):
         scroll_hist = ctk.CTkScrollableFrame(tab_historico, fg_color=("#F5F5F5", "#333333"), corner_radius=10)
         scroll_hist.pack(fill="both", expand=True)
 
-        df_hist = self.db.listar_comandas_historico(30)
-        if df_hist.empty:
+        hist = rest_svc.listar_comandas_historico(30)
+        if not hist:
             ctk.CTkLabel(scroll_hist, text="Nenhum registro.", font=("Aileron", 12), text_color="gray").pack(pady=30)
         else:
-            for _, c in df_hist.iterrows():
+            for c in hist:
                 card = ctk.CTkFrame(scroll_hist, fg_color=("white", "#2B2B2B"), corner_radius=10)
                 card.pack(fill="x", padx=5, pady=3)
                 status_cor = "#28a745" if c['status'] == 'fechada' else ("#FFD93D" if c['status'] == 'aberta' else "#FF6B6B")
-                mesa_txt = f" Mesa {int(c['mesa_numero'])}" if pd.notna(c.get('mesa_numero')) else f" {c['tipo_atendimento']}"
+                mesa_num = c.get('mesa_numero')
+                mesa_txt = f" Mesa {int(mesa_num)}" if (mesa_num is not None and not pd.isna(mesa_num)) else f" {c['tipo_atendimento']}"
                 dt_txt = str(c['data_abertura'])[:16].replace('T', ' ')
                 ctk.CTkLabel(card, text=f"#{c['id']} |{mesa_txt} | {dt_txt} | {c['cliente']} | R$ {c['total']:.2f}",
                              font=("Aileron", 11), text_color=("#333", "#CCC")).pack(anchor="w", padx=12, pady=6)
@@ -7751,13 +7766,17 @@ class App(ctk.CTk):
 
     def _nova_comanda_sem_mesa(self, tipo, parent_window, refresh_callback):
         """Cria comanda sem mesa (balcão/delivery/retirada)."""
-        comanda_id = self.db.abrir_comanda(mesa_id=None, tipo_atendimento=tipo)
+        from services.restaurante_service import RestauranteService
+        comanda_id = RestauranteService(self.db).abrir_comanda(mesa_id=None, tipo_atendimento=tipo)
         self._open_comanda_editor(comanda_id)
         parent_window.after(300, refresh_callback)
 
     def _open_comanda_editor(self, comanda_id):
         """Editor de comanda — adicionar itens, observações, ver total."""
-        comanda = self.db.get_comanda(comanda_id)
+        from services.restaurante_service import RestauranteService
+        rest_svc = RestauranteService(self.db)
+
+        comanda = rest_svc.get_comanda(comanda_id)
         if not comanda or comanda['status'] != 'aberta':
             messagebox.showinfo("Info", "Comanda não encontrada ou já fechada.")
             return
@@ -7778,10 +7797,9 @@ class App(ctk.CTk):
         tipo_icon = tipo_icons.get(comanda['tipo_atendimento'], "📋")
         mesa_txt = ""
         if comanda['mesa_id']:
-            df_mesas = self.db.listar_mesas()
-            mesa_row = df_mesas[df_mesas['id'] == comanda['mesa_id']]
-            if not mesa_row.empty:
-                mesa_txt = f" — Mesa {mesa_row.iloc[0]['numero']}"
+            mesas_lista = [m for m in rest_svc.listar_mesas() if m['id'] == comanda['mesa_id']]
+            if mesas_lista:
+                mesa_txt = f" — Mesa {mesas_lista[0]['numero']}"
 
         ctk.CTkLabel(main, text=f"{tipo_icon} Comanda #{comanda_id}{mesa_txt}",
                      font=("Aileron", 18, "bold"), text_color=("#001D39", "white")).grid(
@@ -7855,7 +7873,7 @@ class App(ctk.CTk):
                     except ValueError:
                         qtd = 1
                     obs = eo.get().strip()
-                    self.db.adicionar_item_comanda(comanda_id, prod['id'], prod['nome'], qtd, prod['preco'], obs)
+                    rest_svc.adicionar_item_comanda(comanda_id, prod['id'], prod['nome'], qtd, prod['preco'], obs)
                     _refresh_comanda()
 
                 ctk.CTkButton(action_f, text="+", width=28, height=24, fg_color="#E07B56",
@@ -7903,16 +7921,16 @@ class App(ctk.CTk):
         def _refresh_comanda():
             for w in itens_scroll.winfo_children():
                 w.destroy()
-            df_itens = self.db.listar_itens_comanda(comanda_id)
-            comanda_atualizada = self.db.get_comanda(comanda_id)
+            itens = rest_svc.listar_itens_comanda(comanda_id)
+            comanda_atualizada = rest_svc.get_comanda(comanda_id)
             total = comanda_atualizada['total'] if comanda_atualizada else 0
             lbl_total.configure(text=f"Total: R$ {total:.2f}")
 
-            if df_itens.empty:
+            if not itens:
                 ctk.CTkLabel(itens_scroll, text="Nenhum item adicionado.", text_color="gray").pack(pady=20)
                 return
 
-            for _, item in df_itens.iterrows():
+            for item in itens:
                 item_card = ctk.CTkFrame(itens_scroll, fg_color=("white", "#404040"), corner_radius=8)
                 item_card.pack(fill="x", padx=3, pady=2)
 
@@ -7946,18 +7964,21 @@ class App(ctk.CTk):
                                   font=("Aileron", 8), fg_color=status_cores.get(next_status, "#888"),
                                   text_color="white", hover_color="#49769F",
                                   command=lambda iid=item['id'], ns=next_status: [
-                                      self.db.atualizar_status_item_comanda(iid, ns), _refresh_comanda()]).pack(pady=1)
+                                      rest_svc.atualizar_status_item_comanda(iid, ns), _refresh_comanda()]).pack(pady=1)
 
                 ctk.CTkButton(act_f, text="✕", width=25, height=20, fg_color="#FF6B6B",
                               text_color="white", hover_color="#FF5252", font=("Aileron", 9),
                               command=lambda iid=item['id']: [
-                                  self.db.remover_item_comanda(iid), _refresh_comanda()]).pack(pady=1)
+                                  rest_svc.remover_item_comanda(iid), _refresh_comanda()]).pack(pady=1)
 
         _refresh_comanda()
 
     def _fechar_comanda_dialog(self, comanda_id):
         """Dialog para fechar comanda com forma de pagamento, taxa e desconto."""
-        comanda = self.db.get_comanda(comanda_id)
+        from services.restaurante_service import RestauranteService
+        rest_svc = RestauranteService(self.db)
+
+        comanda = rest_svc.get_comanda(comanda_id)
         if not comanda or comanda['status'] != 'aberta':
             messagebox.showinfo("Info", "Comanda não encontrada ou já fechada.")
             return
@@ -7977,8 +7998,8 @@ class App(ctk.CTk):
         ctk.CTkLabel(frame, text=f"Subtotal: R$ {subtotal:.2f}", font=("Aileron", 14),
                      text_color=("#001D39", "white")).pack(pady=5)
 
-        # Taxa de serviço (10%)
-        taxa_10 = round(subtotal * 0.10, 2)
+        # Taxa de serviço (10% opcional)
+        taxa_10 = float(RestauranteService.calcular_taxa_10(subtotal))
         var_taxa = ctk.BooleanVar(value=False)
         chk_taxa = ctk.CTkCheckBox(frame, text=f"Taxa de serviço 10% (R$ {taxa_10:.2f})",
                                      variable=var_taxa, font=("Aileron", 12))
@@ -8019,14 +8040,15 @@ class App(ctk.CTk):
         e_desc.bind("<KeyRelease>", _recalc)
 
         def _confirmar():
-            from services.servico_service import ServicoService
+            loja_id_ativa = self.current_user.get("loja_id") if self.current_user else None
             try:
-                res = ServicoService(self.db).fechar_comanda(
+                res = rest_svc.fechar_comanda(
                     comanda_id=comanda_id,
                     forma_pagamento=var_pgto.get(),
                     aplicar_taxa_10=bool(var_taxa.get()),
                     desconto=e_desc.get(),
                     observacao=e_obs.get(),
+                    loja_id=loja_id_ativa,
                 )
                 messagebox.showinfo("Sucesso", res["mensagem"], parent=dialog)
                 dialog.destroy()
@@ -8041,7 +8063,10 @@ class App(ctk.CTk):
 
     def _dividir_conta_dialog(self, comanda_id):
         """Dialog para dividir a conta."""
-        comanda = self.db.get_comanda(comanda_id)
+        from services.restaurante_service import RestauranteService
+        rest_svc = RestauranteService(self.db)
+
+        comanda = rest_svc.get_comanda(comanda_id)
         if not comanda:
             return
 
@@ -8070,9 +8095,8 @@ class App(ctk.CTk):
 
         def _calc(*_):
             from collections import Counter
-            from services.servico_service import ServicoService
             try:
-                resultado = ServicoService(self.db).dividir_conta(comanda_id, e_pessoas.get())
+                resultado = rest_svc.dividir_conta(comanda_id, e_pessoas.get())
                 partes = resultado.get("partes") or []
                 if partes:
                     contagem = Counter(partes)
@@ -8093,6 +8117,9 @@ class App(ctk.CTk):
 
     def open_cozinha_dialog(self):
         """Painel da cozinha — mostra pedidos pendentes para preparar."""
+        from services.restaurante_service import RestauranteService
+        rest_svc = RestauranteService(self.db)
+
         window = ctk.CTkToplevel(self)
         window.title("🍳 Painel da Cozinha")
         window.geometry("900x600")
@@ -8136,13 +8163,13 @@ class App(ctk.CTk):
                 for w in scroll.winfo_children():
                     w.destroy()
 
-            df = self.db.itens_cozinha_pendentes()
-            if df.empty:
+            itens = rest_svc.itens_cozinha_pendentes()
+            if not itens:
                 ctk.CTkLabel(col_scrolls["Recebido"], text="Nenhum pedido pendente! 🎉",
                              font=("Aileron", 12), text_color="gray").pack(pady=30)
                 return
 
-            for _, item in df.iterrows():
+            for item in itens:
                 status = item['status']
                 if status not in col_scrolls:
                     continue
@@ -8151,7 +8178,12 @@ class App(ctk.CTk):
                 card = ctk.CTkFrame(scroll, fg_color=("white", "#404040"), corner_radius=10)
                 card.pack(fill="x", padx=5, pady=4)
 
-                mesa_txt = f"Mesa {int(item['mesa_numero'])}" if pd.notna(item.get('mesa_numero')) else item['tipo_atendimento'].capitalize()
+                mesa_num = item.get('mesa_numero')
+                mesa_txt = (
+                    f"Mesa {int(mesa_num)}"
+                    if (mesa_num is not None and not pd.isna(mesa_num))
+                    else str(item.get('tipo_atendimento') or '').capitalize()
+                )
                 ctk.CTkLabel(card, text=f"📍 {mesa_txt}", font=("Aileron", 9, "bold"),
                              text_color=("#888", "#AAA")).pack(anchor="w", padx=10, pady=(6, 0))
                 ctk.CTkLabel(card, text=f"{item['quantidade']}x {item['produto_nome']}",
@@ -8171,7 +8203,7 @@ class App(ctk.CTk):
                     ctk.CTkButton(card, text=f"→ {next_st}", height=26, fg_color=cor_btn,
                                   text_color="white", hover_color="#49769F", font=("Aileron", 10, "bold"),
                                   command=lambda iid=item['id'], ns=next_st: [
-                                      self.db.atualizar_status_item_comanda(iid, ns), _refresh()]).pack(
+                                      rest_svc.atualizar_status_item_comanda(iid, ns), _refresh()]).pack(
                         fill="x", padx=10, pady=(3, 8))
 
         _refresh()
