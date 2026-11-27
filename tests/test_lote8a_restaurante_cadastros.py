@@ -229,3 +229,102 @@ def test_servico_service_delega_restaurante_e_preserva_dividir_conta(db):
     res = serv_svc.fechar_comanda(cid, forma_pagamento="PIX", aplicar_taxa_10=True, loja_id=1)
     assert res["taxa_servico"] == pytest.approx(10.00)
     assert res["total_final"] == pytest.approx(110.00)
+
+
+# ==================== CadastroService: AST + CRUD Completo ====================
+
+def test_cadastro_service_sem_imports_ui():
+    caminho = Path(RAIZ) / "services" / "cadastro_service.py"
+    arvore = ast.parse(caminho.read_text(encoding="utf-8"))
+    proibidos = {"tkinter", "customtkinter", "tkcalendar", "matplotlib", "webview"}
+    for no in ast.walk(arvore):
+        if isinstance(no, ast.Import):
+            nomes = [a.name for a in no.names]
+        elif isinstance(no, ast.ImportFrom):
+            nomes = [no.module or ""]
+        else:
+            continue
+        for n in nomes:
+            assert n.split(".")[0] not in proibidos, f"Import proibido em cadastro_service.py: {n}"
+
+
+def test_cadastro_service_clientes_cpf_fornecedores_categorias(db):
+    from services.cadastro_service import CadastroService
+
+    cad = CadastroService(db)
+
+    # Cliente com CPF válido e rejeição de CPF inválido
+    cid = cad.adicionar_cliente("Maria Clara", "11988887777", "VIP", cpf_cnpj="52998224725")
+    assert cid > 0
+    clientes = cad.listar_clientes()
+    assert any(c["id"] == cid and c["cpf_cnpj"] == "52998224725" for c in clientes)
+    with pytest.raises(ValueError, match="CPF inválido"):
+        cad.adicionar_cliente("Inválido", "", "", cpf_cnpj="11111111111")
+    cad.atualizar_cliente(cid, "Maria Clara Editada", "11977776666", "Obs", cpf_cnpj="52998224725")
+    assert any(c["nome"] == "Maria Clara Editada" for c in cad.listar_clientes())
+    cad.remover_cliente(cid)
+    assert not any(c["id"] == cid for c in cad.listar_clientes())
+
+    # Fornecedor
+    cad.adicionar_fornecedor("Distribuidora Alfa", "1133334444", "Bebidas")
+    forns = cad.listar_fornecedores()
+    assert len(forns) == 1 and forns[0]["nome"] == "Distribuidora Alfa"
+    cad.remover_fornecedor(forns[0]["id"])
+    assert cad.listar_fornecedores() == []
+
+    # Categorias hierárquicas
+    assert cad.adicionar_categoria("Moda", tipo="produto") is True
+    assert "Moda" in cad.listar_categorias("produto")
+    assert cad.adicionar_subcategoria("Moda", "Camisas", tipo="produto") is True
+    assert cad.listar_subcategorias("Moda", "produto") == ["Camisas"]
+    assert cad.adicionar_tamanho("Moda", "Camisas", "M", tipo="produto") is True
+    assert cad.listar_tamanhos("Moda", "Camisas", "produto") == ["M"]
+    assert cad.adicionar_sub_subcategoria("Moda", "Camisas", "Algodão", tipo="produto") is True
+    assert cad.listar_sub_subcategorias("Moda", "Camisas", "produto") == ["Algodão"]
+    cad.remover_categoria("Moda", "produto")
+
+
+def test_cadastro_service_vendedores_estabelecimento_lojas_usuarios(db):
+    from services.cadastro_service import CadastroService
+
+    cad = CadastroService(db)
+
+    # Vendedores (comissão em Decimal)
+    cad.adicionar_vendedor("João Vendedor", "00:00", "23:59", "3,505")
+    vends = cad.listar_vendedores()
+    assert len(vends) == 1
+    assert vends[0]["comissao"] == pytest.approx(3.51)
+    assert cad.vendedor_no_turno() == "João Vendedor"
+    cad.remover_vendedor(vends[0]["id"])
+    assert cad.listar_vendedores() == []
+
+    # Estabelecimento
+    cad.adicionar_tarefa_estabelecimento("Cozinha", "Higienizar chapa", "Alta")
+    tarefas = cad.listar_tarefas_estabelecimento()
+    assert len(tarefas) == 1
+    cad.atualizar_status_estabelecimento(tarefas[0]["id"], "Concluído")
+    assert cad.listar_tarefas_estabelecimento()[0]["status"] == "Concluído"
+    cad.remover_tarefa_estabelecimento(tarefas[0]["id"])
+    assert cad.listar_tarefas_estabelecimento() == []
+
+    # Lojas
+    lid = cad.adicionar_loja("Filial Sul", "Av. Brasil, 200", "1140005000", "12345678000199")
+    assert any(l["id"] == lid and l["nome"] == "Filial Sul" for l in cad.listar_lojas())
+    cad.atualizar_loja(lid, "Filial Sul 2", "Av. Brasil, 201", "1140005000", "12345678000199")
+    assert any(l["nome"] == "Filial Sul 2" for l in cad.listar_lojas())
+    cad.remover_loja(lid)
+    assert not any(l["id"] == lid for l in cad.listar_lojas())
+
+    # Usuários (hash PBKDF2 continua no db; senha nunca em texto claro)
+    senha_teste = "Teste@2026#Seguro"
+    ok, msg = cad.adicionar_usuario("Operador Teste", "op_8a", senha_teste, perfil="caixa", loja_id=1)
+    assert ok is True, msg
+    row_hash = db.conn.execute("SELECT senha_hash FROM usuarios WHERE login = 'op_8a'").fetchone()[0]
+    assert senha_teste not in row_hash
+    assert row_hash.startswith(("scrypt:", "pbkdf2_", "pbkdf2:"))
+    uid = [u["id"] for u in cad.listar_usuarios() if u["login"] == "op_8a"][0]
+    cad.alterar_senha_usuario(uid, "Nova@2026#Seguro")
+    assert db.autenticar_usuario("op_8a", "Nova@2026#Seguro") is not None
+    cad.remover_usuario(uid)
+    assert db.autenticar_usuario("op_8a", "Nova@2026#Seguro") is None
+

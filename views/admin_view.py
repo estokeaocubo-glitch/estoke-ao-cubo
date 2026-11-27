@@ -177,6 +177,9 @@ class AdminView:
         return window
 
     def open_lojas_dialog(self) -> ctk.CTkToplevel:
+        from services.cadastro_service import CadastroService
+        cad_svc = CadastroService(self.db)
+
         window = self._new_dialog("Gestão de Lojas/Filiais", "650x500")
 
         main_f = ctk.CTkFrame(window, fg_color="transparent")
@@ -205,8 +208,7 @@ class AdminView:
         def _refresh():
             for i in tree.get_children():
                 tree.delete(i)
-            df = self.db.listar_lojas()
-            for _, row in df.iterrows():
+            for row in cad_svc.listar_lojas():
                 tree.insert(
                     "",
                     "end",
@@ -232,16 +234,16 @@ class AdminView:
         btn_f.pack(fill="x", padx=15, pady=(0, 10))
 
         def _add():
-            nome = entries["nome"].get().strip()
-            if not nome:
-                messagebox.showerror("Erro", "Nome obrigatório.", parent=window)
+            try:
+                cad_svc.adicionar_loja(
+                    entries["nome"].get(),
+                    entries["end"].get(),
+                    entries["tel"].get(),
+                    entries["cnpj"].get(),
+                )
+            except ValueError as err:
+                messagebox.showerror("Erro", str(err), parent=window)
                 return
-            self.db.adicionar_loja(
-                nome,
-                entries["end"].get().strip(),
-                entries["tel"].get().strip(),
-                entries["cnpj"].get().strip(),
-            )
             for e in entries.values():
                 e.delete(0, "end")
             _refresh()
@@ -252,7 +254,7 @@ class AdminView:
                 return
             lid = tree.item(sel[0])["values"][0]
             if messagebox.askyesno("Confirmar", "Desativar esta loja?", parent=window):
-                self.db.remover_loja(lid)
+                cad_svc.remover_loja(lid)
                 _refresh()
 
         ctk.CTkButton(
@@ -280,6 +282,9 @@ class AdminView:
         return window
 
     def open_usuarios_dialog(self) -> ctk.CTkToplevel:
+        from services.cadastro_service import CadastroService
+        cad_svc = CadastroService(self.db)
+
         window = self._new_dialog("Gestão de Usuários", "800x600")
 
         tabview = ctk.CTkTabview(window, fg_color=("white", "#2B2B2B"))
@@ -305,8 +310,7 @@ class AdminView:
         def _refresh():
             for i in tree.get_children():
                 tree.delete(i)
-            df = self.db.listar_usuarios()
-            for _, row in df.iterrows():
+            for row in cad_svc.listar_usuarios():
                 tree.insert(
                     "",
                     "end",
@@ -329,7 +333,7 @@ class AdminView:
                 return
             uid = tree.item(sel[0])["values"][0]
             if messagebox.askyesno("Confirmar", "Desativar este usuário?", parent=window):
-                self.db.remover_usuario(uid)
+                cad_svc.remover_usuario(uid)
                 _refresh()
 
         def _alterar_senha():
@@ -350,11 +354,11 @@ class AdminView:
             e_pw.pack(padx=20, fill="x")
 
             def _save():
-                pw = e_pw.get().strip()
-                if len(pw) < 4:
-                    messagebox.showerror("Erro", "Senha deve ter 4+ caracteres.", parent=dlg)
+                try:
+                    cad_svc.alterar_senha_usuario(uid, e_pw.get())
+                except ValueError as err:
+                    messagebox.showerror("Erro", str(err), parent=dlg)
                     return
-                self.db.alterar_senha_usuario(uid, pw)
                 messagebox.showinfo("Sucesso", "Senha alterada!", parent=dlg)
                 dlg.destroy()
 
@@ -420,8 +424,8 @@ class AdminView:
         ctk.CTkLabel(fields_frame, text="Loja:", font=("Aileron", 11)).grid(
             row=4, column=0, sticky="w", padx=5, pady=8
         )
-        df_lojas = self.db.listar_lojas()
-        loja_nomes = ["Todas"] + df_lojas["nome"].tolist() if not df_lojas.empty else ["Todas"]
+        lojas_lista = cad_svc.listar_lojas()
+        loja_nomes = ["Todas"] + [l["nome"] for l in lojas_lista] if lojas_lista else ["Todas"]
         loja_var = ctk.StringVar(value="Todas")
         ctk.CTkOptionMenu(fields_frame, values=loja_nomes, variable=loja_var, height=35).grid(
             row=4, column=1, sticky="ew", padx=5, pady=8
@@ -443,24 +447,23 @@ class AdminView:
         ).pack(padx=15, pady=(0, 10), anchor="w")
 
         def _criar_usuario():
-            nome = entries_u["nome"].get().strip()
-            login = entries_u["login"].get().strip()
-            senha = entries_u["senha"].get().strip()
-            if not nome or not login or not senha:
-                messagebox.showerror("Erro", "Preencha todos os campos.", parent=window)
-                return
-            if len(senha) < 4:
-                messagebox.showerror("Erro", "Senha deve ter 4+ caracteres.", parent=window)
-                return
-            perfil = perfil_var.get()
-
             loja_id = None
-            if loja_var.get() != "Todas" and not df_lojas.empty:
-                match = df_lojas[df_lojas["nome"] == loja_var.get()]
-                if not match.empty:
-                    loja_id = int(match.iloc[0]["id"])
-
-            ok, msg = self.db.adicionar_usuario(nome, login, senha, perfil, loja_id)
+            if loja_var.get() != "Todas" and lojas_lista:
+                for l in lojas_lista:
+                    if l["nome"] == loja_var.get():
+                        loja_id = int(l["id"])
+                        break
+            try:
+                ok, msg = cad_svc.adicionar_usuario(
+                    entries_u["nome"].get(),
+                    entries_u["login"].get(),
+                    entries_u["senha"].get(),
+                    perfil_var.get(),
+                    loja_id,
+                )
+            except ValueError as err:
+                messagebox.showerror("Erro", str(err), parent=window)
+                return
             if ok:
                 messagebox.showinfo("Sucesso", msg, parent=window)
                 for e in entries_u.values():
