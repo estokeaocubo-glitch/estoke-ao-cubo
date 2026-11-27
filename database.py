@@ -359,6 +359,7 @@ class Database:
                 """, (kit_id, item['nome'], item['quantidade']))
             self.conn.commit()
             self.registrar_alteracao("Adicionar Kit", f"Kit '{nome}' criado com {len(itens)} componentes.")
+            return kit_id
 
     def listar_kits(self):
         try:
@@ -1776,22 +1777,27 @@ class Database:
         return pd.read_sql_query("SELECT * FROM produtos WHERE tipo_produto != 'insumo'", self.conn)
 
     def registrar_baixa_insumo(self, insumo_id, quantidade, motivo="Uso diário"):
-        """Registra baixa manual de insumo e atualiza estoque."""
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT nome, quantidade FROM produtos WHERE id=? AND tipo_produto='insumo'", (insumo_id,))
-        row = cursor.fetchone()
-        if not row:
-            return False, "Insumo não encontrado."
-        nome, qtd_atual = row
-        if quantidade > qtd_atual:
-            return False, f"Estoque insuficiente. Disponível: {qtd_atual}"
-        data = datetime.date.today().isoformat()
-        cursor.execute("INSERT INTO baixa_insumos (insumo_id, quantidade, data, motivo) VALUES (?, ?, ?, ?)",
-                       (insumo_id, quantidade, data, motivo))
-        cursor.execute("UPDATE produtos SET quantidade = quantidade - ? WHERE id=?", (quantidade, insumo_id))
-        self.conn.commit()
-        self.registrar_alteracao("Baixa Insumo", f"{quantidade} de '{nome}' usado ({motivo})")
-        return True, f"Baixa de {quantidade} de '{nome}' registrada."
+        """Registra baixa manual de insumo e atualiza estoque (atômico: _lock + rollback)."""
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute("SELECT nome, quantidade FROM produtos WHERE id=? AND tipo_produto='insumo'", (insumo_id,))
+            row = cursor.fetchone()
+            if not row:
+                return False, "Insumo não encontrado."
+            nome, qtd_atual = row
+            if quantidade > qtd_atual:
+                return False, f"Estoque insuficiente. Disponível: {qtd_atual}"
+            data = datetime.date.today().isoformat()
+            try:
+                cursor.execute("INSERT INTO baixa_insumos (insumo_id, quantidade, data, motivo) VALUES (?, ?, ?, ?)",
+                               (insumo_id, quantidade, data, motivo))
+                cursor.execute("UPDATE produtos SET quantidade = quantidade - ? WHERE id=?", (quantidade, insumo_id))
+                self.conn.commit()
+            except Exception:
+                self.conn.rollback()
+                raise
+            self.registrar_alteracao("Baixa Insumo", f"{quantidade} de '{nome}' usado ({motivo})")
+            return True, f"Baixa de {quantidade} de '{nome}' registrada."
 
     def listar_baixas_insumos(self, dias=30):
         """Retorna baixas de insumos dos últimos N dias."""
@@ -1806,16 +1812,21 @@ class Database:
     def adicionar_ficha_tecnica(self, produto_id, nome, rendimento, itens):
         """Cria uma ficha técnica vinculando insumos a um produto final.
         itens: lista de dicts {'insumo_id': int, 'quantidade': float}"""
-        cursor = self.conn.cursor()
-        cursor.execute("INSERT INTO fichas_tecnicas (produto_id, nome, rendimento) VALUES (?, ?, ?)",
-                       (produto_id, nome, rendimento))
-        ficha_id = cursor.lastrowid
-        for item in itens:
-            cursor.execute("INSERT INTO ficha_tecnica_itens (ficha_id, insumo_id, quantidade) VALUES (?, ?, ?)",
-                           (ficha_id, item['insumo_id'], item['quantidade']))
-        self.conn.commit()
-        self.registrar_alteracao("Ficha Técnica", f"Ficha '{nome}' criada para produto ID {produto_id}")
-        return ficha_id
+        with self._lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute("INSERT INTO fichas_tecnicas (produto_id, nome, rendimento) VALUES (?, ?, ?)",
+                               (produto_id, nome, rendimento))
+                ficha_id = cursor.lastrowid
+                for item in itens:
+                    cursor.execute("INSERT INTO ficha_tecnica_itens (ficha_id, insumo_id, quantidade) VALUES (?, ?, ?)",
+                                   (ficha_id, item['insumo_id'], item['quantidade']))
+                self.conn.commit()
+            except Exception:
+                self.conn.rollback()
+                raise
+            self.registrar_alteracao("Ficha Técnica", f"Ficha '{nome}' criada para produto ID {produto_id}")
+            return ficha_id
 
     def listar_fichas_tecnicas(self):
         """Retorna todas as fichas técnicas com nome do produto."""
@@ -1834,58 +1845,71 @@ class Database:
 
     def remover_ficha_tecnica(self, ficha_id):
         """Remove uma ficha técnica e seus itens."""
-        cursor = self.conn.cursor()
-        cursor.execute("DELETE FROM fichas_tecnicas WHERE id=?", (ficha_id,))
-        self.conn.commit()
-        self.registrar_alteracao("Remover Ficha", f"Ficha ID {ficha_id} removida")
+        with self._lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute("DELETE FROM fichas_tecnicas WHERE id=?", (ficha_id,))
+                self.conn.commit()
+            except Exception:
+                self.conn.rollback()
+                raise
+            self.registrar_alteracao("Remover Ficha", f"Ficha ID {ficha_id} removida")
 
     # ==================== PRODUÇÃO DIÁRIA ====================
 
     def registrar_producao(self, ficha_id, quantidade_produzida, observacao=""):
-        """Registra produção: dá entrada no produto final e baixa nos insumos."""
-        cursor = self.conn.cursor()
-        # Buscar dados da ficha
-        cursor.execute("SELECT produto_id, rendimento FROM fichas_tecnicas WHERE id=?", (ficha_id,))
-        ficha = cursor.fetchone()
-        if not ficha:
-            return False, "Ficha técnica não encontrada."
-        produto_id, rendimento = ficha
+        """Registra produção: dá entrada no produto final e baixa nos insumos.
 
-        # Buscar itens da ficha
-        cursor.execute("SELECT insumo_id, quantidade FROM ficha_tecnica_itens WHERE ficha_id=?", (ficha_id,))
-        itens = cursor.fetchall()
+        Atômico (Lote 7): checa todos os insumos antes de escrever; _lock + rollback.
+        """
+        with self._lock:
+            cursor = self.conn.cursor()
+            # Buscar dados da ficha
+            cursor.execute("SELECT produto_id, rendimento FROM fichas_tecnicas WHERE id=?", (ficha_id,))
+            ficha = cursor.fetchone()
+            if not ficha:
+                return False, "Ficha técnica não encontrada."
+            produto_id, rendimento = ficha
 
-        # Calcular multiplicador (quantas vezes a receita)
-        multiplicador = quantidade_produzida / rendimento if rendimento > 0 else quantidade_produzida
+            # Buscar itens da ficha
+            cursor.execute("SELECT insumo_id, quantidade FROM ficha_tecnica_itens WHERE ficha_id=?", (ficha_id,))
+            itens = cursor.fetchall()
 
-        # Verificar estoque dos insumos
-        for insumo_id, qtd_base in itens:
-            qtd_necessaria = qtd_base * multiplicador
-            cursor.execute("SELECT nome, quantidade FROM produtos WHERE id=?", (insumo_id,))
-            ins = cursor.fetchone()
-            if not ins:
-                return False, f"Insumo ID {insumo_id} não encontrado."
-            if ins[1] < qtd_necessaria:
-                return False, f"Insumo '{ins[0]}' insuficiente. Precisa: {qtd_necessaria:.2f}, Tem: {ins[1]}"
+            # Calcular multiplicador (quantas vezes a receita)
+            multiplicador = quantidade_produzida / rendimento if rendimento > 0 else quantidade_produzida
 
-        # Dar baixa nos insumos
-        for insumo_id, qtd_base in itens:
-            qtd_necessaria = qtd_base * multiplicador
-            cursor.execute("UPDATE produtos SET quantidade = quantidade - ? WHERE id=?", (qtd_necessaria, insumo_id))
+            # Verificar estoque dos insumos
+            for insumo_id, qtd_base in itens:
+                qtd_necessaria = qtd_base * multiplicador
+                cursor.execute("SELECT nome, quantidade FROM produtos WHERE id=?", (insumo_id,))
+                ins = cursor.fetchone()
+                if not ins:
+                    return False, f"Insumo ID {insumo_id} não encontrado."
+                if ins[1] < qtd_necessaria:
+                    return False, f"Insumo '{ins[0]}' insuficiente. Precisa: {qtd_necessaria:.2f}, Tem: {ins[1]}"
 
-        # Dar entrada no produto final
-        cursor.execute("UPDATE produtos SET quantidade = quantidade + ? WHERE id=?", (quantidade_produzida, produto_id))
+            try:
+                # Dar baixa nos insumos
+                for insumo_id, qtd_base in itens:
+                    qtd_necessaria = qtd_base * multiplicador
+                    cursor.execute("UPDATE produtos SET quantidade = quantidade - ? WHERE id=?", (qtd_necessaria, insumo_id))
 
-        # Registrar produção
-        data = datetime.date.today().isoformat()
-        cursor.execute("INSERT INTO producao_diaria (ficha_id, quantidade_produzida, data, observacao) VALUES (?, ?, ?, ?)",
-                       (ficha_id, quantidade_produzida, data, observacao))
-        self.conn.commit()
+                # Dar entrada no produto final
+                cursor.execute("UPDATE produtos SET quantidade = quantidade + ? WHERE id=?", (quantidade_produzida, produto_id))
 
-        cursor.execute("SELECT nome FROM produtos WHERE id=?", (produto_id,))
-        prod_nome = cursor.fetchone()[0]
-        self.registrar_alteracao("Produção", f"{quantidade_produzida}un de '{prod_nome}' produzidos (Ficha ID {ficha_id})")
-        return True, f"{quantidade_produzida} unidades de '{prod_nome}' produzidas com sucesso!"
+                # Registrar produção
+                data = datetime.date.today().isoformat()
+                cursor.execute("INSERT INTO producao_diaria (ficha_id, quantidade_produzida, data, observacao) VALUES (?, ?, ?, ?)",
+                               (ficha_id, quantidade_produzida, data, observacao))
+                self.conn.commit()
+            except Exception:
+                self.conn.rollback()
+                raise
+
+            cursor.execute("SELECT nome FROM produtos WHERE id=?", (produto_id,))
+            prod_nome = cursor.fetchone()[0]
+            self.registrar_alteracao("Produção", f"{quantidade_produzida}un de '{prod_nome}' produzidos (Ficha ID {ficha_id})")
+            return True, f"{quantidade_produzida} unidades de '{prod_nome}' produzidas com sucesso!"
 
     def listar_producoes(self, dias=30):
         """Retorna produções dos últimos N dias."""
@@ -1900,50 +1924,66 @@ class Database:
 
     # ==================== TROCAS / DEVOLUÇÕES ====================
 
-    def registrar_troca(self, cliente, prod_devolvido_id, qtd_devolvida, prod_novo_id=None, qtd_nova=0, diferenca=0.0, tipo='troca', obs=""):
-        """Registra troca/devolução. Ajusta estoque de ambos os produtos."""
-        cursor = self.conn.cursor()
-        data = datetime.datetime.now().isoformat()
+    def registrar_troca(self, cliente, prod_devolvido_id, qtd_devolvida, prod_novo_id=None, qtd_nova=0, diferenca=0.0, tipo='troca', obs="", loja_id=None):
+        """Registra troca/devolução. Ajusta estoque de ambos os produtos.
 
-        # Nome do produto devolvido
-        cursor.execute("SELECT nome FROM produtos WHERE id=?", (prod_devolvido_id,))
-        dev_row = cursor.fetchone()
-        dev_nome = dev_row[0] if dev_row else "Desconhecido"
+        Lote 7: checa o produto novo ANTES de qualquer escrita (antes, a devolução ao estoque
+        ficava pendente na conexão quando o produto novo faltava) e grava tudo numa transação
+        com _lock + rollback. O lançamento financeiro da diferença leva loja_id
+        (None = loja padrão).
+        """
+        with self._lock:
+            cursor = self.conn.cursor()
+            data = datetime.datetime.now().isoformat()
 
-        # Devolver ao estoque
-        cursor.execute("UPDATE produtos SET quantidade = quantidade + ? WHERE id=?", (qtd_devolvida, prod_devolvido_id))
+            # Nome do produto devolvido
+            cursor.execute("SELECT nome FROM produtos WHERE id=?", (prod_devolvido_id,))
+            dev_row = cursor.fetchone()
+            dev_nome = dev_row[0] if dev_row else "Desconhecido"
 
-        novo_nome = ""
-        if tipo == 'troca' and prod_novo_id and qtd_nova > 0:
-            # Verificar estoque do produto novo
-            cursor.execute("SELECT nome, quantidade FROM produtos WHERE id=?", (prod_novo_id,))
-            novo_row = cursor.fetchone()
-            if not novo_row:
-                return False, "Produto novo não encontrado."
-            novo_nome = novo_row[0]
-            if novo_row[1] < qtd_nova:
-                return False, f"Estoque insuficiente do produto novo. Disponível: {novo_row[1]}"
-            cursor.execute("UPDATE produtos SET quantidade = quantidade - ? WHERE id=?", (qtd_nova, prod_novo_id))
+            novo_nome = ""
+            baixar_novo = tipo == 'troca' and prod_novo_id and qtd_nova > 0
+            if baixar_novo:
+                # Verificar estoque do produto novo (antes de escrever qualquer coisa)
+                cursor.execute("SELECT nome, quantidade FROM produtos WHERE id=?", (prod_novo_id,))
+                novo_row = cursor.fetchone()
+                if not novo_row:
+                    return False, "Produto novo não encontrado."
+                novo_nome = novo_row[0]
+                if novo_row[1] < qtd_nova:
+                    return False, f"Estoque insuficiente do produto novo. Disponível: {novo_row[1]}"
 
-        cursor.execute("""INSERT INTO trocas_devolucoes 
-                         (data, cliente, produto_devolvido_id, produto_devolvido_nome, qtd_devolvida,
-                          produto_novo_id, produto_novo_nome, qtd_nova, diferenca_valor, tipo, observacao)
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                       (data, cliente, prod_devolvido_id, dev_nome, qtd_devolvida,
-                        prod_novo_id, novo_nome, qtd_nova, diferenca, tipo, obs))
+            if loja_id is None:
+                loja_id = self._loja_padrao_id()
 
-        # Se diferença > 0, cliente paga mais; se < 0, loja devolve
-        if diferenca != 0:
-            desc = f"{'Troca' if tipo == 'troca' else 'Devolução'}: {dev_nome}"
-            if diferenca > 0:
-                cursor.execute("INSERT INTO entradas (data, valor, descricao) VALUES (?, ?, ?)",
-                               (data[:10], diferenca, desc))
-            else:
-                cursor.execute("INSERT INTO gastos (data, valor, categoria, descricao, tipo) VALUES (?, ?, ?, ?, ?)",
-                               (data[:10], abs(diferenca), "Devolução", desc, "Variável"))
-        self.conn.commit()
-        self.registrar_alteracao("Troca/Devolução", f"{tipo.title()}: '{dev_nome}' → '{novo_nome}' (Cliente: {cliente})")
-        return True, f"{'Troca' if tipo == 'troca' else 'Devolução'} registrada com sucesso!"
+            try:
+                # Devolver ao estoque
+                cursor.execute("UPDATE produtos SET quantidade = quantidade + ? WHERE id=?", (qtd_devolvida, prod_devolvido_id))
+                if baixar_novo:
+                    cursor.execute("UPDATE produtos SET quantidade = quantidade - ? WHERE id=?", (qtd_nova, prod_novo_id))
+
+                cursor.execute("""INSERT INTO trocas_devolucoes
+                                 (data, cliente, produto_devolvido_id, produto_devolvido_nome, qtd_devolvida,
+                                  produto_novo_id, produto_novo_nome, qtd_nova, diferenca_valor, tipo, observacao)
+                                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                               (data, cliente, prod_devolvido_id, dev_nome, qtd_devolvida,
+                                prod_novo_id, novo_nome, qtd_nova, diferenca, tipo, obs))
+
+                # Se diferença > 0, cliente paga mais; se < 0, loja devolve
+                if diferenca != 0:
+                    desc = f"{'Troca' if tipo == 'troca' else 'Devolução'}: {dev_nome}"
+                    if diferenca > 0:
+                        cursor.execute("INSERT INTO entradas (data, valor, descricao, loja_id) VALUES (?, ?, ?, ?)",
+                                       (data[:10], diferenca, desc, loja_id))
+                    else:
+                        cursor.execute("INSERT INTO gastos (data, valor, categoria, descricao, tipo, loja_id) VALUES (?, ?, ?, ?, ?, ?)",
+                                       (data[:10], abs(diferenca), "Devolução", desc, "Variável", loja_id))
+                self.conn.commit()
+            except Exception:
+                self.conn.rollback()
+                raise
+            self.registrar_alteracao("Troca/Devolução", f"{tipo.title()}: '{dev_nome}' → '{novo_nome}' (Cliente: {cliente})")
+            return True, f"{'Troca' if tipo == 'troca' else 'Devolução'} registrada com sucesso!"
 
     def listar_trocas(self, dias=90):
         """Retorna trocas/devoluções dos últimos N dias."""

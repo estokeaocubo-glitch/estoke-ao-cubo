@@ -4485,10 +4485,10 @@ class App(ctk.CTk):
             try:
                 val_str = dialog_qtd.get_input()
                 if val_str:
-                    val = int(val_str)
-                    if val > 0:
-                        self.temp_kit_items.append({'nome': nome, 'quantidade': val})
-                        refresh_kit_ui()
+                    from services.estoque_service import EstoqueService
+                    val = EstoqueService.parse_qtd_componente(val_str)
+                    self.temp_kit_items.append({'nome': nome, 'quantidade': val})
+                    refresh_kit_ui()
             except Exception: pass
 
         def load_prods(query=""):
@@ -4554,21 +4554,12 @@ class App(ctk.CTk):
             refresh_kit_ui()
         
         def save_kit():
-            nome = e_nome.get().strip()
+            from services.estoque_service import EstoqueService
             try:
-                preco = float(e_preco.get().replace(",", "."))
-            except (ValueError, AttributeError):
-                messagebox.showerror("Erro", "Preço inválido", parent=window)
+                EstoqueService(self.db).criar_kit(e_nome.get(), e_preco.get(), self.temp_kit_items)
+            except ValueError as e:
+                messagebox.showerror("Erro", str(e), parent=window)
                 return
-            
-            if not nome:
-                messagebox.showerror("Erro", "Defina um nome para o kit.", parent=window)
-                return
-            if not self.temp_kit_items:
-                messagebox.showerror("Erro", "O kit precisa ter pelo menos um produto.", parent=window)
-                return
-                
-            self.db.adicionar_kit(nome, 0, preco, 0, self.temp_kit_items)
             messagebox.showinfo("Sucesso", "Kit criado com sucesso!\nEle aparecerá no PDV.", parent=window)
             window.destroy()
 
@@ -6157,28 +6148,19 @@ class App(ctk.CTk):
         e_motivo.pack(fill="x", padx=15, pady=3)
 
         def _fazer_baixa():
+            from services.producao_service import ProducaoService
             nome_sel = combo_insumo.get()
-            if nome_sel not in insumos_map:
-                messagebox.showerror("Erro", "Selecione um insumo.", parent=window)
-                return
+            ins_id = int(insumos_map[nome_sel]['id']) if nome_sel in insumos_map else None
             try:
-                qtd = float(e_qtd_baixa.get().replace(",", "."))
-                if qtd <= 0:
-                    raise ValueError
-            except ValueError:
-                messagebox.showerror("Erro", "Quantidade inválida.", parent=window)
+                msg = ProducaoService(self.db).baixar_insumo(ins_id, e_qtd_baixa.get(), e_motivo.get())
+            except ValueError as e:
+                messagebox.showerror("Erro", str(e), parent=window)
                 return
-            motivo = e_motivo.get().strip() or "Uso diário"
-            ins_id = int(insumos_map[nome_sel]['id'])
-            ok, msg = self.db.registrar_baixa_insumo(ins_id, qtd, motivo)
-            if ok:
-                messagebox.showinfo("Sucesso", msg, parent=window)
-                e_qtd_baixa.delete(0, "end")
-                refresh_insumos_list()
-                _refresh_historico_baixas()
-                self.refresh_dashboard()
-            else:
-                messagebox.showerror("Erro", msg, parent=window)
+            messagebox.showinfo("Sucesso", msg, parent=window)
+            e_qtd_baixa.delete(0, "end")
+            refresh_insumos_list()
+            _refresh_historico_baixas()
+            self.refresh_dashboard()
 
         ctk.CTkButton(baixa_form, text="REGISTRAR BAIXA", command=_fazer_baixa,
                       height=40, fg_color="#D4A373", hover_color="#B8956A", text_color="white",
@@ -6246,7 +6228,8 @@ class App(ctk.CTk):
 
         def _remover_ficha(ficha_id):
             if messagebox.askyesno("Confirmar", "Remover esta ficha técnica?", parent=window):
-                self.db.remover_ficha_tecnica(ficha_id)
+                from services.producao_service import ProducaoService
+                ProducaoService(self.db).remover_ficha(ficha_id)
                 _refresh_fichas()
 
         _refresh_fichas()
@@ -6331,40 +6314,19 @@ class App(ctk.CTk):
                       command=_add_insumo_row).pack(pady=5)
 
         def _salvar_ficha():
+            from services.producao_service import ProducaoService
             prod_nome = combo_prod.get()
-            if prod_nome not in prods_map:
-                messagebox.showerror("Erro", "Selecione o produto final.", parent=dialog)
-                return
             nome_ficha = e_nome_ficha.get().strip()
-            if not nome_ficha:
-                messagebox.showerror("Erro", "Nome da ficha é obrigatório.", parent=dialog)
-                return
+            itens = [
+                {'insumo_id': insumos_id_map.get(item['combo'].get()), 'quantidade': item['qtd'].get()}
+                for item in itens_ficha
+            ]
             try:
-                rendimento = int(e_rendimento.get())
-                if rendimento <= 0:
-                    raise ValueError
-            except ValueError:
-                messagebox.showerror("Erro", "Rendimento deve ser um número inteiro positivo.", parent=dialog)
+                ProducaoService(self.db).criar_ficha(
+                    prods_map.get(prod_nome), nome_ficha, e_rendimento.get(), itens)
+            except ValueError as e:
+                messagebox.showerror("Erro", str(e), parent=dialog)
                 return
-
-            itens = []
-            for item in itens_ficha:
-                ins_nome = item['combo'].get()
-                if ins_nome not in insumos_id_map:
-                    continue
-                try:
-                    qtd = float(item['qtd'].get().replace(",", "."))
-                    if qtd <= 0:
-                        continue
-                except (ValueError, AttributeError):
-                    continue
-                itens.append({'insumo_id': insumos_id_map[ins_nome], 'quantidade': qtd})
-
-            if not itens:
-                messagebox.showerror("Erro", "Adicione ao menos um insumo à ficha.", parent=dialog)
-                return
-
-            self.db.adicionar_ficha_tecnica(prods_map[prod_nome], nome_ficha, rendimento, itens)
             messagebox.showinfo("Sucesso", f"Ficha '{nome_ficha}' criada!", parent=dialog)
             refresh_callback()
             dialog.destroy()
@@ -6435,26 +6397,18 @@ class App(ctk.CTk):
         e_obs_prod.pack(fill="x", padx=15, pady=5)
 
         def _registrar_producao():
+            from services.producao_service import ProducaoService
             sel = combo_ficha.get()
-            if sel not in fichas_map:
-                messagebox.showerror("Erro", "Selecione uma ficha técnica.", parent=window)
-                return
             try:
-                qtd = int(e_qtd_prod.get())
-                if qtd <= 0:
-                    raise ValueError
-            except ValueError:
-                messagebox.showerror("Erro", "Quantidade inválida.", parent=window)
+                msg = ProducaoService(self.db).produzir(
+                    fichas_map.get(sel), e_qtd_prod.get(), e_obs_prod.get())
+            except ValueError as e:
+                messagebox.showerror("Erro", str(e), parent=window)
                 return
-            obs = e_obs_prod.get().strip()
-            ok, msg = self.db.registrar_producao(fichas_map[sel], qtd, obs)
-            if ok:
-                messagebox.showinfo("Sucesso", msg, parent=window)
-                e_qtd_prod.delete(0, "end")
-                _refresh_historico_prod()
-                self.refresh_dashboard()
-            else:
-                messagebox.showerror("Erro", msg, parent=window)
+            messagebox.showinfo("Sucesso", msg, parent=window)
+            e_qtd_prod.delete(0, "end")
+            _refresh_historico_prod()
+            self.refresh_dashboard()
 
         ctk.CTkButton(prod_card, text="PRODUZIR", command=_registrar_producao,
                       height=45, fg_color="#28a745", hover_color="#218838",
@@ -6562,45 +6516,24 @@ class App(ctk.CTk):
         e_obs_troca.pack(fill="x", padx=15, pady=3)
 
         def _registrar_troca():
+            from services.troca_service import TrocaService
             dev_nome = combo_devolvido.get()
-            if dev_nome not in prods_map:
-                messagebox.showerror("Erro", "Selecione o produto devolvido.", parent=window)
-                return
-            try:
-                qtd_dev = int(e_qtd_dev.get())
-                if qtd_dev <= 0:
-                    raise ValueError
-            except ValueError:
-                messagebox.showerror("Erro", "Quantidade devolvida inválida.", parent=window)
-                return
-
-            dev_id = int(prods_map[dev_nome]['id'])
-            tipo = tipo_var.get()
-            cliente = combo_cliente.get()
-
-            novo_id = None
-            qtd_nova = 0
+            dev_id = int(prods_map[dev_nome]['id']) if dev_nome in prods_map else None
             novo_nome = combo_novo.get()
-            if tipo == "troca" and novo_nome != "(nenhum)" and novo_nome in prods_map:
-                novo_id = int(prods_map[novo_nome]['id'])
-                try:
-                    qtd_nova = int(e_qtd_nova.get())
-                except ValueError:
-                    qtd_nova = 1
-
+            novo_id = (int(prods_map[novo_nome]['id'])
+                       if novo_nome != "(nenhum)" and novo_nome in prods_map else None)
+            loja_id = self.current_user.get("loja_id") if self.current_user else None
             try:
-                diferenca = float(e_diferenca.get().replace(",", "."))
-            except ValueError:
-                diferenca = 0.0
-
-            obs = e_obs_troca.get().strip()
-            ok, msg = self.db.registrar_troca(cliente, dev_id, qtd_dev, novo_id, qtd_nova, diferenca, tipo, obs)
-            if ok:
-                messagebox.showinfo("Sucesso", msg, parent=window)
-                _refresh_hist_trocas()
-                self.refresh_dashboard()
-            else:
-                messagebox.showerror("Erro", msg, parent=window)
+                msg = TrocaService(self.db).registrar(
+                    combo_cliente.get(), dev_id, e_qtd_dev.get(), tipo=tipo_var.get(),
+                    produto_novo_id=novo_id, qtd_nova=e_qtd_nova.get(),
+                    diferenca=e_diferenca.get(), observacao=e_obs_troca.get(), loja_id=loja_id)
+            except ValueError as e:
+                messagebox.showerror("Erro", str(e), parent=window)
+                return
+            messagebox.showinfo("Sucesso", msg, parent=window)
+            _refresh_hist_trocas()
+            self.refresh_dashboard()
 
         ctk.CTkButton(card, text="CONFIRMAR", command=_registrar_troca,
                       height=45, fg_color="#0A4174", hover_color="#062F56",
@@ -6649,12 +6582,13 @@ class App(ctk.CTk):
         lista_scroll = ctk.CTkScrollableFrame(window, fg_color="transparent")
         lista_scroll.pack(fill="both", expand=True, padx=15, pady=10)
 
-        df_repor = self.db.gerar_lista_reposicao()
-        if df_repor.empty:
+        from services.estoque_service import EstoqueService
+        itens_repor = EstoqueService(self.db).itens_reposicao()
+        if not itens_repor:
             ctk.CTkLabel(lista_scroll, text="✅ Todos os produtos estão acima do estoque mínimo!",
                         font=("Aileron", 14), text_color="#28a745").pack(pady=30)
         else:
-            for _, r in df_repor.iterrows():
+            for r in itens_repor:
                 f = ctk.CTkFrame(lista_scroll, fg_color=("white", "#3A3A3A"), corner_radius=10,
                                 border_width=1, border_color=("#FF6B6B", "#CC5555"))
                 f.pack(fill="x", pady=3, padx=5)
@@ -6668,13 +6602,10 @@ class App(ctk.CTk):
 
         # Botão exportar para texto (WhatsApp)
         def _exportar_whatsapp():
-            if df_repor.empty:
+            if not itens_repor:
                 messagebox.showinfo("Info", "Nenhum produto para repor.", parent=window)
                 return
-            linhas = ["📋 *Lista de Reposição*\n"]
-            for _, r in df_repor.iterrows():
-                linhas.append(f"• {r['nome']}: repor {r['qtd_repor']}un (atual: {r['quantidade']}, mín: {r['estoque_minimo']})")
-            texto = "\n".join(linhas)
+            texto = EstoqueService.texto_reposicao_whatsapp(itens_repor)
             # Copiar para clipboard
             window.clipboard_clear()
             window.clipboard_append(texto)
