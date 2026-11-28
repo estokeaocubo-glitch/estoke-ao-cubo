@@ -1329,7 +1329,8 @@ class App(ctk.CTk):
             text_cor = "white"
         
         def update_tarefa_status(tarefa_id=tarefa_row['id'], novo_status=proximo_status):
-            self.db.atualizar_status_estabelecimento(tarefa_id, novo_status)
+            from services.cadastro_service import CadastroService
+            CadastroService(self.db).atualizar_status_estabelecimento(tarefa_id, novo_status)
             self.refresh_metas_list()
         
         ctk.CTkButton(action_frame, text=btn_text, width=75, height=28,
@@ -1340,7 +1341,8 @@ class App(ctk.CTk):
         # Botão remover
         def delete_tarefa(tarefa_id=tarefa_row['id']):
             if messagebox.askyesno("Confirmar", "Remover esta tarefa?", parent=self):
-                self.db.remover_tarefa_estabelecimento(tarefa_id)
+                from services.cadastro_service import CadastroService
+                CadastroService(self.db).remover_tarefa_estabelecimento(tarefa_id)
                 self.refresh_metas_list()
         
         ctk.CTkButton(action_frame, text="✕", width=28, height=28,
@@ -1377,14 +1379,16 @@ class App(ctk.CTk):
         combo_prioridade.pack(pady=5, padx=20, fill="x")
         
         def salvar():
-            area = entry_area.get().strip()
-            tarefa = entry_tarefa.get().strip()
-            if not area or not tarefa:
-                messagebox.showerror("Erro", "Preencha Área/Local e Tarefa.", parent=dialog)
+            from services.cadastro_service import CadastroService
+            try:
+                CadastroService(self.db).adicionar_tarefa_estabelecimento(
+                    entry_area.get(), entry_tarefa.get(), var_prioridade.get()
+                )
+            except ValueError as err:
+                messagebox.showerror("Erro", str(err), parent=dialog)
                 dialog.lift()
                 dialog.focus_force()
                 return
-            self.db.adicionar_tarefa_estabelecimento(area, tarefa, var_prioridade.get())
             messagebox.showinfo("Sucesso", "Tarefa adicionada!", parent=dialog)
             dialog.destroy()
             self.refresh_metas_list()
@@ -1638,8 +1642,11 @@ class App(ctk.CTk):
             "caixa_dialog": self.open_caixa_dialog,
             "categorias_manager": self.open_categorias_manager,
             "fornecedores_manager": lambda: self.open_generic_manager(
-                "Fornecedores", self.db.listar_fornecedores, self.db.adicionar_fornecedor,
-                self.db.remover_fornecedor, ["Nome", "Contato", "Produto Fornecido"]
+                "Fornecedores",
+                lambda: __import__("services.cadastro_service", fromlist=["CadastroService"]).CadastroService(self.db).listar_fornecedores(),
+                lambda n, c, p: __import__("services.cadastro_service", fromlist=["CadastroService"]).CadastroService(self.db).adicionar_fornecedor(n, c, p),
+                lambda fid: __import__("services.cadastro_service", fromlist=["CadastroService"]).CadastroService(self.db).remover_fornecedor(fid),
+                ["Nome", "Contato", "Produto Fornecido"],
             ),
             "clientes_manager": self.open_clientes_manager,
             "anota_tudo_dialog": self.open_anota_tudo_dialog,
@@ -1714,7 +1721,11 @@ class App(ctk.CTk):
         def add_item():
             values = [e.get().strip() for e in entries]
             if all(values):
-                add_func(*values)
+                try:
+                    add_func(*values)
+                except ValueError as err:
+                    messagebox.showerror("Erro", str(err), parent=window)
+                    return
                 messagebox.showinfo("Sucesso", "Item adicionado!", parent=window)
                 refresh_list()
                 for e in entries: e.delete(0, "end")
@@ -1740,12 +1751,15 @@ class App(ctk.CTk):
             for widget in list_frame.winfo_children():
                 widget.destroy()
             
-            df = list_func()
-            if df.empty:
+            dados = list_func()
+            rows = dados if isinstance(dados, list) else (
+                [] if getattr(dados, "empty", True) else dados.to_dict(orient="records")
+            )
+            if not rows:
                 ctk.CTkLabel(list_frame, text="Nenhum item encontrado.", text_color=("#999999", "#AAAAAA")).pack(pady=20)
                 return
 
-            for index, row in df.iterrows():
+            for row in rows:
                 item_frame = ctk.CTkFrame(list_frame, fg_color=("white", "#404040"), corner_radius=8)
                 item_frame.pack(pady=5, fill="x", padx=5)
                 
@@ -1765,6 +1779,9 @@ class App(ctk.CTk):
 
     def open_categorias_manager(self):
         """Gerencia categorias, subcategorias e tamanhos."""
+        from services.cadastro_service import CadastroService
+        cad_svc = CadastroService(self.db)
+
         window = ctk.CTkToplevel(self)
         window.title("Gerenciar Categorias")
         window.geometry("750x750")
@@ -1797,7 +1814,7 @@ class App(ctk.CTk):
             def refresh_cats(lf=list_frame, tk=tipo_key):
                 for w in lf.winfo_children():
                     w.destroy()
-                cats = self.db.listar_categorias(tk)
+                cats = cad_svc.listar_categorias(tk)
                 if not cats:
                     ctk.CTkLabel(lf, text="Nenhuma categoria cadastrada.", text_color=("#999999", "#AAAAAA")).pack(pady=20)
                     return
@@ -1813,12 +1830,12 @@ class App(ctk.CTk):
 
                     def del_cat(n=cat_name, t=tk, r=refresh_cats):
                         if messagebox.askyesno("Confirmar", f"Remover categoria '{n}' e todas suas subcategorias?", parent=window):
-                            self.db.remover_categoria(n, t)
+                            cad_svc.remover_categoria(n, t)
                             r()
                     ctk.CTkButton(cat_header, text="✕", width=30, fg_color="#FF6B6B", hover_color="#FF5252", text_color="white", command=del_cat).pack(side="right")
 
                     # Subcategorias dentro da categoria
-                    subcats = self.db.listar_subcategorias(cat_name, tk)
+                    subcats = cad_svc.listar_subcategorias(cat_name, tk)
                     sub_container = ctk.CTkFrame(cat_card, fg_color="transparent")
                     sub_container.pack(fill="x", padx=20, pady=(0, 4))
 
@@ -1832,12 +1849,12 @@ class App(ctk.CTk):
 
                         def del_sub(cn=cat_name, sn=sub_name, t=tk, r=refresh_cats):
                             if messagebox.askyesno("Confirmar", f"Remover subcategoria '{sn}'?", parent=window):
-                                self.db.remover_subcategoria(cn, sn, t)
+                                cad_svc.remover_subcategoria(cn, sn, t)
                                 r()
                         ctk.CTkButton(sub_header, text="✕", width=25, height=22, fg_color="#FF9999", hover_color="#FF6666", text_color="white", command=del_sub, font=ctk.CTkFont(size=10)).pack(side="right")
 
                         # Sub-subcategorias dentro da subcategoria
-                        sub_subs = self.db.listar_sub_subcategorias(cat_name, sub_name, tk)
+                        sub_subs = cad_svc.listar_sub_subcategorias(cat_name, sub_name, tk)
                         if sub_subs:
                             ss_frame = ctk.CTkFrame(sub_frame, fg_color="transparent")
                             ss_frame.pack(fill="x", padx=25, pady=(0, 4))
@@ -1847,7 +1864,7 @@ class App(ctk.CTk):
                                 ctk.CTkLabel(ss_item, text=f"    ↳ {ss_name}", font=ctk.CTkFont(size=11), text_color=("#444", "#CCC")).pack(side="left", padx=6, pady=2)
 
                                 def del_ss(cn=cat_name, sn=sub_name, ssn=ss_name, t=tk, r=refresh_cats):
-                                    self.db.remover_sub_subcategoria(cn, sn, ssn, t)
+                                    cad_svc.remover_sub_subcategoria(cn, sn, ssn, t)
                                     r()
                                 ctk.CTkButton(ss_item, text="✕", width=18, height=18, fg_color="transparent", hover_color="#FF9999", text_color="#999", command=del_ss, font=ctk.CTkFont(size=9)).pack(side="right")
 
@@ -1855,14 +1872,14 @@ class App(ctk.CTk):
                         def add_ss_dlg(cn=cat_name, sn=sub_name, t=tk, r=refresh_cats):
                             ss_str = ctk.CTkInputDialog(text=f"Nova sub-subcategoria em '{sn}':\n(Ex: Estampada, Lisa, Bordada...)", title="Nova Sub-Subcategoria").get_input()
                             if ss_str and ss_str.strip():
-                                if self.db.adicionar_sub_subcategoria(cn, sn, ss_str.strip(), t):
+                                if cad_svc.adicionar_sub_subcategoria(cn, sn, ss_str.strip(), t):
                                     r()
                                 else:
                                     messagebox.showwarning("Aviso", "Sub-subcategoria já existe.", parent=window)
                         ctk.CTkButton(sub_frame, text="+ Sub-Subcat", width=100, height=22, fg_color="#85C1E9", hover_color="#5DADE2", text_color="#001D39", font=ctk.CTkFont(size=10), command=add_ss_dlg).pack(padx=25, pady=(0, 2), anchor="w")
 
                         # Tamanhos dentro da subcategoria
-                        tamanhos = self.db.listar_tamanhos(cat_name, sub_name, tk)
+                        tamanhos = cad_svc.listar_tamanhos(cat_name, sub_name, tk)
                         if tamanhos:
                             tam_frame = ctk.CTkFrame(sub_frame, fg_color="transparent")
                             tam_frame.pack(fill="x", padx=25, pady=(0, 4))
@@ -1872,7 +1889,7 @@ class App(ctk.CTk):
                                 ctk.CTkLabel(t_item, text=f" {tam} ", font=ctk.CTkFont(size=11), text_color=("#333", "#DDD")).pack(side="left", padx=4, pady=2)
 
                                 def del_tam(cn=cat_name, sn=sub_name, tn=tam, t=tk, r=refresh_cats):
-                                    self.db.remover_tamanho(cn, sn, tn, t)
+                                    cad_svc.remover_tamanho(cn, sn, tn, t)
                                     r()
                                 ctk.CTkButton(t_item, text="✕", width=18, height=18, fg_color="transparent", hover_color="#FF9999", text_color="#999", command=del_tam, font=ctk.CTkFont(size=9)).pack(side="left")
 
@@ -1880,7 +1897,7 @@ class App(ctk.CTk):
                         def add_tam_dlg(cn=cat_name, sn=sub_name, t=tk, r=refresh_cats):
                             tam_str = ctk.CTkInputDialog(text=f"Tamanho para '{sn}':\n(Ex: P, M, G, GG, 38, 40...)", title="Novo Tamanho").get_input()
                             if tam_str and tam_str.strip():
-                                self.db.adicionar_tamanho(cn, sn, tam_str.strip().upper(), t)
+                                cad_svc.adicionar_tamanho(cn, sn, tam_str.strip().upper(), t)
                                 r()
                         ctk.CTkButton(sub_frame, text="+ Tamanho", width=90, height=22, fg_color="#5DADE2", hover_color="#3498DB", text_color="white", font=ctk.CTkFont(size=10), command=add_tam_dlg).pack(padx=25, pady=(0, 6), anchor="w")
 
@@ -1888,18 +1905,20 @@ class App(ctk.CTk):
                     def add_sub_dlg(cn=cat_name, t=tk, r=refresh_cats):
                         sub_str = ctk.CTkInputDialog(text=f"Nova subcategoria em '{cn}':\n(Ex: Malha, Linho, Jeans...)", title="Nova Subcategoria").get_input()
                         if sub_str and sub_str.strip():
-                            if self.db.adicionar_subcategoria(cn, sub_str.strip(), t):
+                            if cad_svc.adicionar_subcategoria(cn, sub_str.strip(), t):
                                 r()
                             else:
                                 messagebox.showwarning("Aviso", "Subcategoria já existe.", parent=window)
                     ctk.CTkButton(cat_card, text="+ Subcategoria", width=130, height=26, fg_color="#0A4174", hover_color="#062F56", text_color="white", font=ctk.CTkFont(size=11, weight="bold"), command=add_sub_dlg).pack(padx=10, pady=(0, 8), anchor="w")
 
             def add_cat(entry=entry_cat, tk=tipo_key, rf=refresh_cats):
-                nome = entry.get().strip()
-                if not nome:
-                    messagebox.showerror("Erro", "Digite um nome para a categoria.", parent=window)
+                try:
+                    adicionou = cad_svc.adicionar_categoria(entry.get(), tk)
+                except ValueError as err:
+                    messagebox.showerror("Erro", str(err), parent=window)
                     return
-                if self.db.adicionar_categoria(nome, tk):
+                nome = entry.get().strip()
+                if adicionou:
                     messagebox.showinfo("Sucesso", f"Categoria '{nome}' adicionada!", parent=window)
                     entry.delete(0, "end")
                     rf()
@@ -2454,10 +2473,12 @@ class App(ctk.CTk):
         qr_select_frame = ctk.CTkFrame(api_frame, fg_color="transparent")
         qr_select_frame.pack(fill="x", pady=5)
 
-        usuarios_df = self.db.listar_usuarios()
-        usuarios_ativos = usuarios_df[usuarios_df['ativo'] == 1] if not usuarios_df.empty else usuarios_df
-        user_options = [f"{row['login']} ({row['perfil']})" for _, row in usuarios_ativos.iterrows()] if not usuarios_ativos.empty else ["Nenhum usuário"]
-        user_logins = [row['login'] for _, row in usuarios_ativos.iterrows()] if not usuarios_ativos.empty else []
+        from services.cadastro_service import CadastroService
+        _cad_api = CadastroService(self.db)
+        usuarios_lista = _cad_api.listar_usuarios()
+        usuarios_ativos = [u for u in usuarios_lista if u.get('ativo') == 1]
+        user_options = [f"{row['login']} ({row['perfil']})" for row in usuarios_ativos] if usuarios_ativos else ["Nenhum usuário"]
+        user_logins = [row['login'] for row in usuarios_ativos] if usuarios_ativos else []
 
         ctk.CTkLabel(qr_select_frame, text="Usuário:", font=("Aileron", 11)).pack(side="left", padx=(0, 8))
         combo_user = ctk.CTkComboBox(qr_select_frame, values=user_options, width=200, state="readonly")
@@ -2525,6 +2546,9 @@ class App(ctk.CTk):
 
     def open_estabelecimento_manager(self):
         """Gerencia tarefas de organização do espaço físico (estabelecimento)"""
+        from services.cadastro_service import CadastroService
+        cad_svc = CadastroService(self.db)
+
         window = ctk.CTkToplevel(self)
         window.title("Gestão de Estabelecimento")
         window.geometry("750x650")
@@ -2563,19 +2587,18 @@ class App(ctk.CTk):
         combo_prioridade.pack(pady=2, padx=15, fill="x")
         
         def add_task():
-            area = entry_area.get().strip()
-            tarefa = entry_tarefa.get().strip()
-            prioridade = var_prioridade.get()
-            
-            if area and tarefa:
-                self.db.adicionar_tarefa_estabelecimento(area, tarefa, prioridade)
-                messagebox.showinfo("Sucesso", "Tarefa adicionada!", parent=window)
-                refresh_list()
-                self.refresh_dashboard()  # Atualizar dashboard principal
-                entry_area.delete(0, "end")
-                entry_tarefa.delete(0, "end")
-            else:
-                messagebox.showerror("Erro", "Preencha Área/Local e Tarefa.", parent=window)
+            try:
+                cad_svc.adicionar_tarefa_estabelecimento(
+                    entry_area.get(), entry_tarefa.get(), var_prioridade.get()
+                )
+            except ValueError as err:
+                messagebox.showerror("Erro", str(err), parent=window)
+                return
+            messagebox.showinfo("Sucesso", "Tarefa adicionada!", parent=window)
+            refresh_list()
+            self.refresh_dashboard()  # Atualizar dashboard principal
+            entry_area.delete(0, "end")
+            entry_tarefa.delete(0, "end")
 
         btn_frame = ctk.CTkFrame(add_frame, fg_color="transparent")
         btn_frame.pack(pady=15, padx=15, fill="x")
@@ -2596,12 +2619,12 @@ class App(ctk.CTk):
             for widget in list_frame.winfo_children():
                 widget.destroy()
             
-            df = self.db.listar_tarefas_estabelecimento()
-            if df.empty:
+            tarefas = cad_svc.listar_tarefas_estabelecimento()
+            if not tarefas:
                 ctk.CTkLabel(list_frame, text="Nenhuma tarefa encontrada.", text_color=("#999999", "#AAAAAA")).pack(pady=20)
                 return
 
-            for index, row in df.iterrows():
+            for row in tarefas:
                 task_frame = ctk.CTkFrame(list_frame, fg_color=("white", "#404040"), corner_radius=8, border_width=1, border_color=("#EEEEEE", "#555555"))
                 task_frame.pack(pady=5, padx=5, fill="x")
                 
@@ -2634,7 +2657,7 @@ class App(ctk.CTk):
                 cor_status = "#0A4174" if status_atual == "Pendente" else "#6EA2B3" if status_atual == "Em Progresso" else "#7BBDE8"
                 
                 def update_status(id_val=row['id'], novo_status=proximo_status):
-                    self.db.atualizar_status_estabelecimento(id_val, novo_status)
+                    cad_svc.atualizar_status_estabelecimento(id_val, novo_status)
                     self.refresh_metas_list()
         
                 ctk.CTkButton(btn_frame, text=f"{proximo_status}", width=110, fg_color=cor_status, 
@@ -2643,7 +2666,7 @@ class App(ctk.CTk):
                 
                 def delete_task(id_val=row['id']):
                     if messagebox.askyesno("Confirmar", "Remover esta tarefa?", parent=window):
-                        self.db.remover_tarefa_estabelecimento(id_val)
+                        cad_svc.remover_tarefa_estabelecimento(id_val)
                         refresh_list()
                         self.refresh_dashboard()  # Atualizar dashboard principal
 
@@ -2980,7 +3003,8 @@ class App(ctk.CTk):
                     elif t == "gasto":
                         self.db.remover_gasto(r["id"])
                     elif t == "tarefa":
-                        self.db.remover_tarefa_estabelecimento(r["id"])
+                        from services.cadastro_service import CadastroService
+                        CadastroService(self.db).remover_tarefa_estabelecimento(r["id"])
                     refresh_list()
                     self.refresh_dashboard()
                 else:
@@ -3089,7 +3113,8 @@ class App(ctk.CTk):
             if tab_name in ("produto", "gasto"):
                 cats = ["Todas"]
                 try:
-                    cat_list = self.db.listar_categorias(tab_name)
+                    from services.cadastro_service import CadastroService
+                    cat_list = CadastroService(self.db).listar_categorias(tab_name)
                     if cat_list:
                         cats.extend(cat_list)
                 except Exception:
@@ -3264,7 +3289,8 @@ class App(ctk.CTk):
             elif type_ == "gasto":
                 self.db.remover_gasto(row['id'])
             elif type_ == "tarefa":
-                self.db.remover_tarefa_estabelecimento(row['id'])
+                from services.cadastro_service import CadastroService
+                CadastroService(self.db).remover_tarefa_estabelecimento(row['id'])
             window.destroy()
             messagebox.showinfo("Sucesso", "Item removido!", parent=self)
             self.refresh_dashboard()  # Atualizar em tempo real
@@ -3316,18 +3342,20 @@ class App(ctk.CTk):
             status_combo.pack(pady=5, padx=15, fill="x")
             
             def salvar_tarefa():
-                area = entry_area.get().strip()
-                tarefa = entry_tarefa.get().strip()
-                prioridade = prioridade_var.get()
-                status = status_var.get()
-                
-                if not area or not tarefa:
-                    messagebox.showerror("Erro", "Preencha Área e Tarefa.", parent=dialog)
+                from services.cadastro_service import CadastroService
+                try:
+                    CadastroService(self.db).atualizar_tarefa_estabelecimento(
+                        row['id'],
+                        entry_area.get(),
+                        entry_tarefa.get(),
+                        prioridade_var.get(),
+                        status_var.get(),
+                    )
+                except ValueError as err:
+                    messagebox.showerror("Erro", str(err), parent=dialog)
                     dialog.lift()
                     dialog.focus_force()
                     return
-                
-                self.db.atualizar_tarefa_estabelecimento(row['id'], area, tarefa, prioridade, status)
                 messagebox.showinfo("Sucesso", "Tarefa atualizada!", parent=dialog)
                 dialog.destroy()
                 self.refresh_dashboard()
@@ -4602,6 +4630,9 @@ class App(ctk.CTk):
 
     # --- Gerenciador de Clientes com Histórico e Fidelidade ---
     def open_clientes_manager(self):
+        from services.cadastro_service import CadastroService
+        cad_svc = CadastroService(self.db)
+
         window = ctk.CTkToplevel(self)
         window.title("Gerenciador de Clientes")
         window.geometry("900x650")
@@ -4639,18 +4670,17 @@ class App(ctk.CTk):
         def refresh_clientes():
             for i in tree_cli.get_children(): tree_cli.delete(i)
             try:
-                df = self.db.listar_clientes()
-                for _, r in df.iterrows():
+                for r in cad_svc.listar_clientes():
                     tree_cli.insert("", "end", values=(r['id'], r['nome'], r.get('contato', ''), r.get('observacoes', ''), r.get('compras_recorrentes', 0)))
             except Exception as e:
                 logger.warning("Erro listar clientes: %s", e)
 
         def add_cliente():
-            nome = e_nome.get().strip()
-            if not nome:
-                messagebox.showerror("Erro", "Nome é obrigatório.", parent=window)
+            try:
+                cad_svc.adicionar_cliente(e_nome.get(), e_contato.get(), e_obs.get())
+            except ValueError as err:
+                messagebox.showerror("Erro", str(err), parent=window)
                 return
-            self.db.adicionar_cliente(nome, e_contato.get().strip(), e_obs.get().strip())
             e_nome.delete(0, "end")
             e_contato.delete(0, "end")
             e_obs.delete(0, "end")
@@ -4661,7 +4691,7 @@ class App(ctk.CTk):
             if not sel: return
             c_id = tree_cli.item(sel[0])['values'][0]
             if messagebox.askyesno("Confirmar", "Remover este cliente?", parent=window):
-                self.db.remover_cliente(c_id)
+                cad_svc.remover_cliente(c_id)
                 refresh_clientes()
 
         ctk.CTkButton(add_frame, text="Adicionar", command=add_cliente, width=80, fg_color="#28a745", hover_color="#218838").pack(side="left", padx=5, pady=10)
@@ -4673,8 +4703,8 @@ class App(ctk.CTk):
         hc_frame = ctk.CTkFrame(tab_historico, fg_color=("white", "#2B2B2B"), corner_radius=10)
         hc_frame.pack(fill="x", pady=5, padx=5)
         ctk.CTkLabel(hc_frame, text="Cliente:", font=("Aileron", 11, "bold")).pack(side="left", padx=10, pady=10)
-        df_c = self.db.listar_clientes()
-        c_names = df_c['nome'].tolist() if not df_c.empty else []
+        lista_c = cad_svc.listar_clientes()
+        c_names = [c['nome'] for c in lista_c] if lista_c else []
         var_cli = ctk.StringVar(value=c_names[0] if c_names else "")
         combo_cli = ctk.CTkComboBox(hc_frame, values=c_names, variable=var_cli, width=200)
         combo_cli.pack(side="left", padx=5, pady=10)
@@ -4698,15 +4728,15 @@ class App(ctk.CTk):
             nome = var_cli.get()
             if not nome: return
             try:
-                df_vc = self.db.vendas_por_cliente(nome)
+                vendas_c = cad_svc.vendas_por_cliente(nome)
                 total = 0
-                for _, r in df_vc.iterrows():
+                for r in vendas_c:
                     tree_hc.insert("", "end", values=(
                         str(r['data_venda'])[:16], r.get('produto_nome', 'N/A'), r['quantidade'],
                         f"R$ {r['valor_total']:.2f}", f"R$ {r.get('lucro', 0):.2f}", r.get('forma_pagamento', 'N/A')
                     ))
                     total += r['valor_total']
-                lbl_total_cli.configure(text=f"Total gasto: R$ {total:.2f} | {len(df_vc)} compras")
+                lbl_total_cli.configure(text=f"Total gasto: R$ {total:.2f} | {len(vendas_c)} compras")
             except Exception as e:
                 logger.warning("Erro hist cliente: %s", e)
 
@@ -4726,11 +4756,11 @@ class App(ctk.CTk):
         def carregar_fidelidade():
             for w in fid_frame.winfo_children(): w.destroy()
             try:
-                df_c = self.db.listar_fidelidade_clientes()
-                if df_c.empty:
+                lista_fid = cad_svc.listar_fidelidade_clientes()
+                if not lista_fid:
                     ctk.CTkLabel(fid_frame, text="Nenhum cliente cadastrado.", text_color="gray").pack(pady=20)
                     return
-                for _, r in df_c.iterrows():
+                for r in lista_fid:
                     pontos = int(r.get('pontos', 0) or 0)
                     total_ac = float(r.get('total_acumulado', 0.0) or 0.0)
                     card = ctk.CTkFrame(fid_frame, fg_color=("white", "#2B2B2B"), corner_radius=10)
@@ -6651,7 +6681,6 @@ class App(ctk.CTk):
 
         # --- TAB CAIXA ---
         caixa_aberto = caixa_svc.caixa_aberto(user_id)
-        resumo_caixa = caixa_svc.resumo_caixa(usuario_id=user_id) if caixa_aberto else None
 
         status_frame = ctk.CTkFrame(tab_caixa, fg_color=("white", "#2B2B2B"), corner_radius=15)
         status_frame.pack(fill="x", padx=10, pady=10)
@@ -6995,6 +7024,9 @@ class App(ctk.CTk):
 
     def open_vendedores_dialog(self):
         """Dialog para gerenciar vendedores/funcionários com desempenho."""
+        from services.cadastro_service import CadastroService
+        cad_svc = CadastroService(self.db)
+
         window = ctk.CTkToplevel(self)
         window.title("Vendedores / Funcionários")
         window.geometry("850x600")
@@ -7047,7 +7079,7 @@ class App(ctk.CTk):
         ttk_local.Scrollbar(list_frame, orient="vertical", command=tree_v.yview).pack(side="right", fill="y")
 
         # Indicador de turno atual
-        turno_atual = self.db.vendedor_no_turno()
+        turno_atual = cad_svc.vendedor_no_turno()
         if turno_atual:
             ctk.CTkLabel(tab_lista, text=f"\U0001f7e2 No turno agora: {turno_atual}",
                         font=("Aileron", 12, "bold"), text_color="#28a745").pack(pady=(5, 0))
@@ -7055,8 +7087,7 @@ class App(ctk.CTk):
         def _refresh():
             for i in tree_v.get_children():
                 tree_v.delete(i)
-            df = self.db.listar_vendedores()
-            for _, r in df.iterrows():
+            for r in cad_svc.listar_vendedores():
                 tree_v.insert("", "end", values=(
                     r['id'], r['nome'],
                     f"{r['horario_inicio']} - {r['horario_fim']}",
@@ -7065,17 +7096,13 @@ class App(ctk.CTk):
         _refresh()
 
         def _add():
-            nome = e_nome.get().strip()
-            if not nome:
-                messagebox.showerror("Erro", "Informe o nome.", parent=window)
-                return
             h_ini = e_h_ini.get().strip() or "08:00"
             h_fim = e_h_fim.get().strip() or "18:00"
             try:
-                com = float(e_comissao.get().replace(",", ".")) if e_comissao.get().strip() else 0
-            except ValueError:
-                com = 0
-            self.db.adicionar_vendedor(nome, h_ini, h_fim, com)
+                cad_svc.adicionar_vendedor(e_nome.get(), h_ini, h_fim, e_comissao.get())
+            except ValueError as err:
+                messagebox.showerror("Erro", str(err), parent=window)
+                return
             e_nome.delete(0, "end")
             _refresh()
 
@@ -7085,7 +7112,7 @@ class App(ctk.CTk):
                 return
             vid = tree_v.item(sel[0])['values'][0]
             if messagebox.askyesno("Confirmar", "Desativar este vendedor?", parent=window):
-                self.db.remover_vendedor(vid)
+                cad_svc.remover_vendedor(vid)
                 _refresh()
 
         btn_f = ctk.CTkFrame(tab_lista, fg_color="transparent")
@@ -7099,8 +7126,8 @@ class App(ctk.CTk):
         ctk.CTkLabel(tab_desempenho, text="Desempenho dos Vendedores (30 dias)",
                     font=("Aileron", 14, "bold"), text_color=("#001D39", "white")).pack(pady=(10, 5))
 
-        df_perf = self.db.vendas_por_vendedor(30)
-        if df_perf.empty:
+        perf_lista = cad_svc.vendas_por_vendedor(30)
+        if not perf_lista:
             ctk.CTkLabel(tab_desempenho, text="Nenhuma venda com vendedor identificado nos últimos 30 dias.",
                         font=("Aileron", 12), text_color=("#555", "#CCC")).pack(pady=20)
         else:
@@ -7108,12 +7135,10 @@ class App(ctk.CTk):
             perf_scroll.pack(fill="both", expand=True, padx=10, pady=5)
 
             # Calcular comissões
-            df_vendedores = self.db.listar_vendedores()
-            comissao_map = {}
-            if not df_vendedores.empty:
-                comissao_map = dict(zip(df_vendedores['nome'], df_vendedores['comissao']))
+            vendedores_lista = cad_svc.listar_vendedores()
+            comissao_map = {v['nome']: v.get('comissao', 0) for v in vendedores_lista}
 
-            for _, r in df_perf.iterrows():
+            for r in perf_lista:
                 card = ctk.CTkFrame(perf_scroll, fg_color=("white", "#2B2B2B"), corner_radius=10)
                 card.pack(fill="x", padx=5, pady=3)
                 nome_v = r['vendedor']
@@ -7519,6 +7544,9 @@ class App(ctk.CTk):
 
     def open_mesas_manager(self):
         """Gerencia mesas do restaurante com mapa visual."""
+        from services.restaurante_service import RestauranteService
+        rest_svc = RestauranteService(self.db)
+
         window = ctk.CTkToplevel(self)
         window.title("Gestão de Mesas")
         window.geometry("850x650")
@@ -7558,9 +7586,12 @@ class App(ctk.CTk):
             except ValueError:
                 cap = 4
             area = combo_area.get()
-            criadas = self.db.criar_mesas(qtd, cap, area)
-            messagebox.showinfo("Sucesso", f"{criadas} mesa(s) criada(s).", parent=window)
-            _refresh()
+            try:
+                criadas = rest_svc.criar_mesas(qtd, cap, area)
+                messagebox.showinfo("Sucesso", f"{criadas} mesa(s) criada(s).", parent=window)
+                _refresh()
+            except ValueError as err:
+                messagebox.showerror("Erro", str(err), parent=window)
 
         ctk.CTkButton(add_f, text="+ Criar", width=80, height=30, fg_color="#E07B56",
                       hover_color="#C4623E", text_color="white", font=("Aileron", 11, "bold"),
@@ -7579,14 +7610,20 @@ class App(ctk.CTk):
         def _refresh():
             for w in mesas_scroll.winfo_children():
                 w.destroy()
-            df = self.db.listar_mesas()
-            if df.empty:
+            mesas = rest_svc.listar_mesas()
+            if not mesas:
                 ctk.CTkLabel(mesas_scroll, text="Nenhuma mesa cadastrada.\nUse o botão '+ Criar' acima.",
                              font=("Aileron", 13), text_color="gray").pack(pady=40)
                 return
 
             # Agrupar por área
-            for area_nome in df['area'].unique():
+            areas_vistas = []
+            for m in mesas:
+                area_m = m.get('area') or 'Salão'
+                if area_m not in areas_vistas:
+                    areas_vistas.append(area_m)
+
+            for area_nome in areas_vistas:
                 area_label = ctk.CTkLabel(mesas_scroll, text=f"📍 {area_nome}",
                                           font=("Aileron", 13, "bold"), text_color=("#001D39", "white"))
                 area_label.pack(anchor="w", padx=10, pady=(10, 3))
@@ -7594,9 +7631,8 @@ class App(ctk.CTk):
                 area_frame = ctk.CTkFrame(mesas_scroll, fg_color="transparent")
                 area_frame.pack(fill="x", padx=10, pady=(0, 5))
 
-                area_mesas = df[df['area'] == area_nome]
-                col = 0
-                for _, mesa in area_mesas.iterrows():
+                area_mesas = [m for m in mesas if (m.get('area') or 'Salão') == area_nome]
+                for col, mesa in enumerate(area_mesas):
                     status = mesa['status']
                     cores = {"livre": "#28a745", "ocupada": "#FF6B6B", "reservada": "#FFD93D"}
                     cor = cores.get(status, "#888")
@@ -7632,27 +7668,27 @@ class App(ctk.CTk):
 
                     def _del_mesa(mid=mesa['id']):
                         if messagebox.askyesno("Confirmar", "Remover esta mesa?", parent=window):
-                            self.db.remover_mesa(mid)
+                            rest_svc.remover_mesa(mid)
                             _refresh()
                     ctk.CTkButton(btn_frame, text="✕", width=22, height=22, font=("Aileron", 9),
                                   fg_color="white", text_color="red", hover_color="#e0e0e0",
                                   command=_del_mesa).pack(side="left", padx=1)
-
-                    col += 1
 
         self._refresh_mesas = _refresh
         _refresh()
 
     def _abrir_comanda_mesa(self, mesa, parent_window=None):
         """Abre uma comanda para a mesa selecionada e abre o dialog de comanda."""
-        comanda_id = self.db.abrir_comanda(mesa_id=mesa['id'], tipo_atendimento="mesa")
+        from services.restaurante_service import RestauranteService
+        comanda_id = RestauranteService(self.db).abrir_comanda(mesa_id=mesa['id'], tipo_atendimento="mesa")
         if parent_window and hasattr(self, '_refresh_mesas'):
             self._refresh_mesas()
         self._open_comanda_editor(comanda_id)
 
     def _ver_comanda_mesa(self, mesa, parent_window=None):
         """Abre a comanda existente da mesa."""
-        comanda = self.db.get_comanda_por_mesa(mesa['id'])
+        from services.restaurante_service import RestauranteService
+        comanda = RestauranteService(self.db).get_comanda_por_mesa(mesa['id'])
         if comanda:
             self._open_comanda_editor(comanda['id'])
         else:
@@ -7662,6 +7698,9 @@ class App(ctk.CTk):
 
     def open_comandas_dialog(self):
         """Dialog principal de comandas — lista abertas e permite criar nova."""
+        from services.restaurante_service import RestauranteService
+        rest_svc = RestauranteService(self.db)
+
         window = ctk.CTkToplevel(self)
         window.title("Comandas")
         window.geometry("900x650")
@@ -7699,12 +7738,12 @@ class App(ctk.CTk):
         def _refresh():
             for w in scroll_abertas.winfo_children():
                 w.destroy()
-            df = self.db.listar_comandas_abertas()
-            if df.empty:
+            abertas = rest_svc.listar_comandas_abertas()
+            if not abertas:
                 ctk.CTkLabel(scroll_abertas, text="Nenhuma comanda aberta.", font=("Aileron", 13),
                              text_color="gray").pack(pady=30)
                 return
-            for _, c in df.iterrows():
+            for c in abertas:
                 card = ctk.CTkFrame(scroll_abertas, fg_color=("white", "#2B2B2B"), corner_radius=12)
                 card.pack(fill="x", padx=5, pady=4)
 
@@ -7713,7 +7752,8 @@ class App(ctk.CTk):
 
                 tipo_icons = {"mesa": "🍽️", "balcão": "🪑", "delivery": "🛵", "retirada": "📦"}
                 tipo_icon = tipo_icons.get(c['tipo_atendimento'], "📋")
-                mesa_txt = f" — Mesa {int(c['mesa_numero'])}" if pd.notna(c.get('mesa_numero')) else ""
+                mesa_num = c.get('mesa_numero')
+                mesa_txt = f" — Mesa {int(mesa_num)}" if (mesa_num is not None and not pd.isna(mesa_num)) else ""
                 ctk.CTkLabel(info, text=f"{tipo_icon} Comanda #{c['id']}{mesa_txt}",
                              font=("Aileron", 13, "bold"), text_color=("#001D39", "white")).pack(anchor="w")
                 hora = str(c['data_abertura'])[:16].replace('T', ' ')
@@ -7739,15 +7779,16 @@ class App(ctk.CTk):
         scroll_hist = ctk.CTkScrollableFrame(tab_historico, fg_color=("#F5F5F5", "#333333"), corner_radius=10)
         scroll_hist.pack(fill="both", expand=True)
 
-        df_hist = self.db.listar_comandas_historico(30)
-        if df_hist.empty:
+        hist = rest_svc.listar_comandas_historico(30)
+        if not hist:
             ctk.CTkLabel(scroll_hist, text="Nenhum registro.", font=("Aileron", 12), text_color="gray").pack(pady=30)
         else:
-            for _, c in df_hist.iterrows():
+            for c in hist:
                 card = ctk.CTkFrame(scroll_hist, fg_color=("white", "#2B2B2B"), corner_radius=10)
                 card.pack(fill="x", padx=5, pady=3)
                 status_cor = "#28a745" if c['status'] == 'fechada' else ("#FFD93D" if c['status'] == 'aberta' else "#FF6B6B")
-                mesa_txt = f" Mesa {int(c['mesa_numero'])}" if pd.notna(c.get('mesa_numero')) else f" {c['tipo_atendimento']}"
+                mesa_num = c.get('mesa_numero')
+                mesa_txt = f" Mesa {int(mesa_num)}" if (mesa_num is not None and not pd.isna(mesa_num)) else f" {c['tipo_atendimento']}"
                 dt_txt = str(c['data_abertura'])[:16].replace('T', ' ')
                 ctk.CTkLabel(card, text=f"#{c['id']} |{mesa_txt} | {dt_txt} | {c['cliente']} | R$ {c['total']:.2f}",
                              font=("Aileron", 11), text_color=("#333", "#CCC")).pack(anchor="w", padx=12, pady=6)
@@ -7756,13 +7797,17 @@ class App(ctk.CTk):
 
     def _nova_comanda_sem_mesa(self, tipo, parent_window, refresh_callback):
         """Cria comanda sem mesa (balcão/delivery/retirada)."""
-        comanda_id = self.db.abrir_comanda(mesa_id=None, tipo_atendimento=tipo)
+        from services.restaurante_service import RestauranteService
+        comanda_id = RestauranteService(self.db).abrir_comanda(mesa_id=None, tipo_atendimento=tipo)
         self._open_comanda_editor(comanda_id)
         parent_window.after(300, refresh_callback)
 
     def _open_comanda_editor(self, comanda_id):
         """Editor de comanda — adicionar itens, observações, ver total."""
-        comanda = self.db.get_comanda(comanda_id)
+        from services.restaurante_service import RestauranteService
+        rest_svc = RestauranteService(self.db)
+
+        comanda = rest_svc.get_comanda(comanda_id)
         if not comanda or comanda['status'] != 'aberta':
             messagebox.showinfo("Info", "Comanda não encontrada ou já fechada.")
             return
@@ -7783,10 +7828,9 @@ class App(ctk.CTk):
         tipo_icon = tipo_icons.get(comanda['tipo_atendimento'], "📋")
         mesa_txt = ""
         if comanda['mesa_id']:
-            df_mesas = self.db.listar_mesas()
-            mesa_row = df_mesas[df_mesas['id'] == comanda['mesa_id']]
-            if not mesa_row.empty:
-                mesa_txt = f" — Mesa {mesa_row.iloc[0]['numero']}"
+            mesas_lista = [m for m in rest_svc.listar_mesas() if m['id'] == comanda['mesa_id']]
+            if mesas_lista:
+                mesa_txt = f" — Mesa {mesas_lista[0]['numero']}"
 
         ctk.CTkLabel(main, text=f"{tipo_icon} Comanda #{comanda_id}{mesa_txt}",
                      font=("Aileron", 18, "bold"), text_color=("#001D39", "white")).grid(
@@ -7860,7 +7904,7 @@ class App(ctk.CTk):
                     except ValueError:
                         qtd = 1
                     obs = eo.get().strip()
-                    self.db.adicionar_item_comanda(comanda_id, prod['id'], prod['nome'], qtd, prod['preco'], obs)
+                    rest_svc.adicionar_item_comanda(comanda_id, prod['id'], prod['nome'], qtd, prod['preco'], obs)
                     _refresh_comanda()
 
                 ctk.CTkButton(action_f, text="+", width=28, height=24, fg_color="#E07B56",
@@ -7908,16 +7952,16 @@ class App(ctk.CTk):
         def _refresh_comanda():
             for w in itens_scroll.winfo_children():
                 w.destroy()
-            df_itens = self.db.listar_itens_comanda(comanda_id)
-            comanda_atualizada = self.db.get_comanda(comanda_id)
+            itens = rest_svc.listar_itens_comanda(comanda_id)
+            comanda_atualizada = rest_svc.get_comanda(comanda_id)
             total = comanda_atualizada['total'] if comanda_atualizada else 0
             lbl_total.configure(text=f"Total: R$ {total:.2f}")
 
-            if df_itens.empty:
+            if not itens:
                 ctk.CTkLabel(itens_scroll, text="Nenhum item adicionado.", text_color="gray").pack(pady=20)
                 return
 
-            for _, item in df_itens.iterrows():
+            for item in itens:
                 item_card = ctk.CTkFrame(itens_scroll, fg_color=("white", "#404040"), corner_radius=8)
                 item_card.pack(fill="x", padx=3, pady=2)
 
@@ -7951,18 +7995,21 @@ class App(ctk.CTk):
                                   font=("Aileron", 8), fg_color=status_cores.get(next_status, "#888"),
                                   text_color="white", hover_color="#49769F",
                                   command=lambda iid=item['id'], ns=next_status: [
-                                      self.db.atualizar_status_item_comanda(iid, ns), _refresh_comanda()]).pack(pady=1)
+                                      rest_svc.atualizar_status_item_comanda(iid, ns), _refresh_comanda()]).pack(pady=1)
 
                 ctk.CTkButton(act_f, text="✕", width=25, height=20, fg_color="#FF6B6B",
                               text_color="white", hover_color="#FF5252", font=("Aileron", 9),
                               command=lambda iid=item['id']: [
-                                  self.db.remover_item_comanda(iid), _refresh_comanda()]).pack(pady=1)
+                                  rest_svc.remover_item_comanda(iid), _refresh_comanda()]).pack(pady=1)
 
         _refresh_comanda()
 
     def _fechar_comanda_dialog(self, comanda_id):
         """Dialog para fechar comanda com forma de pagamento, taxa e desconto."""
-        comanda = self.db.get_comanda(comanda_id)
+        from services.restaurante_service import RestauranteService
+        rest_svc = RestauranteService(self.db)
+
+        comanda = rest_svc.get_comanda(comanda_id)
         if not comanda or comanda['status'] != 'aberta':
             messagebox.showinfo("Info", "Comanda não encontrada ou já fechada.")
             return
@@ -7982,8 +8029,8 @@ class App(ctk.CTk):
         ctk.CTkLabel(frame, text=f"Subtotal: R$ {subtotal:.2f}", font=("Aileron", 14),
                      text_color=("#001D39", "white")).pack(pady=5)
 
-        # Taxa de serviço (10%)
-        taxa_10 = round(subtotal * 0.10, 2)
+        # Taxa de serviço (10% opcional)
+        taxa_10 = float(RestauranteService.calcular_taxa_10(subtotal))
         var_taxa = ctk.BooleanVar(value=False)
         chk_taxa = ctk.CTkCheckBox(frame, text=f"Taxa de serviço 10% (R$ {taxa_10:.2f})",
                                      variable=var_taxa, font=("Aileron", 12))
@@ -8024,14 +8071,15 @@ class App(ctk.CTk):
         e_desc.bind("<KeyRelease>", _recalc)
 
         def _confirmar():
-            from services.servico_service import ServicoService
+            loja_id_ativa = self.current_user.get("loja_id") if self.current_user else None
             try:
-                res = ServicoService(self.db).fechar_comanda(
+                res = rest_svc.fechar_comanda(
                     comanda_id=comanda_id,
                     forma_pagamento=var_pgto.get(),
                     aplicar_taxa_10=bool(var_taxa.get()),
                     desconto=e_desc.get(),
                     observacao=e_obs.get(),
+                    loja_id=loja_id_ativa,
                 )
                 messagebox.showinfo("Sucesso", res["mensagem"], parent=dialog)
                 dialog.destroy()
@@ -8046,7 +8094,10 @@ class App(ctk.CTk):
 
     def _dividir_conta_dialog(self, comanda_id):
         """Dialog para dividir a conta."""
-        comanda = self.db.get_comanda(comanda_id)
+        from services.restaurante_service import RestauranteService
+        rest_svc = RestauranteService(self.db)
+
+        comanda = rest_svc.get_comanda(comanda_id)
         if not comanda:
             return
 
@@ -8075,9 +8126,8 @@ class App(ctk.CTk):
 
         def _calc(*_):
             from collections import Counter
-            from services.servico_service import ServicoService
             try:
-                resultado = ServicoService(self.db).dividir_conta(comanda_id, e_pessoas.get())
+                resultado = rest_svc.dividir_conta(comanda_id, e_pessoas.get())
                 partes = resultado.get("partes") or []
                 if partes:
                     contagem = Counter(partes)
@@ -8098,6 +8148,9 @@ class App(ctk.CTk):
 
     def open_cozinha_dialog(self):
         """Painel da cozinha — mostra pedidos pendentes para preparar."""
+        from services.restaurante_service import RestauranteService
+        rest_svc = RestauranteService(self.db)
+
         window = ctk.CTkToplevel(self)
         window.title("🍳 Painel da Cozinha")
         window.geometry("900x600")
@@ -8141,13 +8194,13 @@ class App(ctk.CTk):
                 for w in scroll.winfo_children():
                     w.destroy()
 
-            df = self.db.itens_cozinha_pendentes()
-            if df.empty:
+            itens = rest_svc.itens_cozinha_pendentes()
+            if not itens:
                 ctk.CTkLabel(col_scrolls["Recebido"], text="Nenhum pedido pendente! 🎉",
                              font=("Aileron", 12), text_color="gray").pack(pady=30)
                 return
 
-            for _, item in df.iterrows():
+            for item in itens:
                 status = item['status']
                 if status not in col_scrolls:
                     continue
@@ -8156,7 +8209,12 @@ class App(ctk.CTk):
                 card = ctk.CTkFrame(scroll, fg_color=("white", "#404040"), corner_radius=10)
                 card.pack(fill="x", padx=5, pady=4)
 
-                mesa_txt = f"Mesa {int(item['mesa_numero'])}" if pd.notna(item.get('mesa_numero')) else item['tipo_atendimento'].capitalize()
+                mesa_num = item.get('mesa_numero')
+                mesa_txt = (
+                    f"Mesa {int(mesa_num)}"
+                    if (mesa_num is not None and not pd.isna(mesa_num))
+                    else str(item.get('tipo_atendimento') or '').capitalize()
+                )
                 ctk.CTkLabel(card, text=f"📍 {mesa_txt}", font=("Aileron", 9, "bold"),
                              text_color=("#888", "#AAA")).pack(anchor="w", padx=10, pady=(6, 0))
                 ctk.CTkLabel(card, text=f"{item['quantidade']}x {item['produto_nome']}",
@@ -8176,7 +8234,7 @@ class App(ctk.CTk):
                     ctk.CTkButton(card, text=f"→ {next_st}", height=26, fg_color=cor_btn,
                                   text_color="white", hover_color="#49769F", font=("Aileron", 10, "bold"),
                                   command=lambda iid=item['id'], ns=next_st: [
-                                      self.db.atualizar_status_item_comanda(iid, ns), _refresh()]).pack(
+                                      rest_svc.atualizar_status_item_comanda(iid, ns), _refresh()]).pack(
                         fill="x", padx=10, pady=(3, 8))
 
         _refresh()
@@ -8266,7 +8324,8 @@ class App(ctk.CTk):
         """Exibe notificações toast para alertas pendentes (exceto estoque baixo, que vira tarefa)."""
         try:
             # Criar tarefas automáticas para estoque baixo (sem popup)
-            count = self.db.criar_tarefas_estoque_baixo()
+            from services.cadastro_service import CadastroService
+            count = CadastroService(self.db).criar_tarefas_estoque_baixo()
             if count > 0:
                 self.refresh_metas_list()
                 self.notifier.notify(

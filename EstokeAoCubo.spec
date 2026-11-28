@@ -4,7 +4,7 @@
 #   ESTOKE_EDITION=full|trial   (padrão: full)
 #   ESTOKE_EXE_NAME=<nome>      (opcional; sobrescreve nome do executável/pasta)
 
-from PyInstaller.utils.hooks import collect_all, collect_data_files
+from PyInstaller.utils.hooks import collect_all, collect_data_files, collect_submodules
 import glob
 import os
 
@@ -61,22 +61,8 @@ hiddenimports = [
     "label_generator",
     "barcode_scanner",
     "api_server",
-    # Subpacote services
+    # Subpacote services (coletado automaticamente via collect_submodules abaixo)
     "services",
-    "services.venda_service",
-    "services.caixa_service",
-    "services.estoque_service",
-    "services.dreams_service",
-    "services.security",
-    "services.relatorio_caixa",
-    "services.mercadopago_service",
-    "services.outbox_service",
-    "services.scheduler",
-    "services.updater",
-    "services.compras_service",
-    "services.fiscal_service",
-    "services.producao_service",
-    "services.troca_service",
     # Subpacote views
     "views",
     "views.base",
@@ -162,6 +148,7 @@ for _pkg in _collect_packages:
     except Exception:
         pass
 
+hiddenimports += collect_submodules("services")
 hiddenimports = sorted(set(hiddenimports))
 
 a = Analysis(
